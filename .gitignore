@@ -107,3 +107,9 @@ venv.bak/
 **/results
 *.pkl
 *.log
+
+
+# data
+./data/raw/*
+./data/numpy/*
+./data/torch/*
