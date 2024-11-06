@@ -110,6 +110,6 @@ venv.bak/
 
 
 # data
-./data/raw/*.json
-./data/numpy/*.npy
-./data/torch/*.pyt
+/data/raw/*.json
+/data/numpy/*.npy
+/data/torch/*.pyt
