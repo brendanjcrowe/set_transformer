@@ -35,17 +35,15 @@ def raw_to_numpy(
     return np.array(
         [
             [
-                np.array([
-                    float(x)
-                    for particle_id, particle in particles.items()
-                    for var_nam, x in particle.items()
-                ], dtype=np.float32)
-                for timestep, particles in traj.items()
+                [float(x) for var_name, x in particle.items()]
+                for particle_id, particle in particles.items()
             ]
             for traj_num, traj in raw_data.items()
+            for timestep, particles in traj.items()
         ],
-        dtype=np.object_,
+        dtype=np.float32,
     )
+
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--data_file_name", default="data.json", required=False, type=str)
