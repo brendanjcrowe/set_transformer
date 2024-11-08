@@ -1,37 +1,40 @@
+import argparse
+import logging
+import os
+import pickle
+import time
+
+import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-import numpy as np
-import pickle
-import os
-import argparse
-import logging
-import time
-from tqdm import tqdm
-import matplotlib.pyplot as plt
-from models import SetTransformer, DeepSet
 from mixture_of_mvns import MixtureOfMVNs
+from models import DeepSet, SetTransformer
 from mvn_diag import MultivariateNormalDiag
+from tqdm import tqdm
+
 from set_transformer.data.dataset import get_data_loader
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--mode', type=str, default='train')
-parser.add_argument('--num_bench', type=int, default=100)
-parser.add_argument('--net', type=str, default='set_transformer')
-parser.add_argument('--B', type=int, default=10)
-parser.add_argument('--N_min', type=int, default=300)
-parser.add_argument('--N_max', type=int, default=600)
-parser.add_argument('--K', type=int, default=4)
-parser.add_argument('--gpu', type=str, default='0')
-parser.add_argument('--lr', type=float, default=1e-3)
-parser.add_argument('--run_name', type=str, default='trial')
-parser.add_argument('--num_steps', type=int, default=50000)
-parser.add_argument('--test_freq', type=int, default=200)
-parser.add_argument('--save_freq', type=int, default=400)
+parser.add_argument("--mode", type=str, default="train")
+parser.add_argument("--num_bench", type=int, default=100)
+parser.add_argument("--net", type=str, default="set_transformer")
+parser.add_argument("--B", type=int, default=10)
+parser.add_argument("--N_min", type=int, default=300)
+parser.add_argument("--N_max", type=int, default=600)
+parser.add_argument("--K", type=int, default=500)
+parser.add_argument("--gpu", type=str, default="0")
+parser.add_argument("--lr", type=float, default=1e-3)
+parser.add_argument("--run_name", type=str, default="trial")
+parser.add_argument("--num_steps", type=int, default=100)
+parser.add_argument("--test_freq", type=int, default=1)
+parser.add_argument("--save_freq", type=int, default=10)
+parser.add_argument("--batch_size", type=int, default=512)
 
 args = parser.parse_args()
-os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
+os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
 
 B = args.B
 N_min = args.N_min
@@ -57,102 +60,122 @@ D = 4
 #     bench = [data, ll/args.num_bench]
 #     torch.save(bench, benchfile)
 
-save_dir = os.path.join('results', args.net, args.run_name)
+save_dir = os.path.join("results", args.net, args.run_name)
+
+
 def train():
     if not os.path.isdir(save_dir):
         os.makedirs(save_dir)
 
-
-    dataloader = get_data_loader(batch_size=64)
+    training_dataloader, eval_dataloader, training_size, eval_size = get_data_loader(batch_size=64, device="cuda")
+    print(training_size, eval_size)
     logging.basicConfig(level=logging.INFO)
     logger = logging.getLogger(args.run_name)
-    logger.addHandler(logging.FileHandler(
-        os.path.join(save_dir,
-            'train_'+time.strftime('%Y%m%d-%H%M')+'.log'),
-        mode='w'))
-    logger.info(str(args) + '\n')
-    
-    
-    if args.net == 'set_transformer':
+    logger.addHandler(
+        logging.FileHandler(
+            os.path.join(save_dir, "train_" + time.strftime("%Y%m%d-%H%M") + ".log"),
+            mode="w",
+        )
+    )
+    logger.info(str(args) + "\n")
+
+    if args.net == "set_transformer":
         net = SetTransformer(D, K, D).cuda()
-    elif args.net == 'deepset':
+    elif args.net == "deepset":
         net = DeepSet(D, K, D).cuda()
     else:
-        raise ValueError('Invalid net {}'.format(args.net))
+        raise ValueError("Invalid net {}".format(args.net))
 
     criterion = nn.MSELoss()  # For example, if you’re reconstructing particles
-    optimizer = torch.optim.Adam(net.parameters(), lr=0.01)
+    optimizer = torch.optim.Adam(net.parameters(), lr=0.005)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.num_steps)
+
     tick = time.time()
-    for t in range(1, args.num_steps+1):
+    eval_loss = []
+    line, loss = test(net, eval_dataloader, eval_size)
+    eval_loss.append(loss)
+    print(line)
+    for t in range(1, args.num_steps + 1):
         net.train()
-        for batch in dataloader:
-            if t == int(0.5*args.num_steps):
-                optimizer.param_groups[0]['lr'] *= 0.1
-          
+        print(f"Timestep: {t}")
+        for batch in training_dataloader:
+
             optimizer.zero_grad()
-            
+
             # Forward pass
             batch = batch.to("cuda")
             outputs = net(batch)
             # Calculate the reconstruction loss (outputs vs. input batch)
-            loss = criterion(outputs, batch)  # batch is the target since we are reconstructing
-            
+            loss = criterion(
+                outputs, batch
+            )  # batch is the target since we are reconstructing
+
             # Backward pass and optimize
             loss.backward()
             optimizer.step()
 
+        scheduler.step()
+
         if t % args.test_freq == 0:
-            line = 'step {}, lr {:.3e}, '.format(
-                    t, optimizer.param_groups[0]['lr'])
-            line += test(net, bench, verbose=False)
-            line += ' ({:.3f} secs)'.format(time.time()-tick)
+            line = "step {}, lr {:.3e}, ".format(t, optimizer.param_groups[0]["lr"])
+            linex, loss = test(net, eval_dataloader, eval_size, verbose=False)
+            line +=linex
+            eval_loss.append(eval_loss)
+            line += " ({:.3f} secs)".format(time.time() - tick)
             tick = time.time()
             logger.info(line)
 
         if t % args.save_freq == 0:
-            torch.save({'state_dict':net.state_dict()},
-                    os.path.join(save_dir, 'model.tar'))
+            torch.save(
+                {"state_dict": net.state_dict()}, os.path.join(save_dir, "model.tar")
+            )
 
-    torch.save({'state_dict':net.state_dict()},
-        os.path.join(save_dir, 'model.tar'))
+    torch.save({"state_dict": net.state_dict()}, os.path.join(save_dir, "model.tar"))
+    plot(args.num_steps, eval_loss)
 
-def test(net, bench, verbose=True):
+def test(net, eval_data, eval_size, verbose=True):
     net.eval()
-    data, oracle_ll = bench
-    avg_ll = 0.
-    for X in data:
-        X = X.cuda()
-        avg_ll += mog.log_prob(X, *mvn.parse(net(X))).item()
-    avg_ll /= len(data)
-    line = 'test ll {:.4f} (oracle {:.4f})'.format(avg_ll, oracle_ll)
+    avg_loss = 0.0
+    criterion = nn.MSELoss(reduction="sum")
+
+    for batch in eval_data:
+        batch = batch.to("cuda")
+        outputs = net(batch)
+        loss = criterion(outputs, batch).item()
+        avg_loss += loss
+
+    avg_loss /= eval_size
+    rmse = np.sqrt(avg_loss)
+    line = "Eval RMSE Loss: {:.4f}".format(rmse)
+
     if verbose:
-        logging.basicConfig(level=logging.INFO)
         logger = logging.getLogger(args.run_name)
-        logger.addHandler(logging.FileHandler(
-            os.path.join(save_dir, 'test.log'), mode='w'))
+        logger.addHandler(
+            logging.FileHandler(os.path.join(save_dir, "test.log"), mode="w")
+        )
         logger.info(line)
-    return line
 
-def plot():
-    net.eval()
-    X = mog.sample(B, np.random.randint(N_min, N_max), K)
-    pi, params = mvn.parse(net(X))
-    ll, labels = mog.log_prob(X, pi, params, return_labels=True)
-    fig, axes = plt.subplots(2, B//2, figsize=(7*B//5,5))
-    mog.plot(X, labels, params, axes)
-    plt.show()
+    return line, rmse
 
-if __name__ == '__main__':
-    if args.mode == 'bench':
+
+def plot(t_steps, loss):
+    fig, ax = plt.subplots()
+    ax.plot(np.arange(t_steps), loss)
+    ax.set_xlabel("Epochs")
+    ax.set_ylabel("Eval loss")
+
+
+if __name__ == "__main__":
+    if args.mode == "bench":
         generate_benchmark()
-    elif args.mode == 'train':
+    elif args.mode == "train":
         train()
-    elif args.mode == 'test':
+    elif args.mode == "test":
         bench = torch.load(benchfile)
-        ckpt = torch.load(os.path.join(save_dir, 'model.tar'))
-        net.load_state_dict(ckpt['state_dict'])
+        ckpt = torch.load(os.path.join(save_dir, "model.tar"))
+        net.load_state_dict(ckpt["state_dict"])
         test(bench)
-    elif args.mode == 'plot':
-        ckpt = torch.load(os.path.join(save_dir, 'model.tar'))
-        net.load_state_dict(ckpt['state_dict'])
+    elif args.mode == "plot":
+        ckpt = torch.load(os.path.join(save_dir, "model.tar"))
+        net.load_state_dict(ckpt["state_dict"])
         plot()
