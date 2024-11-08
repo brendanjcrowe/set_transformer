@@ -13,6 +13,7 @@ import matplotlib.pyplot as plt
 from models import SetTransformer, DeepSet
 from mixture_of_mvns import MixtureOfMVNs
 from mvn_diag import MultivariateNormalDiag
+from set_transformer.data.dataset import get_data_loader
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--mode', type=str, default='train')
@@ -37,41 +38,32 @@ N_min = args.N_min
 N_max = args.N_max
 K = args.K
 
-D = 2
-mvn = MultivariateNormalDiag(D)
-mog = MixtureOfMVNs(mvn)
-dim_output = 2*D
+D = 4
+# mvn = MultivariateNormalDiag(D)
+# mog = MixtureOfMVNs(mvn)
+# dim_output = 2*D
 
-if args.net == 'set_transformer':
-    net = SetTransformer(D, K, dim_output).cuda()
-elif args.net == 'deepset':
-    net = DeepSet(D, K, dim_output).cuda()
-else:
-    raise ValueError('Invalid net {}'.format(args.net))
-benchfile = os.path.join('benchmark', 'mog_{:d}.pkl'.format(K))
 
-def generate_benchmark():
-    if not os.path.isdir('benchmark'):
-        os.makedirs('benchmark')
-    N_list = np.random.randint(N_min, N_max, args.num_bench)
-    data = []
-    ll = 0.
-    for N in tqdm(N_list):
-        X, labels, pi, params = mog.sample(B, N, K, return_gt=True)
-        ll += mog.log_prob(X, pi, params).item()
-        data.append(X)
-    bench = [data, ll/args.num_bench]
-    torch.save(bench, benchfile)
+# def generate_benchmark():
+#     if not os.path.isdir('benchmark'):
+#         os.makedirs('benchmark')
+#     N_list = np.random.randint(N_min, N_max, args.num_bench)
+#     data = []
+#     ll = 0.
+#     for N in tqdm(N_list):
+#         X, labels, pi, params = mog.sample(B, N, K, return_gt=True)
+#         ll += mog.log_prob(X, pi, params).item()
+#         data.append(X)
+#     bench = [data, ll/args.num_bench]
+#     torch.save(bench, benchfile)
 
 save_dir = os.path.join('results', args.net, args.run_name)
 def train():
     if not os.path.isdir(save_dir):
         os.makedirs(save_dir)
 
-    if not os.path.isfile(benchfile):
-        generate_benchmark()
 
-    bench = torch.load(benchfile)
+    dataloader = get_data_loader(batch_size=64)
     logging.basicConfig(level=logging.INFO)
     logger = logging.getLogger(args.run_name)
     logger.addHandler(logging.FileHandler(
@@ -79,25 +71,41 @@ def train():
             'train_'+time.strftime('%Y%m%d-%H%M')+'.log'),
         mode='w'))
     logger.info(str(args) + '\n')
+    
+    
+    if args.net == 'set_transformer':
+        net = SetTransformer(D, K, D).cuda()
+    elif args.net == 'deepset':
+        net = DeepSet(D, K, D).cuda()
+    else:
+        raise ValueError('Invalid net {}'.format(args.net))
 
-    optimizer = optim.Adam(net.parameters(), lr=args.lr)
+    criterion = nn.MSELoss()  # For example, if you’re reconstructing particles
+    optimizer = torch.optim.Adam(net.parameters(), lr=0.01)
     tick = time.time()
     for t in range(1, args.num_steps+1):
-        if t == int(0.5*args.num_steps):
-            optimizer.param_groups[0]['lr'] *= 0.1
         net.train()
-        optimizer.zero_grad()
-        N = np.random.randint(N_min, N_max)
-        X = mog.sample(B, N, K)
-        ll = mog.log_prob(X, *mvn.parse(net(X)))
-        loss = -ll
-        loss.backward()
-        optimizer.step()
+        for batch in dataloader:
+            if t == int(0.5*args.num_steps):
+                optimizer.param_groups[0]['lr'] *= 0.1
+          
+            optimizer.zero_grad()
+            optimizer.zero_grad()
+            
+            # Forward pass
+            batch = batch.to("cuda")
+            outputs = net(batch)
+            # Calculate the reconstruction loss (outputs vs. input batch)
+            loss = criterion(outputs, batch)  # batch is the target since we are reconstructing
+            
+            # Backward pass and optimize
+            loss.backward()
+            optimizer.step()
 
         if t % args.test_freq == 0:
             line = 'step {}, lr {:.3e}, '.format(
                     t, optimizer.param_groups[0]['lr'])
-            line += test(bench, verbose=False)
+            line += test(net, bench, verbose=False)
             line += ' ({:.3f} secs)'.format(time.time()-tick)
             tick = time.time()
             logger.info(line)
@@ -109,7 +117,7 @@ def train():
     torch.save({'state_dict':net.state_dict()},
         os.path.join(save_dir, 'model.tar'))
 
-def test(bench, verbose=True):
+def test(net, bench, verbose=True):
     net.eval()
     data, oracle_ll = bench
     avg_ll = 0.

@@ -110,6 +110,6 @@ venv.bak/
 
 
 # data
-/data/raw/*.json
-/data/numpy/*.npy
-/data/torch/*.pyt
+/set_transformer/data/raw/*.json
+/set_transformer/data/numpy/*.npy
+/set_transformer/data/torch/*.pyt

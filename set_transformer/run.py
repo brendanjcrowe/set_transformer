@@ -42,6 +42,8 @@ mvn = MultivariateNormalDiag(D)
 mog = MixtureOfMVNs(mvn)
 dim_output = 2*D
 
+print(B, N_min, N_max, K, D)
+
 if args.net == 'set_transformer':
     net = SetTransformer(D, K, dim_output).cuda()
 elif args.net == 'deepset':
@@ -89,6 +91,7 @@ def train():
         optimizer.zero_grad()
         N = np.random.randint(N_min, N_max)
         X = mog.sample(B, N, K)
+        print(X.shape)
         ll = mog.log_prob(X, *mvn.parse(net(X)))
         loss = -ll
         loss.backward()
