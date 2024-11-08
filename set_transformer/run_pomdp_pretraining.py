@@ -90,7 +90,6 @@ def train():
                 optimizer.param_groups[0]['lr'] *= 0.1
           
             optimizer.zero_grad()
-            optimizer.zero_grad()
             
             # Forward pass
             batch = batch.to("cuda")
