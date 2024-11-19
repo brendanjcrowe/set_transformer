@@ -80,7 +80,7 @@ def train():
     logger.info(str(args) + "\n")
 
     if args.net == "set_transformer":
-        net = SetTransformer(D, K, D).cuda()
+        net = SetTransformer(D, K, D, num_inds=64, dim_hidden=256, num_heads=8).cuda()
     elif args.net == "deepset":
         net = DeepSet(D, K, D).cuda()
     else:
@@ -93,7 +93,7 @@ def train():
     tick = time.time()
     eval_loss = []
     line, loss = test(net, eval_dataloader, eval_size)
-    eval_loss.append(loss)
+    eval_loss.append(loss.item())
     print(line)
     for t in range(1, args.num_steps + 1):
         net.train()
