@@ -11,11 +11,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from mixture_of_mvns import MixtureOfMVNs
-from models import DeepSet, SetTransformer
+from models import DeepSet, PFSetTransformer, SetTransformer
 from mvn_diag import MultivariateNormalDiag
 from tqdm import tqdm
 
+
 from set_transformer.data.dataset import get_data_loader
+from set_transformer.loss import ChamferDistanceLoss, SinkhornLoss
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--mode", type=str, default="train")
@@ -39,9 +41,9 @@ os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
 B = args.B
 N_min = args.N_min
 N_max = args.N_max
-K = args.K
+num_particles = args.K
 
-D = 4
+dim_particles = 4
 # mvn = MultivariateNormalDiag(D)
 # mog = MixtureOfMVNs(mvn)
 # dim_output = 2*D
@@ -60,14 +62,18 @@ D = 4
 #     bench = [data, ll/args.num_bench]
 #     torch.save(bench, benchfile)
 
-save_dir = os.path.join("results", args.net, args.run_name)
+
+
+save_dir = os.path.join("results", args.net, args.run_name + "_" + time.strftime("%Y-%m-DD:hh-mm-ss"))
 
 
 def train():
     if not os.path.isdir(save_dir):
         os.makedirs(save_dir)
 
-    training_dataloader, eval_dataloader, training_size, eval_size = get_data_loader(batch_size=64, device="cuda")
+    training_dataloader, eval_dataloader, training_size, eval_size = get_data_loader(
+        batch_size=64, device="cuda"
+    )
     print(training_size, eval_size)
     logging.basicConfig(level=logging.INFO)
     logger = logging.getLogger(args.run_name)
@@ -79,16 +85,25 @@ def train():
     )
     logger.info(str(args) + "\n")
 
-    if args.net == "set_transformer":
-        net = SetTransformer(D, K, D, num_inds=64, dim_hidden=256, num_heads=8).cuda()
-    elif args.net == "deepset":
-        net = DeepSet(D, K, D).cuda()
+    if args.net == "pf_set_transformer":
+        net = PFSetTransformer(
+            num_particles=num_particles,
+            dim_partciles=dim_particles,
+            num_encodings=8,
+            dim_encoder=2,
+            num_inds=32,
+            dim_hidden=128,
+            num_heads=4,
+            ln=True,
+        ).cuda()
     else:
         raise ValueError("Invalid net {}".format(args.net))
 
-    criterion = nn.MSELoss()  # For example, if you’re reconstructing particles
-    optimizer = torch.optim.Adam(net.parameters(), lr=0.005)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.num_steps)
+    criterion = SinkhornLoss(p=2, blur=0.5) # For example, if you’re reconstructing particles
+    optimizer = torch.optim.Adam(net.parameters(), lr=0.001)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.num_steps
+    )
 
     tick = time.time()
     eval_loss = []
@@ -109,9 +124,9 @@ def train():
             loss = criterion(
                 outputs, batch
             )  # batch is the target since we are reconstructing
-
             # Backward pass and optimize
             loss.backward()
+            nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
             optimizer.step()
 
         scheduler.step()
@@ -119,7 +134,7 @@ def train():
         if t % args.test_freq == 0:
             line = "step {}, lr {:.3e}, ".format(t, optimizer.param_groups[0]["lr"])
             linex, loss = test(net, eval_dataloader, eval_size, verbose=False)
-            line +=linex
+            line += linex
             eval_loss.append(eval_loss)
             line += " ({:.3f} secs)".format(time.time() - tick)
             tick = time.time()
@@ -133,10 +148,11 @@ def train():
     torch.save({"state_dict": net.state_dict()}, os.path.join(save_dir, "model.tar"))
     plot(args.num_steps, eval_loss)
 
+
 def test(net, eval_data, eval_size, verbose=True):
     net.eval()
     avg_loss = 0.0
-    criterion = nn.MSELoss(reduction="sum")
+    criterion = SinkhornLoss(reduction="sum")
 
     for batch in eval_data:
         batch = batch.to("cuda")
@@ -146,7 +162,7 @@ def test(net, eval_data, eval_size, verbose=True):
 
     avg_loss /= eval_size
     rmse = np.sqrt(avg_loss)
-    line = "Eval RMSE Loss: {:.4f}".format(rmse)
+    line = f"{criterion}: {rmse:.4f}"
 
     if verbose:
         logger = logging.getLogger(args.run_name)
