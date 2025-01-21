@@ -11,7 +11,7 @@ import torch
 import torch.nn.functional as F
 import math
 
-from mixture_of_mvns import MultivariateNormal
+from .mixture_of_mvns import MultivariateNormal
 
 
 class MultivariateNormalDiag(MultivariateNormal):

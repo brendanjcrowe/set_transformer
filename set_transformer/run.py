@@ -26,48 +26,35 @@ import time
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 
-from models import SetTransformer, DeepSet
-from mixture_of_mvns import MixtureOfMVNs
-from mvn_diag import MultivariateNormalDiag
+from .models import SetTransformer, DeepSet
+from .mixture_of_mvns import MixtureOfMVNs
+from .mvn_diag import MultivariateNormalDiag
 
-# Set up command line argument parser
-parser = argparse.ArgumentParser(description='Train and evaluate Set Transformer on mixture modeling')
-parser.add_argument('--mode', type=str, default='train',
-                  help='Mode: bench, train, test, or plot')
-parser.add_argument('--num_bench', type=int, default=100,
-                  help='Number of benchmark datasets to generate')
-parser.add_argument('--net', type=str, default='set_transformer',
-                  help='Network architecture: set_transformer or deepset')
-parser.add_argument('--B', type=int, default=10,
-                  help='Batch size')
-parser.add_argument('--N_min', type=int, default=300,
-                  help='Minimum number of points per set')
-parser.add_argument('--N_max', type=int, default=600,
-                  help='Maximum number of points per set')
-parser.add_argument('--K', type=int, default=4,
-                  help='Number of mixture components')
-parser.add_argument('--gpu', type=str, default='0',
-                  help='GPU device ID')
-parser.add_argument('--lr', type=float, default=1e-3,
-                  help='Learning rate')
-parser.add_argument('--run_name', type=str, default='trial',
-                  help='Name of this run')
-parser.add_argument('--num_steps', type=int, default=50000,
-                  help='Number of training steps')
-parser.add_argument('--test_freq', type=int, default=200,
-                  help='Test frequency in steps')
-parser.add_argument('--save_freq', type=int, default=400,
-                  help='Model save frequency in steps')
 
-args = parser.parse_args()
-os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
+# Default configuration
+DEFAULT_CONFIG = {
+    'mode': 'train',
+    'num_bench': 100,
+    'net': 'set_transformer',
+    'B': 10,
+    'N_min': 300,
+    'N_max': 600,
+    'K': 4,
+    'gpu': '0',
+    'lr': 1e-3,
+    'run_name': 'trial',
+    'num_steps': 50000,
+    'test_freq': 200,
+    'save_freq': 400
+}
 
-B = args.B
-N_min = args.N_min
-N_max = args.N_max
-K = args.K
-
+# Initialize global variables with defaults
+B = DEFAULT_CONFIG['B']
+N_min = DEFAULT_CONFIG['N_min']
+N_max = DEFAULT_CONFIG['N_max']
+K = DEFAULT_CONFIG['K']
 D = 2  # Data dimension
+
 mvn = MultivariateNormalDiag(D)
 mog = MixtureOfMVNs(mvn)
 dim_output = 2*D
@@ -75,84 +62,83 @@ dim_output = 2*D
 print(B, N_min, N_max, K, D)
 
 # Initialize model
-if args.net == 'set_transformer':
+if DEFAULT_CONFIG['net'] == 'set_transformer':
     net = SetTransformer(D, K, dim_output).cuda()
-elif args.net == 'deepset':
+elif DEFAULT_CONFIG['net'] == 'deepset':
     net = DeepSet(D, K, dim_output).cuda()
 else:
-    raise ValueError('Invalid net {}'.format(args.net))
+    raise ValueError('Invalid net {}'.format(DEFAULT_CONFIG['net']))
 
 benchfile = os.path.join('benchmark', 'mog_{:d}.pkl'.format(K))
 
 
 def generate_benchmark() -> None:
-    """Generate benchmark datasets for evaluation.
+    """Generate benchmark datasets."""
+    benchmark_dir = os.environ.get('BENCHMARK_DIR', 'benchmark')
+    if not os.path.exists(benchmark_dir):
+        os.makedirs(benchmark_dir)
 
-    Creates a directory of mixture datasets with ground truth log-likelihoods
-    for model evaluation. Each dataset contains B sets of N points, where N is
-    randomly chosen between N_min and N_max.
-    """
-    if not os.path.isdir('benchmark'):
-        os.makedirs('benchmark')
-    N_list = np.random.randint(N_min, N_max, args.num_bench)
+    # Generate mixture of Gaussians data
     data = []
     ll = 0.
     for N in tqdm(N_list):
         X, labels, pi, params = mog.sample(B, N, K, return_gt=True)
         ll += mog.log_prob(X, pi, params).item()
         data.append(X)
-    bench = [data, ll/args.num_bench]
+    bench = [data, ll/DEFAULT_CONFIG['num_bench']]
     torch.save(bench, benchfile)
 
 
-save_dir = os.path.join('results', args.net, args.run_name)
+save_dir = os.path.join('results', DEFAULT_CONFIG['net'], DEFAULT_CONFIG['run_name'])
 
 
-def train() -> None:
-    """Train the model on mixture modeling.
+def train(args: argparse.Namespace) -> None:
+    """Train the model.
 
-    Trains the model to predict mixture parameters from sets of points.
-    Evaluates on benchmark datasets periodically and saves checkpoints.
+    Args:
+        args (argparse.Namespace): Training arguments.
     """
-    if not os.path.isdir(save_dir):
-        os.makedirs(save_dir)
-
+    device = torch.device(f'cuda:{args.gpu}' if torch.cuda.is_available() else 'cpu')
+    
+    # Set up model
+    if args.net == 'set_transformer':
+        net = SetTransformer(D, K, dim_output).to(device)
+    elif args.net == 'deepset':
+        net = DeepSet(D, K, dim_output).to(device)
+    else:
+        raise ValueError('Invalid net {}'.format(args.net))
+    optimizer = optim.Adam(net.parameters(), lr=args.lr)
+    
+    # Generate benchmark data
     if not os.path.isfile(benchfile):
         generate_benchmark()
-
     bench = torch.load(benchfile)
-    logging.basicConfig(level=logging.INFO)
-    logger = logging.getLogger(args.run_name)
-    logger.addHandler(logging.FileHandler(
-        os.path.join(save_dir,
-            'train_'+time.strftime('%Y%m%d-%H%M')+'.log'),
-        mode='w'))
-    logger.info(str(args) + '\n')
-
-    optimizer = optim.Adam(net.parameters(), lr=args.lr)
-    tick = time.time()
-    for t in range(1, args.num_steps+1):
-        if t == int(0.5*args.num_steps):
-            optimizer.param_groups[0]['lr'] *= 0.1
-        net.train()
+    
+    # Training loop
+    pbar = tqdm(range(args.num_steps))
+    for step in pbar:
         optimizer.zero_grad()
+        
+        # Generate batch
         N = np.random.randint(N_min, N_max)
-        X = mog.sample(B, N, K)
-        print(X.shape)
-        ll = mog.log_prob(X, *mvn.parse(net(X)))
-        loss = -ll
+        X = mog.sample(args.B, N, K)
+        X = X.to(device)
+        
+        # Forward pass
+        pi, params = mvn.parse(net(X))
+        loss = -mog.log_prob(X, pi, params).mean()
+        
+        # Backward pass
         loss.backward()
         optimizer.step()
-
-        if t % args.test_freq == 0:
-            line = 'step {}, lr {:.3e}, '.format(
-                    t, optimizer.param_groups[0]['lr'])
-            line += test(bench, verbose=False)
-            line += ' ({:.3f} secs)'.format(time.time()-tick)
-            tick = time.time()
-            logger.info(line)
-
-        if t % args.save_freq == 0:
+        
+        # Testing
+        if (step + 1) % args.test_freq == 0:
+            test_loss = test(bench, verbose=False)
+            pbar.set_description(f'Step {step + 1}, Test Loss: {test_loss:.4f}')
+        
+        # Save checkpoint
+        if (step + 1) % args.save_freq == 0:
             torch.save({'state_dict':net.state_dict()},
                     os.path.join(save_dir, 'model.tar'))
 
@@ -160,31 +146,30 @@ def train() -> None:
         os.path.join(save_dir, 'model.tar'))
 
 
-def test(bench: List[torch.Tensor], verbose: bool = True) -> str:
-    """Evaluate model on benchmark datasets.
+def test(bench: List[torch.Tensor], verbose: bool = True) -> float:
+    """Test the model on benchmark data.
 
     Args:
-        bench (List[torch.Tensor]): Benchmark data and ground truth log-likelihood
-        verbose (bool, optional): Whether to log results. Defaults to True.
+        bench (List[torch.Tensor]): List of benchmark tensors.
+        verbose (bool, optional): Whether to print results. Defaults to True.
 
     Returns:
-        str: String containing test results
+        float: Average test loss.
     """
-    net.eval()
-    data, oracle_ll = bench
-    avg_ll = 0.
-    for X in data:
-        X = X.cuda()
-        avg_ll += mog.log_prob(X, *mvn.parse(net(X))).item()
-    avg_ll /= len(data)
-    line = 'test ll {:.4f} (oracle {:.4f})'.format(avg_ll, oracle_ll)
+    device = next(net.parameters()).device
+    losses = []
+    for X in bench[0]:
+        X = X.to(device)
+        with torch.no_grad():
+            pi, params = mvn.parse(net(X))
+            loss = -mog.log_prob(X, pi, params).mean()
+        losses.append(loss.item())
+    
+    avg_loss = np.mean(losses)
     if verbose:
-        logging.basicConfig(level=logging.INFO)
-        logger = logging.getLogger(args.run_name)
-        logger.addHandler(logging.FileHandler(
-            os.path.join(save_dir, 'test.log'), mode='w'))
-        logger.info(line)
-    return line
+        print(f'Test Loss: {avg_loss:.4f}')
+    
+    return avg_loss
 
 
 def plot() -> None:
@@ -203,16 +188,66 @@ def plot() -> None:
 
 
 if __name__ == '__main__':
+    # Set up command line argument parser
+    parser = argparse.ArgumentParser(description='Train and evaluate Set Transformer on mixture modeling')
+    parser.add_argument('--mode', type=str, default=DEFAULT_CONFIG['mode'],
+                      help='Mode: bench, train, test, or plot')
+    parser.add_argument('--num_bench', type=int, default=DEFAULT_CONFIG['num_bench'],
+                      help='Number of benchmark datasets to generate')
+    parser.add_argument('--net', type=str, default=DEFAULT_CONFIG['net'],
+                      help='Network architecture: set_transformer or deepset')
+    parser.add_argument('--B', type=int, default=DEFAULT_CONFIG['B'],
+                      help='Batch size')
+    parser.add_argument('--N_min', type=int, default=DEFAULT_CONFIG['N_min'],
+                      help='Minimum number of points per set')
+    parser.add_argument('--N_max', type=int, default=DEFAULT_CONFIG['N_max'],
+                      help='Maximum number of points per set')
+    parser.add_argument('--K', type=int, default=DEFAULT_CONFIG['K'],
+                      help='Number of mixture components')
+    parser.add_argument('--gpu', type=str, default=DEFAULT_CONFIG['gpu'],
+                      help='GPU device ID')
+    parser.add_argument('--lr', type=float, default=DEFAULT_CONFIG['lr'],
+                      help='Learning rate')
+    parser.add_argument('--run_name', type=str, default=DEFAULT_CONFIG['run_name'],
+                      help='Name of this run')
+    parser.add_argument('--num_steps', type=int, default=DEFAULT_CONFIG['num_steps'],
+                      help='Number of training steps')
+    parser.add_argument('--test_freq', type=int, default=DEFAULT_CONFIG['test_freq'],
+                      help='Test frequency in steps')
+    parser.add_argument('--save_freq', type=int, default=DEFAULT_CONFIG['save_freq'],
+                      help='Model save frequency in steps')
+
+    args = parser.parse_args()
+    os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
+
+    # Update global variables with command line arguments
+    B = args.B
+    N_min = args.N_min
+    N_max = args.N_max
+    K = args.K
+
     if args.mode == 'bench':
         generate_benchmark()
     elif args.mode == 'train':
-        train()
+        train(args)
     elif args.mode == 'test':
         bench = torch.load(benchfile)
         ckpt = torch.load(os.path.join(save_dir, 'model.tar'))
+        if args.net == 'set_transformer':
+            net = SetTransformer(D, K, dim_output).cuda()
+        elif args.net == 'deepset':
+            net = DeepSet(D, K, dim_output).cuda()
+        else:
+            raise ValueError('Invalid net {}'.format(args.net))
         net.load_state_dict(ckpt['state_dict'])
         test(bench)
     elif args.mode == 'plot':
         ckpt = torch.load(os.path.join(save_dir, 'model.tar'))
+        if args.net == 'set_transformer':
+            net = SetTransformer(D, K, dim_output).cuda()
+        elif args.net == 'deepset':
+            net = DeepSet(D, K, dim_output).cuda()
+        else:
+            raise ValueError('Invalid net {}'.format(args.net))
         net.load_state_dict(ckpt['state_dict'])
         plot()

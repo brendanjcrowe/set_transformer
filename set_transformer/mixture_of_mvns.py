@@ -13,7 +13,7 @@ import matplotlib.pyplot as plt
 from matplotlib.axes import Axes
 import numpy as np
 
-from plots import scatter_mog
+from .plots import scatter_mog
 
 
 class MultivariateNormal:

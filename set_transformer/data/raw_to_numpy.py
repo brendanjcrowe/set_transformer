@@ -40,8 +40,14 @@ def load_raw_data(
             data_file_name,
         )
 
-    with open(data_path, "rb") as file:
-        raw_data = json.load(file)
+    try:
+        with open(data_path, "rb") as file:
+            raw_data = json.load(file)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid JSON file: {str(e)}")
+
+    if not raw_data:
+        raise ValueError("Raw data file is empty")
 
     return raw_data
 
@@ -63,17 +69,28 @@ def raw_to_numpy(
         npt.NDArray: Numpy array of shape (num_samples, num_particles, num_variables)
             where num_samples = num_trajectories * num_timesteps
     """
-    return np.array(
-        [
+    if not raw_data:
+        raise ValueError("Raw data is empty")
+
+    try:
+        numpy_data = np.array(
             [
-                [float(x) for var_name, x in particle.items()]
-                for particle_id, particle in particles.items()
-            ]
-            for traj_num, traj in raw_data.items()
-            for timestep, particles in traj.items()
-        ],
-        dtype=np.float32,
-    )
+                [
+                    [float(x) for var_name, x in particle.items()]
+                    for particle_id, particle in particles.items()
+                ]
+                for traj_num, traj in raw_data.items()
+                for timestep, particles in traj.items()
+            ],
+            dtype=np.float32,
+        )
+    except (TypeError, ValueError, AttributeError) as e:
+        raise ValueError(f"Invalid data format: {str(e)}")
+
+    if numpy_data.size == 0:
+        raise ValueError("Converted array is empty")
+
+    return numpy_data
 
 
 # Set up command line argument parser

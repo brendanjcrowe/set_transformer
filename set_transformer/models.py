@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 
 
-from modules import ISAB, PMA, SAB, PFDecoder
+from .modules import ISAB, PMA, SAB, PFDecoder
 
 
 class DeepSet(nn.Module):
