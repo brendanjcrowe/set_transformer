@@ -6,6 +6,60 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class PFDecoder(nn.Module):
+    """Particle Filter Decoder module.
+    
+    This module decodes encoded features back into a set of particles using
+    cross-attention between learned query vectors and encoded features,
+    followed by an MLP decoder.
+
+    Args:
+        encoder_dim (int): Dimension of the encoded features
+        hidden_dim (int): Dimension of hidden layers
+        n_particles (int): Number of particles to generate
+        n_vars (int): Number of variables per particle
+    """
+
+    def __init__(
+        self, 
+        encoder_dim: int, 
+        hidden_dim: int, 
+        n_particles: int, 
+        n_vars: int
+    ) -> None:
+        super(PFDecoder, self).__init__()
+        self.n_particles = n_particles
+        self.n_vars = n_vars
+        self.hidden_dim = hidden_dim
+        self.encoder_dim = encoder_dim
+        self.mlp = nn.Sequential(
+            nn.Linear(self.encoder_dim, self.hidden_dim),
+            nn.ReLU(),
+            nn.Linear(self.hidden_dim, n_vars),
+        )
+        self.query_vectors = nn.Parameter(torch.randn(n_particles, self.encoder_dim))
+
+    def forward(self, encoded_features: torch.Tensor) -> torch.Tensor:
+        """Forward pass of the PFDecoder.
+
+        Args:
+            encoded_features (torch.Tensor): Encoded features of shape (batch_size, num_encodings, encoder_dim)
+
+        Returns:
+            torch.Tensor: Decoded particles of shape (batch_size, n_particles, n_vars)
+        """
+        # Cross-attend encoded features using learned queries
+        attention_weights = torch.matmul(
+            self.query_vectors, encoded_features.transpose(-1, -2)
+        )
+        attention_weights = torch.softmax(attention_weights, dim=-1)
+        attended_features = torch.matmul(attention_weights, encoded_features)
+
+        # Decode using MLP
+        decoded_output = self.mlp(attended_features)
+        return decoded_output
+
+
 class MAB(nn.Module):
     """Multihead Attention Block (MAB) module.
     
