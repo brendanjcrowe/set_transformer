@@ -107,3 +107,9 @@ venv.bak/
 **/results
 *.pkl
 *.log
+
+
+# data
+/set_transformer/data/raw/*.json
+/set_transformer/data/numpy/*.npy
+/set_transformer/data/torch/*.pyt
