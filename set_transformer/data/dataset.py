@@ -111,15 +111,13 @@ def get_data_loader(
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
-        shuffle=True,
-        pin_memory=(device == "cuda")
+        shuffle=True
     )
 
     eval_loader = DataLoader(
         eval_dataset,
         batch_size=batch_size,
-        shuffle=False,
-        pin_memory=(device == "cuda")
+        shuffle=False
     )
 
     return train_loader, eval_loader, train_size, eval_size
