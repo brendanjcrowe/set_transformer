@@ -1,4 +1,5 @@
 import math
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -6,7 +7,26 @@ import torch.nn.functional as F
 
 
 class PFDecoder(nn.Module):
-    def __init__(self, encoder_dim, hidden_dim, n_particles, n_vars):
+    """Particle Filter Decoder module.
+    
+    This module decodes encoded features back into a set of particles using
+    cross-attention between learned query vectors and encoded features,
+    followed by an MLP decoder.
+
+    Args:
+        encoder_dim (int): Dimension of the encoded features
+        hidden_dim (int): Dimension of hidden layers
+        n_particles (int): Number of particles to generate
+        n_vars (int): Number of variables per particle
+    """
+
+    def __init__(
+        self, 
+        encoder_dim: int, 
+        hidden_dim: int, 
+        n_particles: int, 
+        n_vars: int
+    ) -> None:
         super(PFDecoder, self).__init__()
         self.n_particles = n_particles
         self.n_vars = n_vars
@@ -19,7 +39,15 @@ class PFDecoder(nn.Module):
         )
         self.query_vectors = nn.Parameter(torch.randn(n_particles, self.encoder_dim))
 
-    def forward(self, encoded_features):
+    def forward(self, encoded_features: torch.Tensor) -> torch.Tensor:
+        """Forward pass of the PFDecoder.
+
+        Args:
+            encoded_features (torch.Tensor): Encoded features of shape (batch_size, num_encodings, encoder_dim)
+
+        Returns:
+            torch.Tensor: Decoded particles of shape (batch_size, n_particles, n_vars)
+        """
         # Cross-attend encoded features using learned queries
         attention_weights = torch.matmul(
             self.query_vectors, encoded_features.transpose(-1, -2)
@@ -33,7 +61,23 @@ class PFDecoder(nn.Module):
 
 
 class MAB(nn.Module):
-    def __init__(self, dim_Q, dim_K, dim_V, num_heads, ln=False):
+    """Multihead Attention Block (MAB) module.
+    
+    This is a core building block of the Set Transformer that implements multihead attention
+    with preprocessing and postprocessing networks. It computes attention between a set of 
+    queries Q and a set of key-value pairs K (where K is also used as values).
+
+    Args:
+        dim_Q (int): Dimension of the query features
+        dim_K (int): Dimension of the key features
+        dim_V (int): Dimension of the value features (output dimension)
+        num_heads (int): Number of attention heads
+        ln (bool, optional): Whether to use layer normalization. Defaults to False.
+    """
+
+    def __init__(
+        self, dim_Q: int, dim_K: int, dim_V: int, num_heads: int, ln: bool = False
+    ) -> None:
         super(MAB, self).__init__()
         self.dim_V = dim_V
         self.num_heads = num_heads
@@ -45,7 +89,16 @@ class MAB(nn.Module):
             self.ln1 = nn.LayerNorm(dim_V)
         self.fc_o = nn.Linear(dim_V, dim_V)
 
-    def forward(self, Q, K):
+    def forward(self, Q: torch.Tensor, K: torch.Tensor) -> torch.Tensor:
+        """Forward pass of the MAB module.
+
+        Args:
+            Q (torch.Tensor): Query tensor of shape (batch_size, num_queries, dim_Q)
+            K (torch.Tensor): Key tensor of shape (batch_size, num_keys, dim_K)
+
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, num_queries, dim_V)
+        """
         Q = self.fc_q(Q)
         K, V = self.fc_k(K), self.fc_v(K)
 
@@ -63,33 +116,103 @@ class MAB(nn.Module):
 
 
 class SAB(nn.Module):
-    def __init__(self, dim_in, dim_out, num_heads, ln=False):
+    """Self-Attention Block (SAB) module.
+    
+    This module applies self-attention to a set of inputs. It's essentially a MAB where
+    the input set acts as both the query and key-value set, enabling the elements to
+    attend to each other.
+
+    Args:
+        dim_in (int): Input dimension
+        dim_out (int): Output dimension
+        num_heads (int): Number of attention heads
+        ln (bool, optional): Whether to use layer normalization. Defaults to False.
+    """
+
+    def __init__(
+        self, dim_in: int, dim_out: int, num_heads: int, ln: bool = False
+    ) -> None:
         super(SAB, self).__init__()
         self.mab = MAB(dim_in, dim_in, dim_out, num_heads, ln=ln)
 
-    def forward(self, X):
+    def forward(self, X: torch.Tensor) -> torch.Tensor:
+        """Forward pass of the SAB module.
+
+        Args:
+            X (torch.Tensor): Input tensor of shape (batch_size, set_size, dim_in)
+
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, set_size, dim_out)
+        """
         return self.mab(X, X)
 
 
 class ISAB(nn.Module):
-    def __init__(self, dim_in, dim_out, num_heads, num_inds, ln=False):
+    """Induced Set Attention Block (ISAB) module.
+    
+    This module implements a more efficient version of SAB by using a set of inducing points.
+    Instead of computing attention between all pairs of elements (O(n²) complexity),
+    it computes attention through a smaller set of inducing points (O(n) complexity).
+
+    Args:
+        dim_in (int): Input dimension
+        dim_out (int): Output dimension
+        num_heads (int): Number of attention heads
+        num_inds (int): Number of inducing points
+        ln (bool, optional): Whether to use layer normalization. Defaults to False.
+    """
+
+    def __init__(
+        self, dim_in: int, dim_out: int, num_heads: int, num_inds: int, ln: bool = False
+    ) -> None:
         super(ISAB, self).__init__()
         self.I = nn.Parameter(torch.Tensor(1, num_inds, dim_out))
         nn.init.xavier_uniform_(self.I)
         self.mab0 = MAB(dim_out, dim_in, dim_out, num_heads, ln=ln)
         self.mab1 = MAB(dim_in, dim_out, dim_out, num_heads, ln=ln)
 
-    def forward(self, X):
+    def forward(self, X: torch.Tensor) -> torch.Tensor:
+        """Forward pass of the ISAB module.
+
+        Args:
+            X (torch.Tensor): Input tensor of shape (batch_size, set_size, dim_in)
+
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, set_size, dim_out)
+        """
         H = self.mab0(self.I.repeat(X.size(0), 1, 1), X)
         return self.mab1(X, H)
 
 
 class PMA(nn.Module):
-    def __init__(self, dim, num_heads, num_seeds, ln=False):
+    """Pooling by Multihead Attention (PMA) module.
+    
+    This module learns to pool a set of features into a fixed number of outputs using
+    multihead attention. It uses a set of learned seed vectors to attend to the input set,
+    producing a fixed-size output regardless of the input set size.
+
+    Args:
+        dim (int): Feature dimension
+        num_heads (int): Number of attention heads
+        num_seeds (int): Number of seed vectors (output size)
+        ln (bool, optional): Whether to use layer normalization. Defaults to False.
+    """
+
+    def __init__(
+        self, dim: int, num_heads: int, num_seeds: int, ln: bool = False
+    ) -> None:
         super(PMA, self).__init__()
         self.S = nn.Parameter(torch.Tensor(1, num_seeds, dim))
         nn.init.xavier_uniform_(self.S)
         self.mab = MAB(dim, dim, dim, num_heads, ln=ln)
 
-    def forward(self, X):
+    def forward(self, X: torch.Tensor) -> torch.Tensor:
+        """Forward pass of the PMA module.
+
+        Args:
+            X (torch.Tensor): Input tensor of shape (batch_size, set_size, dim)
+
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, num_seeds, dim)
+        """
         return self.mab(self.S.repeat(X.size(0), 1, 1), X)
