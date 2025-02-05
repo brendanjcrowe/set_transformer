@@ -9,12 +9,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from tqdm import tqdm
+
+from set_transformer.data.dataset import get_data_loader
+from set_transformer.loss import ChamferDistanceLoss, SinkhornLoss
+
 from .mixture_of_mvns import MixtureOfMVNs
 from .models import DeepSet, PFSetTransformer, SetTransformer
 from .mvn_diag import MultivariateNormalDiag
-from tqdm import tqdm
-from set_transformer.data.dataset import get_data_loader
-from set_transformer.loss import ChamferDistanceLoss, SinkhornLoss
+from .plots import visualize_particle_filter_reconstruction
 
 
 def train(args, train_loader, eval_loader, train_size, eval_size):
@@ -27,7 +30,7 @@ def train(args, train_loader, eval_loader, train_size, eval_size):
         train_size: Number of training samples.
         eval_size: Number of evaluation samples.
     """
-    save_dir = os.path.join('results', args.net, args.run_name)
+    save_dir = os.path.join("results", args.net, args.run_name)
     if not os.path.exists(save_dir):
         os.makedirs(save_dir)
 
@@ -41,7 +44,7 @@ def train(args, train_loader, eval_loader, train_size, eval_size):
     )
     logger.info(str(args) + "\n")
 
-    device = torch.device(f'cuda:{args.gpu}' if torch.cuda.is_available() else 'cpu')
+    device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
     if args.net == "pf_set_transformer":
         net = PFSetTransformer(
             num_particles=args.K,
@@ -57,7 +60,9 @@ def train(args, train_loader, eval_loader, train_size, eval_size):
         raise ValueError("Invalid net {}".format(args.net))
 
     optimizer = torch.optim.Adam(net.parameters(), lr=0.001)
-    criterion = SinkhornLoss(p=2, blur=0.5) # For example, if you’re reconstructing particles
+    criterion = SinkhornLoss(
+        p=2, blur=0.5
+    )  # For example, if you're reconstructing particles
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.num_steps
     )
@@ -100,7 +105,7 @@ def train(args, train_loader, eval_loader, train_size, eval_size):
         if t % args.save_freq == 0:
             torch.save(
                 {"state_dict": net.state_dict()},
-                os.path.join(save_dir, f"model_{t}.tar")
+                os.path.join(save_dir, f"model_{t}.tar"),
             )
 
     torch.save({"state_dict": net.state_dict()}, os.path.join(save_dir, "model.tar"))
@@ -139,12 +144,12 @@ def test(net, eval_loader, eval_size, verbose=True):
     return result, avg_loss
 
 
-def plot(eval_loader, loss):
-    """Plot results.
+def plot(eval_loader, loss=None):
+    """Plot particle filter reconstruction results.
 
     Args:
         eval_loader: Evaluation data loader.
-        loss: Loss value to display.
+        loss: Optional loss value to display.
     """
     device = next(net.parameters()).device
     net.eval()
@@ -154,14 +159,13 @@ def plot(eval_loader, loss):
         X = X.to(device)
         Z = net(X)
 
-    plt.figure(figsize=(10, 5))
-    plt.subplot(121)
-    plt.scatter(X.cpu().numpy()[:, 0], X.cpu().numpy()[:, 1])
-    plt.title('Input')
-
-    plt.subplot(122)
-    plt.scatter(Z.cpu().numpy()[:, 0], Z.cpu().numpy()[:, 1])
-    plt.title(f'Latent (Loss: {loss:.4f})')
+    # Plot first batch of particles
+    title = (
+        f"Particle Filter Reconstruction (Loss: {loss:.4f})"
+        if loss is not None
+        else None
+    )
+    visualize_particle_filter_reconstruction(X[0], Z[0], title=title)
     plt.show()
 
 
@@ -195,7 +199,9 @@ if __name__ == "__main__":
     # mog = MixtureOfMVNs(mvn)
     # dim_output = 2*D
 
-    save_dir = os.path.join("results", args.net, args.run_name + "_" + time.strftime("%Y-%m-DD:hh-mm-ss"))
+    save_dir = os.path.join(
+        "results", args.net, args.run_name + "_" + time.strftime("%Y-%m-DD:hh-mm-ss")
+    )
 
     if args.mode == "bench":
         generate_benchmark()
