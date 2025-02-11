@@ -5,22 +5,25 @@ processing POMDP (Partially Observable Markov Decision Process) data.
 """
 
 from typing import List, Optional, Tuple, Union
+
 import numpy as np
 import numpy.typing as npt
 import torch
-from torch.utils.data import Dataset, DataLoader
-from torch.utils.data import random_split
+from torch.utils.data import DataLoader, Dataset, random_split
 
 
 class POMDPDataset(Dataset):
     """Dataset class for POMDP data."""
 
-    def __init__(self, data: Union[np.ndarray, torch.Tensor]) -> None:
+    def __init__(
+        self, data: Union[np.ndarray, torch.Tensor], device: str = "cpu"
+    ) -> None:
         """Initialize dataset.
 
         Args:
             data (Union[np.ndarray, torch.Tensor]): Data array of shape
                 (num_samples, num_particles, particle_dim).
+            device (str, optional): Device to store data on. Defaults to "cpu".
 
         Raises:
             ValueError: If data is empty or has wrong shape.
@@ -36,6 +39,7 @@ class POMDPDataset(Dataset):
             raise ValueError("Data cannot be empty")
 
         self.data = data
+        self.device = device
 
     def __len__(self) -> int:
         """Get the total number of samples in the dataset.
@@ -54,27 +58,29 @@ class POMDPDataset(Dataset):
         Returns:
             torch.Tensor: Sample at index idx.
         """
-        return self.data[idx]
+        return self.data[idx].to(self.device)
 
 
-def get_dataset(data_path: str) -> POMDPDataset:
+def get_dataset(data_path: str, device: str = "cpu") -> POMDPDataset:
     """Load dataset from file.
 
     Args:
         data_path (str): Path to data file.
+        device (str, optional): Device to store data on. Defaults to "cpu".
 
     Returns:
         POMDPDataset: Dataset object.
     """
     data = np.load(data_path)
-    return POMDPDataset(data)
+    return POMDPDataset(data, device)
 
 
 def get_data_loader(
     batch_size: int,
     data_path: str,
     device: str,
-    train_split: float = 0.8
+    train_split: float = 0.8,
+    num_workers: int = 0,
 ) -> Tuple[DataLoader, DataLoader, int, int]:
     """Create data loaders for training and evaluation.
 
@@ -87,6 +93,8 @@ def get_data_loader(
         device (str): Device to load data on ('cpu' or 'cuda').
         train_split (float, optional): Fraction of data to use for training.
             Defaults to 0.8.
+        num_workers (int, optional): Number of worker processes for data loading.
+            Defaults to 0.
 
     Returns:
         Tuple[DataLoader, DataLoader, int, int]: Training loader, evaluation loader,
@@ -98,26 +106,18 @@ def get_data_loader(
     if not 0 < train_split < 1:
         raise ValueError("Train split must be between 0 and 1")
 
-    dataset = get_dataset(data_path)
-    dataset.data = dataset.data.to(device)
-
+    dataset = get_dataset(data_path, device)
     train_size = int(train_split * len(dataset))
     eval_size = len(dataset) - train_size
 
-    train_dataset, eval_dataset = random_split(
-        dataset, [train_size, eval_size]
-    )
+    train_dataset, eval_dataset = random_split(dataset, [train_size, eval_size])
 
     train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True
+        train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers
     )
 
     eval_loader = DataLoader(
-        eval_dataset,
-        batch_size=batch_size,
-        shuffle=False
+        eval_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers
     )
 
     return train_loader, eval_loader, train_size, eval_size
