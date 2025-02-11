@@ -8,15 +8,26 @@ import logging
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
+# Configure matplotlib to use 'Agg' backend
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import wandb
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
-from ..loss import ChamferDistanceLoss, HausdorffDistanceLoss, SinkhornLoss, EarthMoverDistanceLoss
+import wandb
+
+from ..loss import (
+    ChamferDistanceLoss,
+    EarthMoverDistanceLoss,
+    HausdorffLoss,
+    SinkhornLoss,
+)
 from ..models import PFSetTransformer
 from ..plots import visualize_particle_filter_reconstruction
 from .config import ExperimentConfig, TrainingConfig
@@ -149,14 +160,16 @@ class Trainer:
         Returns:
             nn.Module: Initialized loss function
         """
-        if self.config.loss_type == "hausdorff":
-            return HausdorffDistanceLoss()
+        if self.config.loss_type == "emd":
+            return EarthMoverDistanceLoss()
         elif self.config.loss_type == "chamfer":
             return ChamferDistanceLoss()
         elif self.config.loss_type == "sinkhorn":
             return SinkhornLoss(
                 blur=self.config.sinkhorn_blur, scaling=self.config.sinkhorn_scaling
             )
+        elif self.config.loss_type == "hausdorff":
+            return HausdorffLoss()
         else:
             raise ValueError(f"Unknown loss type: {self.config.loss_type}")
 
@@ -270,20 +283,44 @@ class Trainer:
 
             # Logging
             if self.global_step % self.config.log_freq == 0:
+                # Calculate running averages
+                running_loss = total_loss / num_batches
+
+                # Log to tensorboard
                 self.writer.add_scalar("train/loss", loss.item(), self.global_step)
+                self.writer.add_scalar(
+                    "train/running_loss", running_loss, self.global_step
+                )
+
+                # Log to wandb with more metrics
                 wandb.log(
                     {
-                        "train/loss": loss.item(),
+                        "train/step_loss": loss.item(),
+                        "train/running_loss": running_loss,
                         "train/learning_rate": self.optimizer.param_groups[0]["lr"],
+                        "training/step": self.global_step,
+                        "training/epoch": self.current_epoch,
                     },
                     step=self.global_step,
                 )
 
             # Evaluation
             if self.global_step % self.config.eval_freq == 0:
-                val_loss = self.evaluate()
+                val_loss, val_metrics = self.evaluate()
+
+                # Log to tensorboard
                 self.writer.add_scalar("val/loss", val_loss, self.global_step)
-                wandb.log({"val/loss": val_loss}, step=self.global_step)
+
+                # Log to wandb with evaluation metrics
+                wandb.log(
+                    {
+                        "val/loss": val_loss,
+                        "val/earth_mover_distance": val_metrics["emd"],
+                        "val/step": self.global_step,
+                        "val/epoch": self.current_epoch,
+                    },
+                    step=self.global_step,
+                )
 
                 # Save visualization
                 self._save_visualization(batch, output)
@@ -292,6 +329,10 @@ class Trainer:
                 if val_loss < self.best_val_loss:
                     self.best_val_loss = val_loss
                     self.save_checkpoint(is_best=True)
+                    wandb.log(
+                        {"val/best_loss": val_loss},
+                        step=self.global_step,
+                    )
 
             # Regular checkpoint saving
             if self.global_step % self.config.save_freq == 0:
@@ -300,26 +341,40 @@ class Trainer:
         epoch_loss = total_loss / num_batches
         return epoch_loss
 
-    def evaluate(self) -> float:
+    def evaluate(self) -> Tuple[float, Dict[str, float]]:
         """Evaluate the model.
 
         Returns:
-            float: Average validation loss
+            Tuple[float, Dict[str, float]]: Average validation loss and metrics dictionary
         """
         self.model.eval()
         total_loss = 0
+        total_emd = 0
         num_batches = 0
 
         with torch.no_grad():
             for batch in self.val_loader:
                 batch = batch.to(self.config.device)
                 output = self.model(batch)
-                loss = self.eval_loss(output, batch)
 
+                # Calculate validation loss (using training loss)
+                loss = self.train_loss(output, batch)
                 total_loss += loss.item()
+
+                # Calculate Earth Mover Distance (always)
+                emd = self.eval_loss(output, batch)
+                total_emd += emd.item()
+
                 num_batches += 1
 
-        return total_loss / num_batches
+        avg_loss = total_loss / num_batches
+        avg_emd = total_emd / num_batches
+
+        metrics = {
+            "emd": avg_emd,
+        }
+
+        return avg_loss, metrics
 
     def _save_visualization(
         self, input_batch: torch.Tensor, output_batch: torch.Tensor
@@ -330,14 +385,18 @@ class Trainer:
             input_batch: Input particle set
             output_batch: Reconstructed particle set
         """
-        # Take first example from batch
-        input_particles = input_batch[0].cpu().numpy()
-        output_particles = output_batch[0].cpu().numpy()
+        # Take first example from batch and detach from computation graph
+        input_particles = input_batch[0].detach().cpu().numpy()
+        output_particles = output_batch[0].detach().cpu().numpy()
+
+        # Create figure
+        fig, ((ax1, ax2, ax3), (ax4, ax5, ax6)) = plt.subplots(2, 3, figsize=(18, 10))
 
         # Create visualization
-        fig = visualize_particle_filter_reconstruction(
+        visualize_particle_filter_reconstruction(
             input_particles,
             output_particles,
+            ax=(ax1, ax2, ax3, ax4, ax5, ax6),
             title=f"Reconstruction (Step {self.global_step})",
         )
 
@@ -347,6 +406,9 @@ class Trainer:
 
         # Save to file
         fig.savefig(self.exp_config.log_dir / f"reconstruction_{self.global_step}.png")
+
+        # Close the figure to free memory
+        plt.close(fig)
 
     def train(self) -> None:
         """Train the model for the specified number of epochs."""
@@ -368,7 +430,14 @@ class Trainer:
 
             # Log epoch metrics
             self.writer.add_scalar("train/epoch_loss", epoch_loss, epoch)
-            wandb.log({"train/epoch_loss": epoch_loss, "epoch": epoch})
+            wandb.log(
+                {
+                    "train/epoch_loss": epoch_loss,
+                    "epoch": epoch,
+                    "learning_rate": self.optimizer.param_groups[0]["lr"],
+                },
+                step=self.global_step,
+            )
 
         self.logger.info("Training completed!")
         wandb.finish()
