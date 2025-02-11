@@ -202,19 +202,47 @@ class HausdorffLoss(SampleLoss):
         return "Hausdorff Loss"
 
 
-class EarthMoverDistanceLoss(object):
+class EarthMoverDistanceLoss(nn.Module):
     """Earth Mover Distance Loss for comparing two point sets.
 
     This loss computes the Earth Mover's Distance (Wasserstein distance) between two point sets.
 
     Note: This is a non-differentiable loss function. Cannot be used with backpropagation.
+
+    Args:
+        reduction (str): Reduction method for the loss. One of: "mean", "sum", "max", "min".
+
+    Raises:
+        TypeError: If reduction is not a string.
+        ValueError: If reduction is not one of the supported methods.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        reduction: Literal["mean", "sum", "max", "min", "none"] = "mean",
+    ) -> None:
         """
         Initialize the EarthMoverDistanceLoss class.
+
+        Args:
+            reduction (str): Reduction method for the loss. One of: "mean", "sum", "max", "min".
+
+        Raises:
+            TypeError: If reduction is not a string.
+            ValueError: If reduction is not one of the supported methods.
         """
-        pass
+        super(EarthMoverDistanceLoss, self).__init__()
+        if reduction is None:
+            reduction = "none"
+        if not isinstance(reduction, str):
+            raise TypeError(
+                f"reduction must be of type str, got type {type(reduction)}"
+            )
+        if reduction not in list(reduction_map.keys()):
+            raise ValueError(
+                f"reduction must be one of: {list(reduction_map.keys())}, got {reduction}"
+            )
+        self.reduction = reduction_map[reduction]
 
     def forward(
         self,
@@ -231,19 +259,33 @@ class EarthMoverDistanceLoss(object):
             target_set (torch.Tensor): Target set of points of shape (batch_size, num_points, dim)
             predicted_weights (torch.Tensor): Weights for the predicted set of shape (batch_size, num_points)
             target_weights (torch.Tensor): Weights for the target set of shape (batch_size, num_points)
+
+        Returns:
+            torch.Tensor: Computed Earth Mover Distance after applying the reduction method
         """
-        X, Y = predicted_set.cpu().numpy(), target_set.cpu().numpy()
-        if predicted_weights is None:
-            predicted_weights = np.ones(X.shape[0]) / X.shape[0]
-        else:
-            predicted_weights = predicted_weights.cpu().numpy()
-        if target_weights is None:
-            target_weights = np.ones(Y.shape[0]) / Y.shape[0]
-        else:
-            target_weights = target_weights.cpu().numpy()
-        cost_matrix = np.linalg.norm(X[:, None] - Y[None, :], axis=2)
-        loss = ot.emd2(predicted_weights, target_weights, cost_matrix)
-        return self.reduction(loss)
+        batch_size = predicted_set.size(0)
+        losses = []
+
+        for i in range(batch_size):
+            X = predicted_set[i].detach().cpu().numpy()
+            Y = target_set[i].detach().cpu().numpy()
+
+            if predicted_weights is None:
+                p_weights = np.ones(X.shape[0]) / X.shape[0]
+            else:
+                p_weights = predicted_weights[i].detach().cpu().numpy()
+
+            if target_weights is None:
+                t_weights = np.ones(Y.shape[0]) / Y.shape[0]
+            else:
+                t_weights = target_weights[i].detach().cpu().numpy()
+
+            cost_matrix = np.linalg.norm(X[:, None] - Y[None, :], axis=2)
+            loss = ot.emd2(p_weights, t_weights, cost_matrix)
+            losses.append(loss)
+
+        losses = torch.tensor(losses, device=predicted_set.device)
+        return self.reduction(losses)
 
     def __str__(self) -> str:
         """
