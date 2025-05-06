@@ -1,0 +1,46 @@
+{
+  "os":  "Linux-5.15.0-131-generic-x86_64-with-glibc2.31",
+  "python":  "CPython 3.11.10",
+  "startedAt":  "2025-02-11T01:20:49.878425Z",
+  "args":  [
+    "--loss_type",
+    "chamfer",
+    "--data_path",
+    "set_transformer/data/numpy/data.npy"
+  ],
+  "program":  "-m set_transformer.training.main",
+  "git":  {
+    "remote":  "https://github.com/brendanjcrowe/set_transformer.git",
+    "commit":  "48db6e883b7cbd36d6383902ccdad6a8ca111488"
+  },
+  "email":  "brendancrowe98@gmail.com",
+  "root":  "/home/brendan/set_transformer",
+  "host":  "brendan-lab-desktop",
+  "executable":  "/home/brendan/miniconda3/envs/SetTransformer/bin/python",
+  "cpu_count":  24,
+  "cpu_count_logical":  32,
+  "gpu":  "NVIDIA GeForce RTX 4070 Ti SUPER",
+  "gpu_count":  1,
+  "disk":  {
+    "/":  {
+      "total":  "1967317549056",
+      "used":  "120298201088"
+    }
+  },
+  "memory":  {
+    "total":  "33468268544"
+  },
+  "cpu":  {
+    "count":  24,
+    "countLogical":  32
+  },
+  "gpu_nvidia":  [
+    {
+      "name":  "NVIDIA GeForce RTX 4070 Ti SUPER",
+      "memoryTotal":  "17171480576",
+      "cudaCores":  8448,
+      "architecture":  "Ada"
+    }
+  ],
+  "cudaVersion":  "12.2"
+}
