@@ -56,7 +56,7 @@ def create_pf_dataset(num_trajectories, timesteps_per_trajectory, num_particles=
     
     # Initialize environment
     env = gym.make('pdomains-ant-tag-v0', rendering=False)
-    env.seed(seed)
+    env.reset(seed=seed)
     
     raw_data = {}
     total_visible_error = 0
@@ -94,7 +94,7 @@ def create_pf_dataset(num_trajectories, timesteps_per_trajectory, num_particles=
             
             # Get the true opponent position from the environment state
             # (This would not be available in a real POMDP scenario, but we use it for evaluation)
-            true_opponent_pos = env.env.env.get_target_pos()
+            true_opponent_pos = get_target_pos(env)
             
             # Check if opponent is visible (within observation radius)
             ant_pos = np.array([obs[0], obs[1]])
@@ -341,6 +341,23 @@ class AntTagParticleFilter:
         all_particles.sort(key=lambda x: x[1], reverse=True)
         
         return all_particles
+
+
+def get_target_pos(env):
+    """
+    Get the target position from the environment.
+    Args:
+        env: The environment instance.
+    Returns:
+        target_pos: The target position as a numpy array.
+    """
+    # Get the target position from the environment
+    # This assumes that the target position is stored in the first mocap position
+    # and that the environment has a method to access it.
+
+    e = env.unwrapped 
+    target_pos = e.sim.data.mocap_pos[0][:2]
+    return target_pos
 
 def raw_to_numpy(raw_data):
     """
