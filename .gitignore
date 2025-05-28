@@ -113,3 +113,6 @@ venv.bak/
 /set_transformer/data/raw/*.json
 /set_transformer/data/numpy/*.npy
 /set_transformer/data/torch/*.pyt
+
+models/
+sb3_e2e_tensorboard/
