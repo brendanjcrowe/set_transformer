@@ -10,19 +10,21 @@ Usage:
 """
 
 import argparse
-import gymnasium as gym
-import numpy as np
-import os
-import torch
-import torch.nn as nn
-from torch.distributions import Normal
 import json
-from tqdm import tqdm
-import matplotlib.pyplot as plt
-from matplotlib.patches import Circle
+import os
 
 # Import Set Transformer modules
 import sys
+
+import gymnasium as gym
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+import torch.nn as nn
+from matplotlib.patches import Circle
+from torch.distributions import Normal
+from tqdm import tqdm
+
 sys.path.append('.')  # Add the current directory to path
 try:
     from set_transformer.modules import ISAB, PMA, SAB
@@ -31,15 +33,16 @@ except ImportError:
 
 # Import Stable Baselines 3
 from stable_baselines3 import PPO, SAC
-from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
-from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
-from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.evaluation import evaluate_policy
+from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize
 
 # Import our particle filter implementation
 from particle_filter_ant_tag import AntTagParticleFilter
+
 
 class SetTransformerNetwork(nn.Module):
     """
@@ -194,36 +197,39 @@ class ParticleFilterDictWrapper(gym.Wrapper):
     
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
+        obs = obs.astype(np.float32)  # Ensure obs is float32 early
         
         # Initialize a new particle filter
         self.particle_filter = AntTagParticleFilter(self.num_particles, obs)
         
         # Process the initial state
-        processed_obs = self._process_observation(obs)
+        processed_obs = self._process_observation(obs) # obs is already float32
         return processed_obs, info
     
     def step(self, action):
         next_obs, reward, terminated, truncated, info = self.env.step(action)
+        next_obs_float32 = next_obs.astype(np.float32) # Ensure next_obs is float32 early
         
         # Update particle filter
         # First predict step
         self.particle_filter.predict(action)
         
         # Get the true opponent position (for evaluation only)
-        true_opponent_pos = self.env.env.get_target_pos()
+        true_opponent_pos = self.env.unwrapped.get_target_pos().astype(np.float32) # Ensure float32
         
         # Check if opponent is visible
-        ant_pos = np.array([next_obs[0], next_obs[1]])
-        opponent_visible = np.linalg.norm(ant_pos - true_opponent_pos) <= 3.0
+        ant_pos = np.array([next_obs_float32[0], next_obs_float32[1]], dtype=np.float32)
+        opponent_visible = np.linalg.norm(ant_pos - true_opponent_pos) <= 3.0 # Both operands should be float32
         
         # Get observed position (NaN if not visible)
-        observed_opponent_pos = next_obs[13:15] if opponent_visible else np.array([np.nan, np.nan])
+        # next_obs_float32 is already float32, so slicing it will retain float32
+        observed_opponent_pos = next_obs_float32[13:15] if opponent_visible else np.array([np.nan, np.nan], dtype=np.float32)
         
         # Update particle filter with observation
-        self.particle_filter.update(observed_opponent_pos, ant_pos)
+        self.particle_filter.update(observed_opponent_pos, ant_pos) # ant_pos is float32
         
         # Process observation with particle filter
-        processed_obs = self._process_observation(next_obs)
+        processed_obs = self._process_observation(next_obs_float32) # Pass float32 next_obs
         
         return processed_obs, reward, terminated, truncated, info
     
@@ -240,7 +246,7 @@ class ParticleFilterDictWrapper(gym.Wrapper):
         
         # Create the dict observation
         dict_obs = {
-            "obs": obs,
+            "obs": obs.astype(np.float32),
             "particles": particle_features.astype(np.float32)
         }
         
@@ -248,6 +254,9 @@ class ParticleFilterDictWrapper(gym.Wrapper):
 
 def make_ant_tag_env(num_particles=100):
     """Helper function to create an Ant-Tag environment with particle filter"""
+    # Import pdomains to ensure environment is registered
+    import pdomains
+    
     env = gym.make('pdomains-ant-tag-v0')
     env = ParticleFilterDictWrapper(env, num_particles)
     env = Monitor(env)
@@ -332,7 +341,7 @@ class ParticleFilterVisualizerCallback(BaseCallback):
         ax.scatter(ant_pos[0], ant_pos[1], color='red', s=100, label='Ant')
         
         # Plot true opponent position
-        true_pos = self.eval_env.env.env.get_target_pos()
+        true_pos = self.eval_env.env.unwrapped.get_target_pos()
         ax.scatter(true_pos[0], true_pos[1], color='green', s=100, label='True Opponent')
         
         # Plot estimated position
@@ -519,7 +528,7 @@ def evaluate_e2e_agent(
                 ax.scatter(ant_pos[0], ant_pos[1], color='red', s=100, label='Ant')
                 
                 # Plot true opponent position
-                true_pos = env.env.env.get_target_pos()
+                true_pos = env.env.unwrapped.get_target_pos()
                 ax.scatter(true_pos[0], true_pos[1], color='green', s=100, label='True Opponent')
                 
                 # Plot estimated position
