@@ -2,6 +2,7 @@ import os
 
 import numpy as np
 import torch
+import torch.nn as nn
 
 # It's better to load the specific SetTransformer model class that was used for pretraining.
 # For now, let's assume it's the one from set_transformer.models
@@ -26,35 +27,108 @@ class PretrainedSetTransformerProcessor:
         
         try:
             # Attempt to load the model. 
-            # This assumes the model was saved as a full SetTransformer object.
-            # If only state_dict was saved, this needs to be adapted by first instantiating
-            # the model with correct parameters, then loading state_dict.
-            self.model = torch.load(model_path, map_location=self.device)
-            if not isinstance(self.model, SetTransformer):
-                 print(f"Warning: Loaded model from {model_path} is not an instance of set_transformer.models.SetTransformer. Ensure it has the expected interface (forward method, dim_input, dim_output attributes).")
+            # First try loading as a complete object, then try as state_dict
+            loaded = torch.load(model_path, map_location=self.device, weights_only=False)
+            
+            if isinstance(loaded, dict) and any(k.startswith('set_transformer.') or k.startswith('input_projection.') for k in loaded.keys()):
+                # It's a state_dict, likely from ParticleReconstructionModel
+                print("Detected state_dict format. Reconstructing model...")
+                # Extract set_transformer state_dict
+                st_state_dict = {k.replace('set_transformer.', ''): v 
+                                for k, v in loaded.items() 
+                                if k.startswith('set_transformer.')}
+                input_proj_state_dict = {k.replace('input_projection.', ''): v 
+                                        for k, v in loaded.items() 
+                                        if k.startswith('input_projection.')}
+                
+                # Reconstruct the SetTransformer - need to infer dimensions from state_dict
+                # Get dim_input from first layer weight shape
+                if input_proj_state_dict:
+                    # input_projection maps particle_dim -> st_hidden_dim
+                    particle_dim = input_proj_state_dict['weight'].shape[1]
+                    st_hidden_dim = input_proj_state_dict['weight'].shape[0]
+                else:
+                    # Try to infer from set_transformer
+                    if st_state_dict and 'encoder.0.weight' in st_state_dict:
+                        st_hidden_dim = st_state_dict['encoder.0.weight'].shape[0]
+                        particle_dim = 1  # Default for OddEvenPOMDP
+                    else:
+                        raise ValueError("Cannot infer model dimensions from state_dict")
+                
+                # Get num_outputs and other params from state_dict structure
+                # Look for PMA layer to get num_outputs
+                num_outputs = 1  # Default
+                if any('pma' in k.lower() for k in st_state_dict.keys()):
+                    # Try to infer from PMA layer
+                    for k in st_state_dict.keys():
+                        if 'pma' in k.lower() and 'weight' in k:
+                            num_outputs = st_state_dict[k].shape[0]
+                            break
+                
+                # Create input projection
+                self.input_projection = nn.Linear(particle_dim, st_hidden_dim)
+                if input_proj_state_dict:
+                    self.input_projection.load_state_dict(input_proj_state_dict)
+                
+                # Create SetTransformer - need to infer other params
+                num_heads = 4  # Default
+                num_inds = 32  # Default
+                dim_output = st_hidden_dim  # Usually same as hidden
+                
+                self.model = SetTransformer(
+                    dim_input=st_hidden_dim,
+                    num_outputs=num_outputs,
+                    dim_output=dim_output,
+                    dim_hidden=st_hidden_dim,
+                    num_heads=num_heads,
+                    num_inds=num_inds,
+                    ln=bool(num_inds)
+                )
+                self.model.load_state_dict(st_state_dict)
+                
+                self.dim_particle_input = particle_dim
+                self.st_output_dim = dim_output * num_outputs
+                
+            elif isinstance(loaded, SetTransformer):
+                # It's a complete SetTransformer object
+                self.model = loaded
+                self.input_projection = None
+                self.dim_particle_input = self.model.dim_input
+                self.st_output_dim = self.model.dim_output
+            else:
+                # Try to use it as-is (might be a wrapper model)
+                self.model = loaded
+                self.input_projection = None
+                if hasattr(self.model, 'set_transformer'):
+                    # It's a wrapper model with set_transformer attribute
+                    self.dim_particle_input = getattr(self.model, 'particle_dim', 1)
+                    self.st_output_dim = self.model.set_transformer.dim_output
+                else:
+                    raise ValueError(f"Unknown model format: {type(loaded)}")
             
             self.model.eval()  # Set to evaluation mode
             self.model.to(self.device)
+            if self.input_projection is not None:
+                self.input_projection.eval()
+                self.input_projection.to(self.device)
 
         except Exception as e:
             print(f"Error loading model from {model_path}: {e}")
-            print("Please ensure the model_path points to a valid PyTorch model file saved as a complete object (not just state_dict), or modify this loader.")
+            import traceback
+            traceback.print_exc()
             raise
 
-        # Try to get model dimensions. These might not exist if the loaded model is not the expected type.
-        try:
-            # These attributes (dim_input, dim_output) are specific to the SetTransformer class in set_transformer.models
-            # If your pretrained model has different attribute names for these, they need to be adapted.
-            self.dim_particle_input = self.model.dim_input
-            self.st_output_dim = self.model.dim_output 
-            # For SetTransformer from set_transformer.models, the PMA output (num_outputs) and final linear layer output (dim_output) are coupled.
-            # The effective feature dimension coming out is num_outputs * dim_output, but here it's simplified.
-            # The loaded model's forward pass should produce [batch, feature_dim]
-        except AttributeError as e:
-            print(f"Warning: Could not access dim_input or dim_output attributes from the loaded model. {e}")
-            print("Defaulting dim_particle_input to 3 and st_output_dim to 64. This might be incorrect.")
-            self.dim_particle_input = 3 # Default, assuming (x,y,weight)
-            self.st_output_dim = 64 # Default common ST output size
+        # Dimensions should be set during loading, but verify
+        if not hasattr(self, 'dim_particle_input') or not hasattr(self, 'st_output_dim'):
+            try:
+                if hasattr(self.model, 'dim_input'):
+                    self.dim_particle_input = self.model.dim_input
+                if hasattr(self.model, 'dim_output'):
+                    self.st_output_dim = self.model.dim_output
+            except:
+                print("Warning: Could not determine model dimensions. Using defaults.")
+                self.dim_particle_input = 1  # Default for OddEvenPOMDP
+                self.st_output_dim = 128  # Default
         
         print(f"Pretrained model loaded. Expected particle input dim: {self.dim_particle_input}, ST output dim: {self.st_output_dim}")
     
@@ -73,10 +147,25 @@ class PretrainedSetTransformerProcessor:
         if particle_set.shape[-1] != self.dim_particle_input:
             raise ValueError(f"Input particle dimension {particle_set.shape[-1]} does not match model's expected input dimension {self.dim_particle_input}")
         
-        particle_set = particle_set.to(self.device) # Ensure tensor is on the correct device
+        particle_set = particle_set.to(self.device) # Ensure tensor is on the same device
 
         with torch.no_grad():
-            features = self.model(particle_set) # Expected output: [batch_size, st_output_dim]
+            # If we have input_projection, use it first
+            if self.input_projection is not None:
+                # Project particles to hidden dimension
+                projected = self.input_projection(particle_set)
+                # Process through SetTransformer
+                features = self.model(projected)  # [batch_size, num_outputs, dim_output]
+            elif hasattr(self.model, 'set_transformer'):
+                # It's a wrapper model
+                features = self.model.set_transformer(particle_set)
+            else:
+                # Direct SetTransformer
+                features = self.model(particle_set)
+            
+            # Flatten if needed (if features is [batch, num_outputs, dim_output])
+            if len(features.shape) == 3:
+                features = features.view(features.shape[0], -1)  # [batch, num_outputs * dim_output]
         
         return features.cpu().numpy()
 

@@ -9,10 +9,12 @@ import argparse
 import os
 from typing import Dict, List, Tuple
 
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from pdomains.odd_even_pomdp import OddEvenPOMDP, OddEvenPOMDPConfig
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
@@ -23,58 +25,68 @@ from set_transformer.modules import ISAB, MAB, PMA, SAB
 
 class ParticleReconstructionDataset(Dataset):
     """
-    Dataset for training Set Transformer to reconstruct particles from belief distributions.
+    Dataset for training Set Transformer to reconstruct particles from input particles.
     
     Each sample contains:
-    - Input: Observation history from the POMDP
-    - Target: Particle set representing the belief distribution over modes
+    - Input: Particle set sampled from the true belief distribution
+    - Target: Another particle set sampled from the same distribution (what we want to reconstruct)
     - Ground Truth: True belief distribution for evaluation
     """
     
     def __init__(self, 
                  pomdp_config,
-                 num_samples: int = 10000,
-                 num_particles: int = 100,
-                 observation_history_length: int = 5):
+                 num_samples: int = 1000,
+                 num_particles: int = 100):
         """
         Args:
             pomdp_config: OddEvenPOMDPConfig instance
             num_samples: Number of training samples to generate
             num_particles: Number of particles per sample
-            observation_history_length: Length of observation history to use as input
         """
         self.pomdp_config = pomdp_config
         self.num_samples = num_samples
         self.num_particles = num_particles
-        self.obs_history_length = observation_history_length
+        
+        # Create a shared RNG for generating different seeds for each POMDP
+        # This ensures each POMDP gets a different mean
+        base_seed = pomdp_config.seed if pomdp_config.seed is not None else 42
+        self.dataset_rng = np.random.RandomState(base_seed)
         
         # Generate training data
         self.samples = self._generate_samples()
         
     def _generate_samples(self) -> List[Dict]:
         """Generate training samples"""
-        from odd_even_pomdp import OddEvenPOMDP, OddEvenPOMDPConfig
         
         samples = []
         
         for i in range(self.num_samples):
-            # Create a new POMDP instance for each sample
-            pomdp = OddEvenPOMDP(self.pomdp_config)
+            # Create a new POMDP instance for each sample with a different seed
+            # This ensures each POMDP gets a different random mean
+            sample_config = OddEvenPOMDPConfig(
+                n=self.pomdp_config.n,
+                mean=None,  # Let it be random for each sample
+                std_dev=self.pomdp_config.std_dev,
+                belief_resolution=self.pomdp_config.belief_resolution,
+                seed=self.dataset_rng.randint(0, 2**31)  # Use a different seed for each POMDP
+            )
+            pomdp = OddEvenPOMDP(sample_config)
             
-            # Generate observation history and update belief
-            obs_history = []
-            for _ in range(self.obs_history_length):
-                obs = pomdp.get_observation()
-                pomdp.update_belief(obs)
-                obs_history.append(obs)
+            # Sample particles from the true belief distribution over modes
+            # Particles are sampled from valid_numbers according to observation probabilities
+            input_particles = pomdp.rng.choice(pomdp.valid_numbers, size=self.num_particles, p=pomdp.observation_probs)
+            input_particles = input_particles.reshape(-1, 1)  # Shape: (num_particles, 1)
             
-            # Sample particles from the current belief distribution over modes
-            particles = self._sample_particles_from_belief(pomdp.belief, pomdp.belief_points, self.num_particles)
+            # Target particles (same distribution, but different sample)
+            # This is what we want to reconstruct
+            target_particles = pomdp.rng.choice(pomdp.valid_numbers, size=self.num_particles, p=pomdp.observation_probs)
+            target_particles = target_particles.reshape(-1, 1)  # Shape: (num_particles, 1)
             
             # Create sample
             sample = {
-                'obs_history': np.array(obs_history, dtype=np.float32),
-                'particles': particles.astype(np.float32),
+                'input_particles': input_particles.astype(np.float32),
+                'target_particles': target_particles.astype(np.float32),
+                'particles': target_particles.astype(np.float32),  # Alias for compatibility
                 'belief': pomdp.belief.astype(np.float32),  # Full belief distribution
                 'belief_points': pomdp.belief_points.astype(np.float32),  # Support points
                 'true_mode': pomdp.mean,  # True mode (mean of the Gaussian)
@@ -85,32 +97,7 @@ class ParticleReconstructionDataset(Dataset):
             samples.append(sample)
             
         return samples
-    
-    def _sample_particles_from_belief(self, belief: np.ndarray, belief_points: np.ndarray, num_particles: int) -> np.ndarray:
-        """
-        Sample particles from a belief distribution over modes.
-        
-        For the mode prediction POMDP, particles represent possible mode values.
-        Each particle is a scalar value representing a possible mode.
-        """
-        # Sample particles according to the belief distribution
-        # belief_points: discrete support points for the belief
-        # belief: probabilities over these support points
-        
-        # Sample indices according to belief probabilities
-        particle_indices = np.random.choice(len(belief_points), size=num_particles, p=belief)
-        
-        # Get the corresponding mode values
-        particles = belief_points[particle_indices]
-        
-        # Add some noise to make particles more realistic (represent uncertainty)
-        noise_std = 0.1  # Small noise to represent uncertainty within each belief point
-        particles = particles + np.random.normal(0, noise_std, particles.shape)
-        
-        # Clip to valid range [1, n]
-        particles = np.clip(particles, 1, self.pomdp_config.n)
-        
-        return particles.reshape(-1, 1)  # Shape: (num_particles, 1)
+
     
     def __len__(self):
         return len(self.samples)
@@ -118,8 +105,9 @@ class ParticleReconstructionDataset(Dataset):
     def __getitem__(self, idx):
         sample = self.samples[idx]
         return {
-            'obs_history': torch.LongTensor(sample['obs_history']),  # Convert to LongTensor for embedding
-            'particles': torch.FloatTensor(sample['particles']),
+            'input_particles': torch.FloatTensor(sample['input_particles']),
+            'target_particles': torch.FloatTensor(sample['target_particles']),
+            'particles': torch.FloatTensor(sample['particles']),  # Alias for compatibility
             'belief': torch.FloatTensor(sample['belief']),
             'belief_points': torch.FloatTensor(sample['belief_points']),
             'true_mode': sample['true_mode'],
@@ -130,36 +118,32 @@ class ParticleReconstructionDataset(Dataset):
 
 class ParticleReconstructionModel(nn.Module):
     """
-    Model that uses Set Transformer to reconstruct particles from observation history.
+    Model that uses Set Transformer to reconstruct particles from input particles.
     
     Architecture:
-    - Input: Observation history (sequence of integers)
-    - Encoder: Embedding layer for observations
-    - Set Transformer: Processes the embedded observations as a set
-    - Output: Particles representing the belief distribution
+    - Input: Set of particles sampled from true distribution
+    - Set Transformer: Processes the input particles as a set
+    - Output: Reconstructed particles representing the same distribution
     """
     
     def __init__(self,
-                 obs_history_length: int,
-                 embedding_dim: int = 64,
+                 particle_dim: int = 1,
                  st_hidden_dim: int = 128,
                  st_num_heads: int = 4,
                  st_num_inds: int = 32,
                  st_num_outputs: int = 1,
-                 num_particles: int = 100,
-                 particle_dim: int = 1):
+                 num_particles: int = 100):
         super().__init__()
         
-        self.obs_history_length = obs_history_length
         self.num_particles = num_particles
         self.particle_dim = particle_dim
         
-        # Embedding layer for observations
-        self.obs_embedding = nn.Embedding(21, embedding_dim)  # Assuming max obs value is 20
+        # Input projection for particles
+        self.input_projection = nn.Linear(particle_dim, st_hidden_dim)
         
-        # Set Transformer
+        # Set Transformer to process input particles
         self.set_transformer = SetTransformer(
-            dim_input=embedding_dim,
+            dim_input=st_hidden_dim,
             num_outputs=st_num_outputs,
             dim_output=st_hidden_dim,  # Required parameter
             dim_hidden=st_hidden_dim,
@@ -168,7 +152,7 @@ class ParticleReconstructionModel(nn.Module):
             ln=bool(st_num_inds)  # Use layer norm if num_inds > 0
         )
         
-        # Decoder to generate particles
+        # Decoder to generate output particles
         self.particle_decoder = nn.Sequential(
             nn.Linear(st_hidden_dim * st_num_outputs, 256),
             nn.ReLU(),
@@ -177,26 +161,26 @@ class ParticleReconstructionModel(nn.Module):
             nn.Linear(128, num_particles * particle_dim)
         )
         
-    def forward(self, obs_history: torch.Tensor) -> torch.Tensor:
+    def forward(self, input_particles: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            obs_history: Shape (batch_size, obs_history_length)
+            input_particles: Shape (batch_size, num_input_particles, particle_dim)
             
         Returns:
             particles: Shape (batch_size, num_particles, particle_dim)
         """
-        batch_size = obs_history.size(0)
+        batch_size = input_particles.size(0)
         
-        # Embed observations
-        embedded_obs = self.obs_embedding(obs_history)  # (batch_size, obs_history_length, embedding_dim)
+        # Project input particles
+        projected_particles = self.input_projection(input_particles)  # (batch_size, num_input_particles, st_hidden_dim)
         
         # Process as a set with Set Transformer
-        st_output = self.set_transformer(embedded_obs)  # (batch_size, num_outputs, dim_hidden)
+        st_output = self.set_transformer(projected_particles)  # (batch_size, num_outputs, dim_hidden)
         
         # Flatten for decoder
         st_output_flat = st_output.view(batch_size, -1)  # (batch_size, num_outputs * dim_hidden)
         
-        # Generate particles
+        # Generate output particles
         particles_flat = self.particle_decoder(st_output_flat)  # (batch_size, num_particles * particle_dim)
         
         # Reshape to particle format
@@ -323,15 +307,15 @@ def train_model(model: ParticleReconstructionModel,
         train_losses_epoch = []
         
         for batch in tqdm(train_loader, desc=f'Epoch {epoch+1}/{num_epochs}'):
-            obs_history = batch['obs_history'].to(device)
-            target_particles = batch['particles'].to(device)
+            input_particles = batch['input_particles'].to(device)
+            target_particles = batch['target_particles'].to(device)
             target_belief = batch['belief'].to(device)
             belief_points = batch['belief_points'].to(device)
             
             optimizer.zero_grad()
             
             # Forward pass
-            predicted_particles = model(obs_history)
+            predicted_particles = model(input_particles)
             
             # Compute loss
             losses = compute_loss(predicted_particles, target_particles, target_belief, belief_points, sinkhorn_loss_fn)
@@ -352,12 +336,12 @@ def train_model(model: ParticleReconstructionModel,
         
         with torch.no_grad():
             for batch in val_loader:
-                obs_history = batch['obs_history'].to(device)
-                target_particles = batch['particles'].to(device)
+                input_particles = batch['input_particles'].to(device)
+                target_particles = batch['target_particles'].to(device)
                 target_belief = batch['belief'].to(device)
                 belief_points = batch['belief_points'].to(device)
                 
-                predicted_particles = model(obs_history)
+                predicted_particles = model(input_particles)
                 losses = compute_loss(predicted_particles, target_particles, target_belief, belief_points, sinkhorn_loss_fn)
                 
                 val_loss += losses['total_loss'].item()
@@ -397,13 +381,17 @@ def evaluate_model(model: ParticleReconstructionModel,
     
     with torch.no_grad():
         for batch in tqdm(test_loader, desc='Evaluating'):
-            obs_history = batch['obs_history'].to(device)
-            target_particles = batch['particles'].to(device)
+            input_particles = batch['input_particles'].to(device)
+            target_particles = batch['target_particles'].to(device)
             target_belief = batch['belief'].to(device)
             belief_points = batch['belief_points'].to(device)
-            true_mode = batch['true_mode'].to(device)
+            # true_mode is a list of scalars, convert to tensor
+            if isinstance(batch['true_mode'], torch.Tensor):
+                true_mode = batch['true_mode'].to(device).float()
+            else:
+                true_mode = torch.tensor(batch['true_mode'], dtype=torch.float32).to(device)
             
-            predicted_particles = model(obs_history)
+            predicted_particles = model(input_particles)
             losses = compute_loss(predicted_particles, target_particles, target_belief, belief_points, sinkhorn_loss_fn)
             
             total_loss += losses['total_loss'].item()
@@ -436,12 +424,157 @@ def evaluate_model(model: ParticleReconstructionModel,
         'avg_belief_error': avg_belief_error
     }
 
+def visualize_results(model: ParticleReconstructionModel, 
+                      pomdp_config: OddEvenPOMDPConfig,
+                      num_particles: int = 100,
+                      n_tests: int = 10, 
+                      device: str = 'cuda' if torch.cuda.is_available() else 'cpu'):
+    """Visualize the results of the model"""
+    
+    # Create a RNG for generating different seeds for each POMDP
+    # This ensures each visualization gets a different random mean
+    base_seed = pomdp_config.seed if pomdp_config.seed is not None else 42
+    viz_rng = np.random.RandomState(base_seed + 9999)  # Offset to avoid overlap with dataset seeds
+    
+    model.eval()
+    with torch.no_grad():
+        for _ in range(n_tests):
+            # Create a new POMDP instance with a different seed for each visualization
+            sample_config = OddEvenPOMDPConfig(
+                n=pomdp_config.n,
+                mean=None,  # Let it be random for each visualization
+                std_dev=pomdp_config.std_dev,
+                belief_resolution=pomdp_config.belief_resolution,
+                seed=viz_rng.randint(0, 2**31)  # Use a different seed for each POMDP
+            )
+            pomdp = OddEvenPOMDP(sample_config)
+            
+            # Sample input particles from the true distribution
+            input_particles = pomdp.rng.choice(pomdp.valid_numbers, size=num_particles, p=pomdp.observation_probs)
+            input_particles = input_particles.reshape(-1, 1).astype(np.float32)
+            
+            # Get prediction
+            input_particles_tensor = torch.FloatTensor(input_particles).unsqueeze(0).to(device)
+            predicted_particles = model(input_particles_tensor)
+            
+            visualize_distribution(pomdp, predicted_particles[0], input_particles)
+            
+            
+def compute_kl_divergence(p: np.ndarray, q: np.ndarray) -> float:
+    """Compute KL divergence KL(P||Q)"""
+    # Add small epsilon to avoid log(0)
+    epsilon = 1e-10
+    p_safe = np.clip(p, epsilon, 1.0)
+    q_safe = np.clip(q, epsilon, 1.0)
+    # Normalize
+    p_safe = p_safe / p_safe.sum()
+    q_safe = q_safe / q_safe.sum()
+    return np.sum(p_safe * np.log(p_safe / q_safe))
+
+
+def compute_descriptive_stats(particles: np.ndarray) -> dict:
+    """Compute descriptive statistics for a particle set"""
+    particles_flat = particles.flatten()
+    return {
+        'mean': np.mean(particles_flat),
+        'std': np.std(particles_flat),
+        'median': np.median(particles_flat),
+        'min': np.min(particles_flat),
+        'max': np.max(particles_flat),
+        'q25': np.percentile(particles_flat, 25),
+        'q75': np.percentile(particles_flat, 75)
+    }
+
+
+def visualize_distribution(pomdp: OddEvenPOMDP, predicted_particles: torch.Tensor, input_particles: np.ndarray):
+    """Visualize the distributions as side-by-side histograms with statistics"""
+    
+    # Convert tensors to numpy
+    if isinstance(predicted_particles, torch.Tensor):
+        predicted_particles_np = predicted_particles.cpu().numpy().flatten()
+    else:
+        predicted_particles_np = predicted_particles.flatten()
+    
+    input_particles_np = input_particles.flatten()
+    
+    # Compute descriptive statistics
+    input_stats = compute_descriptive_stats(input_particles_np)
+    predicted_stats = compute_descriptive_stats(predicted_particles_np)
+    
+    # Create histograms
+    # Use the same bins for both histograms for fair comparison
+    all_values = np.concatenate([input_particles_np, predicted_particles_np])
+    bins = np.linspace(all_values.min(), all_values.max(), 30)
+    
+    # Compute KL divergence using histograms
+    input_hist, _ = np.histogram(input_particles_np, bins=bins, density=True)
+    predicted_hist, _ = np.histogram(predicted_particles_np, bins=bins, density=True)
+    
+    # Normalize histograms to probabilities
+    input_hist = input_hist / (input_hist.sum() + 1e-10)
+    predicted_hist = predicted_hist / (predicted_hist.sum() + 1e-10)
+    
+    kl_div = compute_kl_divergence(input_hist, predicted_hist)
+    
+    # Create side-by-side subplots
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+    
+    # Plot input particles histogram
+    ax1.hist(input_particles_np, bins=bins, alpha=0.7, color='blue', edgecolor='black')
+    ax1.axvline(input_stats['mean'], color='red', linestyle='--', linewidth=2, label=f"Mean: {input_stats['mean']:.2f}")
+    ax1.axvline(input_stats['median'], color='green', linestyle='--', linewidth=2, label=f"Median: {input_stats['median']:.2f}")
+    ax1.set_xlabel('Particle Value')
+    ax1.set_ylabel('Frequency')
+    ax1.set_title('Input Particles Distribution')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+    
+    # Add statistics text box
+    stats_text = f"Mean: {input_stats['mean']:.3f}\n"
+    stats_text += f"Std: {input_stats['std']:.3f}\n"
+    stats_text += f"Median: {input_stats['median']:.3f}\n"
+    stats_text += f"Min: {input_stats['min']:.3f}\n"
+    stats_text += f"Max: {input_stats['max']:.3f}\n"
+    stats_text += f"Q25: {input_stats['q25']:.3f}\n"
+    stats_text += f"Q75: {input_stats['q75']:.3f}"
+    ax1.text(0.02, 0.98, stats_text, transform=ax1.transAxes, 
+             verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5),
+             fontsize=9, family='monospace')
+    
+    # Plot predicted particles histogram
+    ax2.hist(predicted_particles_np, bins=bins, alpha=0.7, color='orange', edgecolor='black')
+    ax2.axvline(predicted_stats['mean'], color='red', linestyle='--', linewidth=2, label=f"Mean: {predicted_stats['mean']:.2f}")
+    ax2.axvline(predicted_stats['median'], color='green', linestyle='--', linewidth=2, label=f"Median: {predicted_stats['median']:.2f}")
+    ax2.set_xlabel('Particle Value')
+    ax2.set_ylabel('Frequency')
+    ax2.set_title('Predicted Particles Distribution')
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+    
+    # Add statistics text box
+    stats_text = f"Mean: {predicted_stats['mean']:.3f}\n"
+    stats_text += f"Std: {predicted_stats['std']:.3f}\n"
+    stats_text += f"Median: {predicted_stats['median']:.3f}\n"
+    stats_text += f"Min: {predicted_stats['min']:.3f}\n"
+    stats_text += f"Max: {predicted_stats['max']:.3f}\n"
+    stats_text += f"Q25: {predicted_stats['q25']:.3f}\n"
+    stats_text += f"Q75: {predicted_stats['q75']:.3f}"
+    ax2.text(0.02, 0.98, stats_text, transform=ax2.transAxes, 
+             verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5),
+             fontsize=9, family='monospace')
+    
+    # Add KL divergence as title
+    fig.suptitle(f'Particle Distributions Comparison (KL Divergence: {kl_div:.4f}, Hidden: {pomdp.hidden_param})', 
+                 fontsize=14, fontweight='bold')
+    
+    plt.tight_layout()
+    plt.show()
 
 def main():
     parser = argparse.ArgumentParser(description='Train Set Transformer for Particle Reconstruction')
     
     # POMDP config
-    parser.add_argument('--n', type=int, default=20, help='Maximum number in range [1, n]')
+    parser.add_argument('--n', type=int, default=10, help='Maximum number in range [1, n]')
     parser.add_argument('--mean', type=float, default=None, help='Mean of Gaussian (random if None)')
     parser.add_argument('--std_dev', type=float, default=2.0, help='Standard deviation of Gaussian')
     parser.add_argument('--belief_resolution', type=int, default=100, help='Number of discrete belief points for mode estimation')
@@ -450,10 +583,8 @@ def main():
     # Dataset config
     parser.add_argument('--num_samples', type=int, default=10000, help='Number of training samples')
     parser.add_argument('--num_particles', type=int, default=100, help='Number of particles per sample')
-    parser.add_argument('--obs_history_length', type=int, default=5, help='Length of observation history')
     
     # Model config
-    parser.add_argument('--embedding_dim', type=int, default=64, help='Embedding dimension for observations')
     parser.add_argument('--st_hidden_dim', type=int, default=128, help='Set Transformer hidden dimension')
     parser.add_argument('--st_num_heads', type=int, default=4, help='Number of attention heads')
     parser.add_argument('--st_num_inds', type=int, default=32, help='Number of inducing points')
@@ -480,7 +611,6 @@ def main():
     print(f'Using device: {device}')
     
     # Create POMDP config
-    from odd_even_pomdp import OddEvenPOMDPConfig
     pomdp_config = OddEvenPOMDPConfig(
         n=args.n,
         mean=args.mean,
@@ -494,8 +624,7 @@ def main():
     train_dataset = ParticleReconstructionDataset(
         pomdp_config=pomdp_config,
         num_samples=args.num_samples,
-        num_particles=args.num_particles,
-        observation_history_length=args.obs_history_length
+        num_particles=args.num_particles
     )
     
     # Split into train/val/test
@@ -516,14 +645,12 @@ def main():
     
     # Create model
     model = ParticleReconstructionModel(
-        obs_history_length=args.obs_history_length,
-        embedding_dim=args.embedding_dim,
+        particle_dim=1,
         st_hidden_dim=args.st_hidden_dim,
         st_num_heads=args.st_num_heads,
         st_num_inds=args.st_num_inds,
         st_num_outputs=args.st_num_outputs,
-        num_particles=args.num_particles,
-        particle_dim=1
+        num_particles=args.num_particles
     )
     
     print(f'Model parameters: {sum(p.numel() for p in model.parameters()):,}')
@@ -549,6 +676,13 @@ def main():
         sinkhorn_blur=args.sinkhorn_blur
     )
     
+    
+    visualize_results(
+        model=results['model'], 
+        pomdp_config=pomdp_config,
+        num_particles=args.num_particles,
+        device=device
+    )
     # Save results
     os.makedirs(args.save_dir, exist_ok=True)
     
