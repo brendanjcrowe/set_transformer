@@ -11,16 +11,15 @@ import os
 import gymnasium as gym
 import numpy as np
 import torch
+from features_extractors.set_transformer_pretrained_processor import (
+    PretrainedSetTransformerProcessor,
+)
 from pdomains.odd_even_pomdp import OddEvenPOMDP, OddEvenPOMDPConfig
 from stable_baselines3 import PPO, SAC
 from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize
-
-from features_extractors.set_transformer_pretrained_processor import (
-    PretrainedSetTransformerProcessor,
-)
 
 
 class OddEvenPOMDPGymAdapter(gym.Env):
@@ -47,22 +46,22 @@ class OddEvenPOMDPGymAdapter(gym.Env):
     def reset(self, seed=None, **kwargs):
         super().reset(seed=seed)
         if seed is not None:
-            self.pomdp.reset(new_seed=seed)
+            obs, info = self.pomdp.reset(seed=seed)
         else:
-            self.pomdp.reset()
+            obs, info = self.pomdp.reset()
         self.step_count = 0
-        obs = self.pomdp.particles.astype(np.float32)
-        info = {'true_mean': self.pomdp.mean, 'hidden_param': self.pomdp.hidden_param}
+        # POMDP now returns (obs, info) directly in gymnasium format
+        obs = obs.astype(np.float32)
         return obs, info
     
     def step(self, action):
-        predicted_mean = int(action) + 1
-        obs, reward, done, _ = self.pomdp.step(predicted_mean)
+        # POMDP now expects 0-indexed action and handles conversion internally
+        obs, reward, terminated, truncated, info = self.pomdp.step(action)
         self.step_count += 1
         obs = obs.astype(np.float32)
-        terminated = done
-        truncated = self.step_count >= self.max_steps
-        info = {'true_mean': self.pomdp.mean, 'predicted_mean': predicted_mean}
+        # Handle max_steps truncation at adapter level
+        if self.step_count >= self.max_steps:
+            truncated = True
         return obs, reward, terminated, truncated, info
 
 

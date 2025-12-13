@@ -29,6 +29,9 @@ class PretrainedSetTransformerProcessor:
             # Attempt to load the model. 
             # First try loading as a complete object, then try as state_dict
             loaded = torch.load(model_path, map_location=self.device, weights_only=False)
+            # #region agent log
+            import json; open('/home/brendan/rl_for_beliefmdps/.cursor/debug.log', 'a').write(json.dumps({'id': 'log_load_model', 'timestamp': __import__('time').time() * 1000, 'location': 'set_transformer_pretrained_processor.py:31', 'message': 'Loaded model', 'data': {'type': str(type(loaded)), 'is_dict': isinstance(loaded, dict), 'keys_sample': list(loaded.keys())[:10] if isinstance(loaded, dict) else None}, 'sessionId': 'debug-session', 'runId': 'run1', 'hypothesisId': 'B'}) + '\n')
+            # #endregion
             
             if isinstance(loaded, dict) and any(k.startswith('set_transformer.') or k.startswith('input_projection.') for k in loaded.keys()):
                 # It's a state_dict, likely from ParticleReconstructionModel
@@ -95,6 +98,59 @@ class PretrainedSetTransformerProcessor:
                 self.input_projection = None
                 self.dim_particle_input = self.model.dim_input
                 self.st_output_dim = self.model.dim_output
+            elif isinstance(loaded, dict):
+                # It's a dict but doesn't match expected pattern - try to handle as state_dict anyway
+                # Check if it looks like a state_dict with model weights
+                if any('encoder' in k or 'pma' in k.lower() or 'weight' in k for k in loaded.keys()):
+                    # Try to treat as SetTransformer state_dict directly (without prefixes)
+                    print("Detected plain state_dict format. Attempting to reconstruct model...")
+                    # #region agent log
+                    open('/home/brendan/rl_for_beliefmdps/.cursor/debug.log', 'a').write(json.dumps({'id': 'log_plain_state_dict', 'timestamp': __import__('time').time() * 1000, 'location': 'set_transformer_pretrained_processor.py:98', 'message': 'Treating as plain state_dict', 'data': {'keys_sample': list(loaded.keys())[:10]}, 'sessionId': 'debug-session', 'runId': 'run1', 'hypothesisId': 'B'}) + '\n')
+                    # #endregion
+                    # Try to infer dimensions from state_dict
+                    if 'encoder.0.weight' in loaded:
+                        st_hidden_dim = loaded['encoder.0.weight'].shape[0]
+                        particle_dim = loaded['encoder.0.weight'].shape[1] if len(loaded['encoder.0.weight'].shape) > 1 else 1
+                    else:
+                        # Default values
+                        st_hidden_dim = 128
+                        particle_dim = 1
+                    
+                    # Get num_outputs from PMA layer if available
+                    num_outputs = 1
+                    for k in loaded.keys():
+                        if 'pma' in k.lower() and 'weight' in k:
+                            num_outputs = loaded[k].shape[0]
+                            break
+                    
+                    dim_output = st_hidden_dim
+                    num_heads = 4
+                    num_inds = 32
+                    
+                    # Create SetTransformer
+                    self.model = SetTransformer(
+                        dim_input=particle_dim,
+                        num_outputs=num_outputs,
+                        dim_output=dim_output,
+                        dim_hidden=st_hidden_dim,
+                        num_heads=num_heads,
+                        num_inds=num_inds,
+                        ln=bool(num_inds)
+                    )
+                    self.model.load_state_dict(loaded, strict=False)
+                    self.input_projection = None
+                    self.dim_particle_input = particle_dim
+                    self.st_output_dim = dim_output * num_outputs
+                else:
+                    # Try to use it as-is (might be a wrapper model)
+                    self.model = loaded
+                    self.input_projection = None
+                    if hasattr(self.model, 'set_transformer'):
+                        # It's a wrapper model with set_transformer attribute
+                        self.dim_particle_input = getattr(self.model, 'particle_dim', 1)
+                        self.st_output_dim = self.model.set_transformer.dim_output
+                    else:
+                        raise ValueError(f"Unknown model format: {type(loaded)}. Keys: {list(loaded.keys())[:10] if isinstance(loaded, dict) else 'N/A'}")
             else:
                 # Try to use it as-is (might be a wrapper model)
                 self.model = loaded
