@@ -22,44 +22,25 @@ from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize
 
 
-class OddEvenPOMDPGymAdapter(gym.Env):
+class OddEvenPOMDPGymAdapter(gym.Wrapper):
     """
-    Adapter to make OddEvenPOMDP work as a gym.Env.
+    Wrapper for OddEvenPOMDP to handle max_steps truncation.
+    Since POMDP is now gymnasium-compatible, we just wrap it to add max_steps handling.
     """
     def __init__(self, pomdp: OddEvenPOMDP, max_steps: int = 100):
-        super().__init__()
-        self.pomdp = pomdp
+        super().__init__(pomdp)
         self.max_steps = max_steps
         self.step_count = 0
-        
-        # Action space: discrete actions from 0 to n_dist_size-1
-        self.action_space = gym.spaces.Discrete(pomdp.config.n_dist_size)
-        
-        # Observation space: particles from the POMDP
-        self.observation_space = gym.spaces.Box(
-            low=1.0,
-            high=float(pomdp.config.n_dist_size),
-            shape=(pomdp.config.n_particles,),
-            dtype=np.float32
-        )
     
     def reset(self, seed=None, **kwargs):
-        super().reset(seed=seed)
-        if seed is not None:
-            obs, info = self.pomdp.reset(seed=seed)
-        else:
-            obs, info = self.pomdp.reset()
+        obs, info = self.env.reset(seed=seed, **kwargs)
         self.step_count = 0
-        # POMDP now returns (obs, info) directly in gymnasium format
-        obs = obs.astype(np.float32)
         return obs, info
     
     def step(self, action):
-        # POMDP now expects 0-indexed action and handles conversion internally
-        obs, reward, terminated, truncated, info = self.pomdp.step(action)
+        obs, reward, terminated, truncated, info = self.env.step(action)
         self.step_count += 1
-        obs = obs.astype(np.float32)
-        # Handle max_steps truncation at adapter level
+        # Handle max_steps truncation
         if self.step_count >= self.max_steps:
             truncated = True
         return obs, reward, terminated, truncated, info
