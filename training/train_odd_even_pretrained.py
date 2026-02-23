@@ -9,6 +9,12 @@ import argparse
 import os
 
 import gymnasium as gym
+
+# Use a non-interactive backend so plotting works in headless / non-GUI environments.
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from features_extractors.set_transformer_pretrained_processor import (
@@ -16,10 +22,95 @@ from features_extractors.set_transformer_pretrained_processor import (
 )
 from pdomains.odd_even_pomdp import OddEvenPOMDP, OddEvenPOMDPConfig
 from stable_baselines3 import PPO, SAC
-from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback
+from stable_baselines3.common.callbacks import (
+    BaseCallback,
+    CheckpointCallback,
+    EvalCallback,
+)
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize
+
+
+class NormalizedRewardCallback(BaseCallback):
+    """
+    Callback to log normalized reward metrics during training.
+    Extracts reward_normalized from info dict and logs it.
+    """
+    def __init__(self, verbose: int = 0, plot_dir: str | None = None):
+        super().__init__(verbose)
+        self.normalized_rewards: list[float] = []
+        self.raw_rewards: list[float] = []
+        self.log_steps: list[int] = []
+        self.log_means: list[float] = []
+        # Explicit directory where plots will be saved
+        self.plot_dir = plot_dir
+        
+    def _on_step(self) -> bool:
+        # Extract normalized reward from info dict if available
+        if self.locals.get('infos') is not None:
+            for info in self.locals['infos']:
+                if isinstance(info, dict):
+                    if 'reward_normalized' in info:
+                        self.normalized_rewards.append(info['reward_normalized'])
+                    if 'reward' in self.locals:
+                        # Raw reward might be in locals
+                        pass
+        
+        # Log to tensorboard if available
+        if len(self.normalized_rewards) > 0:
+            # Calculate mean normalized reward over recent steps
+            recent_normalized = self.normalized_rewards[-100:] if len(self.normalized_rewards) > 100 else self.normalized_rewards
+            mean_normalized = sum(recent_normalized) / len(recent_normalized) if recent_normalized else 0.0
+            
+            # Log every 100 steps to avoid too much logging
+            if self.num_timesteps % 100 == 0:
+                self.logger.record('reward/normalized_mean', mean_normalized)
+                if self.verbose > 0:
+                    print(f"Step {self.num_timesteps}: Mean normalized reward (last 100): {mean_normalized:.4f}")
+                # Store for plotting later
+                self.log_steps.append(self.num_timesteps)
+                self.log_means.append(mean_normalized)
+                # Also save an intermediate plot so we have something even if training aborts
+                self._save_plot(suffix="_latest")
+        
+        return True
+
+    def _on_training_end(self) -> None:
+        """Save a plot of normalized reward over time at the end of training."""
+        if not self.log_steps:
+            return
+        self._save_plot(suffix="")
+
+    def _save_plot(self, suffix: str = "") -> None:
+        """Helper to save the normalized reward plot to disk."""
+        try:
+            # Decide where to save the plot
+            if self.plot_dir is not None:
+                plot_dir = self.plot_dir
+            else:
+                # Fallback to SB3 logger directory
+                plot_dir = self.logger.get_dir() or "."
+            os.makedirs(plot_dir, exist_ok=True)
+            filename = f"normalized_reward{suffix}.png"
+            plot_path = os.path.join(plot_dir, filename)
+
+            plt.figure(figsize=(8, 4))
+            plt.plot(self.log_steps, self.log_means, marker="o", linestyle="-")
+            plt.xlabel("Timesteps")
+            plt.ylabel("Mean normalized reward (last 100 steps)")
+            plt.title("Normalized reward over time")
+            plt.grid(True, alpha=0.3)
+            plt.tight_layout()
+            plt.savefig(plot_path)
+            plt.close()
+
+            if self.verbose > 0:
+                print(f"Saved normalized reward plot to {plot_path}")
+        except Exception as e:
+            # Do not crash training if plotting fails
+            if self.verbose > 0:
+                print(f"Warning: failed to save normalized reward plot: {e}")
 
 
 class OddEvenPOMDPGymAdapter(gym.Wrapper):
@@ -201,7 +292,10 @@ def train_odd_even_pretrained(
         monitor_dir=monitor_dir,
         max_steps=max_steps
     )
-    vec_env = make_vec_env(env_fn, n_envs=n_envs, seed=seed, vec_env_cls=SubprocVecEnv)
+    # Use SubprocVecEnv only when using multiple environments; for a single env,
+    # DummyVecEnv (default) avoids multiprocessing-related crashes and simplifies debugging.
+    vec_env_cls = SubprocVecEnv if n_envs > 1 else None
+    vec_env = make_vec_env(env_fn, n_envs=n_envs, seed=seed, vec_env_cls=vec_env_cls)
 
     if use_vec_normalize:
         vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=True)
@@ -238,7 +332,8 @@ def train_odd_even_pretrained(
         monitor_dir=None,
         max_steps=max_steps
     )
-    eval_vec_env = make_vec_env(eval_env_fn, n_envs=1, vec_env_cls=SubprocVecEnv)
+    # Single-process eval environment: no need for SubprocVecEnv here.
+    eval_vec_env = make_vec_env(eval_env_fn, n_envs=1)
     if use_vec_normalize:
         eval_vec_env = VecNormalize(eval_vec_env, training=False, norm_obs=True, norm_reward=False)
 
@@ -251,10 +346,16 @@ def train_odd_even_pretrained(
         render=False, 
         n_eval_episodes=5
     )
+    
+    # Add callback to log normalized reward and save plots
+    plot_dir = os.path.join(log_dir, "plots")
+    normalized_reward_callback = NormalizedRewardCallback(verbose=1, plot_dir=plot_dir)
 
     print(f"Starting training with {algorithm} using pretrained ST processor...")
+    min_reward = -((pomdp_config.n_dist_size - 1) ** 2)
+    print(f"Reward bounds: min={min_reward}, max=0.0 (normalized: 0.0 = worst, 1.0 = best)")
     try:
-        model.learn(total_timesteps=total_timesteps, callback=[checkpoint_callback, eval_callback])
+        model.learn(total_timesteps=total_timesteps, callback=[checkpoint_callback, eval_callback, normalized_reward_callback])
     finally:
         model.save(model_save_path)
         if use_vec_normalize and isinstance(vec_env, VecNormalize):
@@ -334,4 +435,3 @@ if __name__ == "__main__":
         use_vec_normalize=not args.no_vec_normalize,
         max_steps=args.max_steps
     )
-
