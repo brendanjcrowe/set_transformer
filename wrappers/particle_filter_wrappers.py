@@ -106,8 +106,15 @@ class PFDictObservationWrapper(gym.Wrapper):
             update_call_kwargs = mapped_args.get("update_args", {})
 
         self.particle_filter.predict(action, **predict_call_kwargs)
-        self.particle_filter.update(base_env_obs_float, **update_call_kwargs) # base_env_obs is the primary sensor reading
-        
+
+        # When a mapper is provided, update_call_kwargs contains all needed args
+        # (e.g. observed_target_pos, ant_current_pos_from_obs for AntTag).
+        # Passing base_env_obs_float as a positional would conflict with those kwargs.
+        if self.pf_interaction_mapper:
+            self.particle_filter.update(**update_call_kwargs)
+        else:
+            self.particle_filter.update(base_env_obs_float)
+
         return self._get_dict_obs(base_env_obs_float), reward, terminated, truncated, info
 
     def _get_dict_obs(self, base_env_obs: np.ndarray) -> dict:
@@ -188,8 +195,12 @@ class PFPlusFeaturesObservationWrapper(gym.Wrapper):
             update_call_kwargs = mapped_args.get("update_args", {})
 
         self.particle_filter.predict(action, **predict_call_kwargs)
-        self.particle_filter.update(base_env_obs_float, **update_call_kwargs)
-        
+
+        if self.pf_interaction_mapper:
+            self.particle_filter.update(**update_call_kwargs)
+        else:
+            self.particle_filter.update(base_env_obs_float)
+
         return self._get_concatenated_obs(base_env_obs_float), reward, terminated, truncated, info
 
     def _get_concatenated_obs(self, base_env_obs: np.ndarray) -> np.ndarray:
