@@ -20,21 +20,23 @@ class PFDictObservationWrapper(gym.Wrapper):
 
     Designed for end-to-end training where the Set Transformer is part of the policy.
     """
-    def __init__(self, 
+    def __init__(self,
                  env: gym.Env,
                  particle_filter_class: type[BaseParticleFilter],
                  particle_filter_kwargs: dict,
-                 num_particles: int, 
-                 # This function will be responsible for extracting necessary info from 
+                 num_particles: int,
+                 # This function will be responsible for extracting necessary info from
                  # base_env_obs for pf.update() and pf.predict()
                  # It should return a dict like {"predict": {kwargs for pf.predict}, "update": {kwargs for pf.update}}
-                 pf_interaction_mapper: callable = None 
+                 pf_interaction_mapper: callable = None,
+                 obs_mask_indices: list[int] | None = None,
                 ):
         super().__init__(env)
         self.particle_filter_class = particle_filter_class
         self.particle_filter_kwargs = particle_filter_kwargs
         self.num_particles = num_particles
         self.particle_filter: BaseParticleFilter | None = None
+        self.obs_mask_indices = obs_mask_indices
         
         # This mapper is crucial and env-specific. It defines how to get args for pf methods from env data.
         # Example for AntTag: 
@@ -121,23 +123,33 @@ class PFDictObservationWrapper(gym.Wrapper):
         particles_state = self.particle_filter.particles.astype(np.float32)
         # If particles also include weights as the last dim, make sure ST network expects that.
         # The BaseParticleFilter defines particle_dim, which should be used by the ST network.
-        return {"obs": base_env_obs, "particles": particles_state}
+        agent_obs = base_env_obs
+        if self.obs_mask_indices is not None:
+            agent_obs = base_env_obs.copy()
+            agent_obs[self.obs_mask_indices] = 0.0
+        return {"obs": agent_obs, "particles": particles_state}
 
 
 class PFPlusFeaturesObservationWrapper(gym.Wrapper):
     """
-    Wraps an environment to concatenate features extracted from a particle filter 
+    Wraps an environment to concatenate features extracted from a particle filter
     (by a pretrained Set Transformer) to the original environment observation.
 
     Designed for RL with a pretrained Set Transformer as a fixed feature processor.
+
+    If obs_mask_indices is provided, those indices are zeroed out in the
+    observation passed to the agent (but NOT in the obs used by the PF mapper).
+    This prevents the agent from seeing privileged info (e.g. true target
+    position) that the PF legitimately needs to update its belief.
     """
-    def __init__(self, 
-                 env: gym.Env, 
+    def __init__(self,
+                 env: gym.Env,
                  particle_filter_class: type[BaseParticleFilter],
                  particle_filter_kwargs: dict,
                  pretrained_st_processor: PretrainedSetTransformerProcessor,
                  num_particles: int,
-                 pf_interaction_mapper: callable = None
+                 pf_interaction_mapper: callable = None,
+                 obs_mask_indices: list[int] | None = None,
                 ):
         super().__init__(env)
         self.particle_filter_class = particle_filter_class
@@ -146,6 +158,7 @@ class PFPlusFeaturesObservationWrapper(gym.Wrapper):
         self.num_particles = num_particles
         self.particle_filter: BaseParticleFilter | None = None
         self.pf_interaction_mapper = pf_interaction_mapper
+        self.obs_mask_indices = obs_mask_indices
         if self.pf_interaction_mapper is None:
             print("Warning: pf_interaction_mapper is not provided. PF predict/update calls will only receive action/obs_from_env directly.")
 
@@ -231,4 +244,7 @@ class PFPlusFeaturesObservationWrapper(gym.Wrapper):
             particle_set_torch = torch.tensor(particles_state, dtype=torch.float32).unsqueeze(0) # Add batch dim
             st_features = self.st_processor.process_particles(particle_set_torch).squeeze(0) # Remove batch dim
 
-        return np.concatenate([base_env_obs, st_features.astype(np.float32)]) 
+        agent_obs = base_env_obs.copy()
+        if self.obs_mask_indices is not None:
+            agent_obs[self.obs_mask_indices] = 0.0
+        return np.concatenate([agent_obs, st_features.astype(np.float32)])
