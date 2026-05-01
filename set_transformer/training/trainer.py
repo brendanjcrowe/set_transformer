@@ -166,7 +166,7 @@ class Trainer:
             return ChamferDistanceLoss()
         elif self.config.loss_type == "sinkhorn":
             return SinkhornLoss(
-                blur=self.config.sinkhorn_blur, scaling=self.config.sinkhorn_scaling
+                blur=self.config.sinkhorn_blur,
             )
         elif self.config.loss_type == "hausdorff":
             return HausdorffLoss()
@@ -389,16 +389,32 @@ class Trainer:
         input_particles = input_batch[0].detach().cpu().numpy()
         output_particles = output_batch[0].detach().cpu().numpy()
 
-        # Create figure
-        fig, ((ax1, ax2, ax3), (ax4, ax5, ax6)) = plt.subplots(2, 3, figsize=(18, 10))
-
-        # Create visualization
-        visualize_particle_filter_reconstruction(
-            input_particles,
-            output_particles,
-            ax=(ax1, ax2, ax3, ax4, ax5, ax6),
-            title=f"Reconstruction (Step {self.global_step})",
-        )
+        # The 4D visualization requires (N, 4) particles; for other dims
+        # fall back to a simple 2D scatter comparison.
+        dim = input_particles.shape[-1]
+        if dim == 4:
+            fig, ((ax1, ax2, ax3), (ax4, ax5, ax6)) = plt.subplots(
+                2, 3, figsize=(18, 10)
+            )
+            visualize_particle_filter_reconstruction(
+                input_particles,
+                output_particles,
+                ax=(ax1, ax2, ax3, ax4, ax5, ax6),
+                title=f"Reconstruction (Step {self.global_step})",
+            )
+        else:
+            # Generic 2-column scatter for arbitrary dim (plot first 2 dims)
+            fig, (ax_in, ax_out) = plt.subplots(1, 2, figsize=(12, 5))
+            d0, d1 = 0, min(1, dim - 1)
+            ax_in.scatter(
+                input_particles[:, d0], input_particles[:, d1], s=4, alpha=0.6
+            )
+            ax_in.set_title("Input")
+            ax_out.scatter(
+                output_particles[:, d0], output_particles[:, d1], s=4, alpha=0.6
+            )
+            ax_out.set_title("Reconstruction")
+            fig.suptitle(f"Step {self.global_step}")
 
         # Log to tensorboard and wandb
         self.writer.add_figure("reconstruction", fig, self.global_step)

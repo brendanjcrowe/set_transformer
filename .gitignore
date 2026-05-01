@@ -113,3 +113,25 @@ venv.bak/
 /set_transformer/data/raw/*.json
 /set_transformer/data/numpy/*.npy
 /set_transformer/data/torch/*.pyt
+
+models/
+sb3_e2e_tensorboard/
+
+# SB3 training artifacts
+sb3_*_logs/
+sb3_*_models/
+sanity_check_*_logs/
+sanity_check_*_models/
+
+# ST training experiments + datasets
+experiments/
+data/*.npy
+data/*.npz
+wandb/
+
+# Trajectory renders / eval artifacts
+trajectory_renders/
+*.gif
+*.csv
+*.npz
+*.zip
