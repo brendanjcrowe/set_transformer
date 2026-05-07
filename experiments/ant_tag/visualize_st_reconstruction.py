@@ -13,16 +13,12 @@ Usage:
 """
 
 import argparse
-import sys
-from pathlib import Path
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from set_transformer.models import PFSetTransformer
 

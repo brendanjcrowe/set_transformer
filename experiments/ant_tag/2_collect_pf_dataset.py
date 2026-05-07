@@ -24,8 +24,7 @@ from tqdm import tqdm
 
 import pdomains  # noqa: F401 — registers pdomains-ant-tag-v0
 
-# Use the clean AntTagParticleFilter from the proper package location
-from particle_filters.ant_tag_pf import AntTagParticleFilter
+from set_transformer.rl.particle_filters.ant_tag import AntTagParticleFilter
 
 
 def collect_dataset(

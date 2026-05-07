@@ -8,16 +8,14 @@ from stable_baselines3.common.evaluation import evaluate_policy
 from stable_baselines3.common.utils import set_random_seed
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize
 
-from features_extractors.set_transformer_e2e_extractor import (
+from set_transformer.rl.feature_extractors.e2e import (
     CustomSetTransformerExtractor,
 )
-from features_extractors.set_transformer_pretrained_processor import (
+from set_transformer.rl.feature_extractors.pretrained import (
     PretrainedSetTransformerProcessor,
 )
-from particle_filters.base_pf import BaseParticleFilter
-
-# Refactored components
-from wrappers.particle_filter_wrappers import (
+from set_transformer.rl.particle_filters.base import BaseParticleFilter
+from set_transformer.rl.wrappers.particle_filter import (
     PFDictObservationWrapper,
     PFPlusFeaturesObservationWrapper,
 )
@@ -26,7 +24,7 @@ from wrappers.particle_filter_wrappers import (
 # Placeholder for dynamic import of PF and mapper
 def get_env_module_and_pf(env_id_str: str): # Duplicated, ideally in a shared util
     if "ant_tag" in env_id_str.lower():
-        pf_module_name = "particle_filters.ant_tag_pf"
+        pf_module_name = "set_transformer.rl.particle_filters.ant_tag"
         pf_class_name = "AntTagParticleFilter"
         mapper_module_name = "environments.ant_tag_utils"
         mapper_func_name = "ant_tag_pf_interaction_mapper"

@@ -14,15 +14,11 @@ Usage:
 """
 
 import argparse
-import sys
 from datetime import datetime
 from pathlib import Path
 
 import torch
 import torch.multiprocessing as mp
-
-# Add the parent directory so the set_transformer package is importable
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from set_transformer.data.dataset import get_data_loader
 from set_transformer.training.config import ExperimentConfig, TrainingConfig

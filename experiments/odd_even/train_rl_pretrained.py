@@ -17,7 +17,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from features_extractors.set_transformer_pretrained_processor import (
+from set_transformer.rl.feature_extractors.pretrained import (
     PretrainedSetTransformerProcessor,
 )
 from pdomains.odd_even_pomdp import OddEvenPOMDP, OddEvenPOMDPConfig

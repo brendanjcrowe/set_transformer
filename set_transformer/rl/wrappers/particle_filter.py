@@ -2,13 +2,10 @@ import gymnasium as gym
 import numpy as np
 import torch  # For PFPlusFeaturesObservationWrapper if converting to torch tensor for ST
 
-# Assuming PretrainedSetTransformerProcessor is available for the second wrapper
-from features_extractors.set_transformer_pretrained_processor import (
+from set_transformer.rl.feature_extractors.pretrained import (
     PretrainedSetTransformerProcessor,
 )
-
-# Assuming BaseParticleFilter is in particle_filters.base_pf
-from particle_filters.base_pf import BaseParticleFilter
+from set_transformer.rl.particle_filters.base import BaseParticleFilter
 
 
 class PFDictObservationWrapper(gym.Wrapper):

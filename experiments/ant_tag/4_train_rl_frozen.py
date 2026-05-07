@@ -13,15 +13,6 @@ Usage:
 """
 
 import argparse
-import os
-import sys
-
-# Ensure this repo's set_transformer/ workdir is first on sys.path so our
-# local `wrappers/` / `particle_filters/` win over older installs (e.g.
-# /home/brendan/set_transformer/) that may be earlier on PYTHONPATH.
-_REPO_WORKDIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _REPO_WORKDIR not in sys.path:
-    sys.path.insert(0, _REPO_WORKDIR)
 
 import gymnasium as gym
 import matplotlib
@@ -37,9 +28,9 @@ from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize
 
 import pdomains  # noqa: F401 — registers pdomains-ant-tag-v0
-from particle_filters.ant_tag_pf import AntTagParticleFilter
 from set_transformer.models import PFSetTransformer, SetTransformer
-from wrappers.particle_filter_wrappers import PFPlusFeaturesObservationWrapper
+from set_transformer.rl.particle_filters.ant_tag import AntTagParticleFilter
+from set_transformer.rl.wrappers.particle_filter import PFPlusFeaturesObservationWrapper
 
 
 # ---------------------------------------------------------------------------

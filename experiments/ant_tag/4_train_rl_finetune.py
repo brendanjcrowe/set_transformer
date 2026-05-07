@@ -12,16 +12,7 @@ Usage:
 """
 
 import argparse
-import os
-import sys
-
-# Ensure this repo's `set_transformer/` (two levels up of this file is the repo
-# root — one level up is the set_transformer workdir) is first on sys.path so
-# our local `wrappers/` / `particle_filters/` win over any older installs at
-# e.g. /home/brendan/set_transformer/ that may be earlier on PYTHONPATH.
-_REPO_WORKDIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _REPO_WORKDIR not in sys.path:
-    sys.path.insert(0, _REPO_WORKDIR)
+import importlib
 
 import gymnasium as gym
 import matplotlib
@@ -38,24 +29,19 @@ from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize
 
 import pdomains  # noqa: F401 — registers pdomains-ant-tag-v0
-from particle_filters.ant_tag_pf import AntTagParticleFilter
 from set_transformer.models import PFSetTransformer
-from wrappers.particle_filter_wrappers import PFDictObservationWrapper
+from set_transformer.rl.particle_filters.ant_tag import AntTagParticleFilter
+from set_transformer.rl.wrappers.particle_filter import PFDictObservationWrapper
 
-# Reuse shared components from the frozen-ST training script.
-# When run as `python training/train_ant_tag_finetune.py`, Python adds
-# `training/` to sys.path, so import by module name directly.
-import sys
-_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-if _THIS_DIR not in sys.path:
-    sys.path.insert(0, _THIS_DIR)
-from train_ant_tag_pretrained import (  # noqa: E402
-    CurriculumCallback,
-    CurriculumVisibilityWrapper,
-    PFRewardShapingWrapper,
-    _CurriculumRouter,
-    ant_tag_pf_interaction_mapper,
-)
+# Reuse shared components from the frozen-ST training script. The sibling
+# module name starts with a digit, so the normal ``from X import Y`` syntax
+# can't be used; importlib accepts the name as a string.
+_train_rl_frozen = importlib.import_module("4_train_rl_frozen")
+CurriculumCallback = _train_rl_frozen.CurriculumCallback
+CurriculumVisibilityWrapper = _train_rl_frozen.CurriculumVisibilityWrapper
+PFRewardShapingWrapper = _train_rl_frozen.PFRewardShapingWrapper
+_CurriculumRouter = _train_rl_frozen._CurriculumRouter
+ant_tag_pf_interaction_mapper = _train_rl_frozen.ant_tag_pf_interaction_mapper
 
 
 # ---------------------------------------------------------------------------

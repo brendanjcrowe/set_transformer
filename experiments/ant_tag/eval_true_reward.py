@@ -12,12 +12,7 @@ Usage:
         --n_episodes 50
 """
 import argparse
-import os
-import sys
-
-_REPO_WORKDIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _REPO_WORKDIR not in sys.path:
-    sys.path.insert(0, _REPO_WORKDIR)
+import importlib
 
 import gymnasium as gym
 import numpy as np
@@ -27,17 +22,14 @@ from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import VecNormalize, DummyVecEnv
 
 import pdomains  # noqa: F401
-from particle_filters.ant_tag_pf import AntTagParticleFilter
-from wrappers.particle_filter_wrappers import PFDictObservationWrapper
+from set_transformer.rl.particle_filters.ant_tag import AntTagParticleFilter
+from set_transformer.rl.wrappers.particle_filter import PFDictObservationWrapper
 
-_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-if _THIS_DIR not in sys.path:
-    sys.path.insert(0, _THIS_DIR)
-from train_ant_tag_pretrained import (
-    CurriculumVisibilityWrapper,
-    _CurriculumRouter,
-    ant_tag_pf_interaction_mapper,
-)
+# Sibling module name starts with a digit, so importlib is required.
+_train_rl_frozen = importlib.import_module("4_train_rl_frozen")
+CurriculumVisibilityWrapper = _train_rl_frozen.CurriculumVisibilityWrapper
+_CurriculumRouter = _train_rl_frozen._CurriculumRouter
+ant_tag_pf_interaction_mapper = _train_rl_frozen.ant_tag_pf_interaction_mapper
 
 
 def make_eval_env(num_particles: int, obs_mask_indices, seed: int):
