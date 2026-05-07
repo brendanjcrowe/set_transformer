@@ -123,15 +123,21 @@ sb3_*_models/
 sanity_check_*_logs/
 sanity_check_*_models/
 
-# ST training experiments + datasets
-experiments/
+# ST training run output (NOT to be confused with the source-tree
+# experiments/ directory, which holds per-domain pipeline scripts).
+# Per-script run dirs land at the repo root or under data/ — list those
+# explicitly rather than ignoring all of experiments/.
 data/*.npy
 data/*.npz
 wandb/
 
-# Trajectory renders / eval artifacts
+# Run/eval output artifacts
+logs/
+particle_reconstruction_results/
 trajectory_renders/
 *.gif
 *.csv
 *.npz
 *.zip
+*.png
+/*.npy
