@@ -124,41 +124,6 @@ def draw_ellipse(
         ax.add_patch(ellipse)
 
 
-def scatter_mog(
-    X: Union[np.ndarray, torch.Tensor],
-    labels: Union[np.ndarray, torch.Tensor],
-    mu: Union[np.ndarray, torch.Tensor],
-    cov: Union[np.ndarray, torch.Tensor],
-    ax: Optional[Axes] = None,
-    **kwargs,
-) -> None:
-    """Visualize mixture of Gaussians.
-
-    Args:
-        X (Union[np.ndarray, torch.Tensor]): Points to plot (Nx2).
-        labels (Union[np.ndarray, torch.Tensor]): Labels for points.
-        mu (Union[np.ndarray, torch.Tensor]): Means of Gaussians (Kx2).
-        cov (Union[np.ndarray, torch.Tensor]): Covariance matrices (Kx2x2).
-        ax (Optional[Axes], optional): Matplotlib axes to plot on. Defaults to None.
-        **kwargs: Additional arguments passed to scatter.
-    """
-    if not isinstance(X, np.ndarray):
-        X = to_numpy(X)
-    if not isinstance(labels, np.ndarray):
-        labels = to_numpy(labels)
-    if not isinstance(mu, np.ndarray):
-        mu = to_numpy(mu)
-    if not isinstance(cov, np.ndarray):
-        cov = to_numpy(cov)
-
-    ax = ax or plt.gca()
-    colors = plt.cm.rainbow(np.linspace(0, 1, len(np.unique(labels))))
-    for i, l in enumerate(np.unique(labels)):
-        mask = labels == l
-        ax.scatter(X[mask, 0], X[mask, 1], c=colors[i : i + 1], **kwargs)
-        draw_ellipse(mu[l], cov[l], ax=ax, fc=colors[i])
-
-
 def visualize_particle_filter_reconstruction(
     original_particles: Union[np.ndarray, torch.Tensor],
     reconstructed_particles: Union[np.ndarray, torch.Tensor],
