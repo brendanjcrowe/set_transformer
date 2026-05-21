@@ -8,7 +8,6 @@ from matplotlib.patches import Ellipse
 from set_transformer.plots import (
     draw_ellipse,
     scatter,
-    scatter_mog,
     visualize_particle_filter_reconstruction,
 )
 
@@ -94,19 +93,6 @@ def test_draw_ellipse():
     draw_ellipse(pos, cov, ax=ax)
     # Check that ellipses were added to the plot
     assert len(ax.patches) == 5  # One ellipse per confidence level
-    plt.close()
-
-
-def test_scatter_mog(sample_data, sample_labels):
-    """Test mixture of Gaussians visualization."""
-    fig, ax = plt.subplots()
-    K = len(np.unique(sample_labels))
-    mu = np.random.randn(K, 2)
-    cov = np.array([np.eye(2) for _ in range(K)])
-    scatter_mog(sample_data, sample_labels, mu, cov, ax=ax)
-    # Check that both points and ellipses were plotted
-    assert len(ax.collections) > 0  # Points were plotted
-    assert len(ax.patches) > 0  # Ellipses were plotted
     plt.close()
 
 

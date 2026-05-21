@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "set_transformer"
+version = "1.1.0"
+description = "PyTorch Set Transformer with optional RL / particle-filter infra for POMDP belief encoding"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "Brendan Crowe", email = "brendancrowe98@gmail.com" }]
+license = { text = "MIT" }
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "torch>=1.0",
+    "numpy>=1.18.0",
+    "scipy",
+    "tqdm",
+    "matplotlib",
+    "tensorboard",
+    "wandb",
+    "geomloss",
+    "POT",
+]
+
+[project.optional-dependencies]
+rl = [
+    "gymnasium",
+    "stable-baselines3",
+    "filterpy",
+]
+dev = [
+    "pytest>=6.0",
+    "flake8",
+    "black",
+]
+
+[tool.setuptools.packages.find]
+include = ["set_transformer*"]
+exclude = ["experiments*", "tests*"]
