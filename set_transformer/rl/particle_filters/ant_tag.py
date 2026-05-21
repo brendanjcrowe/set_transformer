@@ -1,7 +1,7 @@
 import numpy as np
 from filterpy.monte_carlo import systematic_resample
 
-from .base_pf import BaseParticleFilter  # Use relative import
+from .base import BaseParticleFilter  # Use relative import
 
 
 class AntTagParticleFilter(BaseParticleFilter):

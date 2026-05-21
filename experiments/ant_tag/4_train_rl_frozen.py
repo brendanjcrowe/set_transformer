@@ -13,6 +13,7 @@ Usage:
 """
 
 import argparse
+import os
 
 import gymnasium as gym
 import matplotlib
