@@ -376,11 +376,29 @@ class _CurriculumRouter(gym.Wrapper):
 # PF interaction mapper for AntTag
 # ---------------------------------------------------------------------------
 
+def get_ant_tag_pf_kwargs(env) -> dict:
+    """Build AntTagParticleFilter kwargs from the live AntTag environment."""
+    unwrapped = env.unwrapped
+    cage_max_x = float(unwrapped.cage_max_x)
+    cage_max_y = float(unwrapped.cage_max_y)
+    if not np.isclose(cage_max_x, cage_max_y):
+        raise ValueError(
+            "AntTagParticleFilter currently assumes a square arena, but "
+            f"got cage_max_x={cage_max_x}, cage_max_y={cage_max_y}"
+        )
+    return {
+        "arena_limits": (-cage_max_x, cage_max_x),
+        "target_step": float(unwrapped.target_step),
+        "visibility_radius": float(unwrapped.visible_radius),
+    }
+
+
 def ant_tag_pf_interaction_mapper(
     base_env_obs: np.ndarray,
     base_env_info: dict,
     base_env_action: np.ndarray | None = None,
     unwrapped_env=None,
+    previous_base_env_obs: np.ndarray | None = None,
 ) -> dict:
     """
     Bridge between AntTag observations and the AntTagParticleFilter
@@ -392,6 +410,11 @@ def ant_tag_pf_interaction_mapper(
     hardcoding a radius.
     """
     ant_pos = base_env_obs[:2].copy()
+    ant_pos_for_prediction = (
+        previous_base_env_obs[:2].copy()
+        if previous_base_env_obs is not None
+        else ant_pos
+    )
     target_in_obs = base_env_obs[-2:].copy()
 
     # CurriculumVisibilityWrapper sets obs[-2:] to true target when visible,
@@ -404,7 +427,7 @@ def ant_tag_pf_interaction_mapper(
         observed_target = np.array([np.nan, np.nan])
 
     return {
-        "predict_args": {"ant_current_pos_from_obs": ant_pos},
+        "predict_args": {"ant_current_pos_from_obs": ant_pos_for_prediction},
         "update_args": {
             "observed_target_pos": observed_target,
             "ant_current_pos_from_obs": ant_pos,
@@ -440,6 +463,7 @@ def make_ant_tag_pretrained_env(
     def _init():
         env = gym.make("pdomains-ant-tag-v0", rendering=False)
         env.reset(seed=seed + rank)
+        particle_filter_kwargs = get_ant_tag_pf_kwargs(env)
 
         # Curriculum wrapper: controls target visibility
         env = CurriculumVisibilityWrapper(env, initial_visibility_radius=initial_visibility_radius)
@@ -459,7 +483,7 @@ def make_ant_tag_pretrained_env(
         env = PFPlusFeaturesObservationWrapper(
             env=env,
             particle_filter_class=AntTagParticleFilter,
-            particle_filter_kwargs={},
+            particle_filter_kwargs=particle_filter_kwargs,
             pretrained_st_processor=processor,
             num_particles=num_particles,
             pf_interaction_mapper=ant_tag_pf_interaction_mapper,

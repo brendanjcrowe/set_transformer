@@ -27,6 +27,23 @@ import pdomains  # noqa: F401 — registers pdomains-ant-tag-v0
 from set_transformer.rl.particle_filters.ant_tag import AntTagParticleFilter
 
 
+def get_ant_tag_pf_kwargs(env) -> dict:
+    """Build AntTagParticleFilter kwargs from the live AntTag environment."""
+    unwrapped = env.unwrapped
+    cage_max_x = float(unwrapped.cage_max_x)
+    cage_max_y = float(unwrapped.cage_max_y)
+    if not np.isclose(cage_max_x, cage_max_y):
+        raise ValueError(
+            "AntTagParticleFilter currently assumes a square arena, but "
+            f"got cage_max_x={cage_max_x}, cage_max_y={cage_max_y}"
+        )
+    return {
+        "arena_limits": (-cage_max_x, cage_max_x),
+        "target_step": float(unwrapped.target_step),
+        "visibility_radius": float(unwrapped.visible_radius),
+    }
+
+
 def collect_dataset(
     num_trajectories: int,
     timesteps_per_trajectory: int,
@@ -66,6 +83,7 @@ def collect_dataset(
         pursuit_fraction = 0.0
 
     env = gym.make("pdomains-ant-tag-v0", rendering=False)
+    particle_filter_kwargs = get_ant_tag_pf_kwargs(env)
 
     all_snapshots = []
     pursuit_count = 0
@@ -79,6 +97,7 @@ def collect_dataset(
         pf = AntTagParticleFilter(
             num_particles=num_particles,
             initial_env_obs=obs,
+            **particle_filter_kwargs,
         )
 
         # Decide trajectory type: fully_observed, pursuit, or random
@@ -100,6 +119,8 @@ def collect_dataset(
         traj_vis_radius = np.random.uniform(*visibility_radius_range)
 
         for t in range(timesteps_per_trajectory):
+            ant_pos_for_prediction = obs[:2].copy()
+
             # Choose action
             if traj_type in ("pursuit", "fully_observed"):
                 if locomotion_policy is not None:
@@ -129,7 +150,7 @@ def collect_dataset(
                 observed_target = np.array([np.nan, np.nan])
 
             # PF predict + update
-            pf.predict(action, ant_current_pos_from_obs=ant_pos)
+            pf.predict(action, ant_current_pos_from_obs=ant_pos_for_prediction)
             pf.update(
                 observed_target_pos=observed_target,
                 ant_current_pos_from_obs=ant_pos,

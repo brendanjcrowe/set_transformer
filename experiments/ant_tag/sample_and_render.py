@@ -39,6 +39,7 @@ _train_rl_frozen = importlib.import_module("4_train_rl_frozen")
 CurriculumVisibilityWrapper = _train_rl_frozen.CurriculumVisibilityWrapper
 _CurriculumRouter = _train_rl_frozen._CurriculumRouter
 ant_tag_pf_interaction_mapper = _train_rl_frozen.ant_tag_pf_interaction_mapper
+get_ant_tag_pf_kwargs = _train_rl_frozen.get_ant_tag_pf_kwargs
 
 
 ARENA_MIN, ARENA_MAX = -4.5, 4.5
@@ -51,11 +52,12 @@ def make_eval_env(num_particles, seed):
     def _init():
         env = gym.make("pdomains-ant-tag-v0", rendering=False)
         env.reset(seed=seed)
+        particle_filter_kwargs = get_ant_tag_pf_kwargs(env)
         env = CurriculumVisibilityWrapper(env, initial_visibility_radius=3.0)
         env = PFDictObservationWrapper(
             env=env,
             particle_filter_class=AntTagParticleFilter,
-            particle_filter_kwargs={},
+            particle_filter_kwargs=particle_filter_kwargs,
             num_particles=num_particles,
             pf_interaction_mapper=ant_tag_pf_interaction_mapper,
             obs_mask_indices=[-2, -1],

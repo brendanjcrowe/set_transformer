@@ -43,6 +43,7 @@ CurriculumVisibilityWrapper = _train_rl_frozen.CurriculumVisibilityWrapper
 PFRewardShapingWrapper = _train_rl_frozen.PFRewardShapingWrapper
 _CurriculumRouter = _train_rl_frozen._CurriculumRouter
 ant_tag_pf_interaction_mapper = _train_rl_frozen.ant_tag_pf_interaction_mapper
+get_ant_tag_pf_kwargs = _train_rl_frozen.get_ant_tag_pf_kwargs
 
 
 # ---------------------------------------------------------------------------
@@ -140,13 +141,14 @@ def make_ant_tag_finetune_env(
     def _init():
         env = gym.make("pdomains-ant-tag-v0", rendering=False)
         env.reset(seed=seed + rank)
+        particle_filter_kwargs = get_ant_tag_pf_kwargs(env)
 
         env = CurriculumVisibilityWrapper(env, initial_visibility_radius=initial_visibility_radius)
 
         env = PFDictObservationWrapper(
             env=env,
             particle_filter_class=AntTagParticleFilter,
-            particle_filter_kwargs={},
+            particle_filter_kwargs=particle_filter_kwargs,
             num_particles=num_particles,
             pf_interaction_mapper=ant_tag_pf_interaction_mapper,
             obs_mask_indices=obs_mask_indices,
