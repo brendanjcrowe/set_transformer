@@ -17,6 +17,7 @@ Usage:
 """
 import argparse
 import importlib
+import os
 
 import gymnasium as gym
 import matplotlib

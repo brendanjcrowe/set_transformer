@@ -41,6 +41,7 @@ def get_ant_tag_pf_kwargs(env) -> dict:
         "arena_limits": (-cage_max_x, cage_max_x),
         "target_step": float(unwrapped.target_step),
         "visibility_radius": float(unwrapped.visible_radius),
+        "min_initial_distance": float(unwrapped.min_distance),
     }
 
 

@@ -16,6 +16,7 @@ class AntTagParticleFilter(BaseParticleFilter):
                  obs_noise_std: float = 0.1,
                  target_step: float = 0.5,
                  visibility_radius: float = 3.0,
+                 min_initial_distance: float = 5.0,
                  **kwargs # To accommodate other BaseParticleFilter args
                  ):
         """
@@ -27,11 +28,13 @@ class AntTagParticleFilter(BaseParticleFilter):
             obs_noise_std: Standard deviation of the observation noise.
             target_step: Step size of target movement (matches env's target_step).
             visibility_radius: Radius within which the target is considered visible.
+            min_initial_distance: Minimum initial ant-target distance from env reset.
         """
         self.arena_min, self.arena_max = arena_limits
         self.obs_noise_std = obs_noise_std
         self.target_step = target_step
         self.visibility_radius = visibility_radius
+        self.min_initial_distance = min_initial_distance
         
         # The actual particle state is [x, y] for the opponent
         self._particle_dim = 2 
@@ -41,9 +44,28 @@ class AntTagParticleFilter(BaseParticleFilter):
 
     def _initialize_particles(self, initial_env_obs: np.ndarray, initial_spread_std: float, **kwargs) -> None:
         """Initialize particle states and weights.
-        Particles are spread uniformly within arena_limits.
+        Particles match the AntTag reset prior: uniform in the arena, conditioned
+        on starting far enough from the ant.
         """
-        self._particles = np.random.uniform(self.arena_min, self.arena_max, (self.num_particles, self.particle_dim))
+        ant_pos = initial_env_obs[:2]
+        particles = np.empty((self.num_particles, self.particle_dim))
+        filled = 0
+
+        while filled < self.num_particles:
+            batch_size = max(2 * (self.num_particles - filled), self.num_particles)
+            candidates = np.random.uniform(
+                self.arena_min,
+                self.arena_max,
+                (batch_size, self.particle_dim),
+            )
+            distances = np.linalg.norm(candidates - ant_pos, axis=1)
+            valid = candidates[distances > self.min_initial_distance]
+            n_take = min(len(valid), self.num_particles - filled)
+            if n_take > 0:
+                particles[filled:filled + n_take] = valid[:n_take]
+                filled += n_take
+
+        self._particles = particles
         self._weights = np.ones(self.num_particles) / self.num_particles
 
     def predict(self, action: np.ndarray, ant_current_pos_from_obs: np.ndarray, **kwargs) -> None:
@@ -90,8 +112,10 @@ class AntTagParticleFilter(BaseParticleFilter):
 
         # If move would go out of bounds, stay put (matches env behavior)
         out_of_bounds = (
-            (np.abs(new_positions[:, 0]) > -self.arena_min) |
-            (np.abs(new_positions[:, 1]) > -self.arena_min)
+            (new_positions[:, 0] < self.arena_min) |
+            (new_positions[:, 0] > self.arena_max) |
+            (new_positions[:, 1] < self.arena_min) |
+            (new_positions[:, 1] > self.arena_max)
         )
         new_positions[out_of_bounds] = self._particles[out_of_bounds]
 
