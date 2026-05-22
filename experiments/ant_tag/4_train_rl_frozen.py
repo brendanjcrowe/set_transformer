@@ -232,20 +232,25 @@ class CurriculumVisibilityWrapper(gym.Wrapper):
         """Called by CurriculumCallback via env_method."""
         self.visibility_radius = radius
 
-    def step(self, action):
-        obs, reward, terminated, truncated, info = self.env.step(action)
+    def _apply_curriculum_visibility(self, obs: np.ndarray) -> np.ndarray:
         ant_pos = obs[:2]
         true_target = self.env.unwrapped.get_target_pos()
         dist = float(np.linalg.norm(ant_pos - true_target))
 
+        obs = obs.copy()
         if dist < self.visibility_radius:
-            obs = obs.copy()
             obs[-2:] = true_target
         else:
-            obs = obs.copy()
             obs[-2:] = np.zeros(2)
+        return obs
 
-        return obs, reward, terminated, truncated, info
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        return self._apply_curriculum_visibility(obs), info
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        return self._apply_curriculum_visibility(obs), reward, terminated, truncated, info
 
 
 class CurriculumCallback(BaseCallback):
