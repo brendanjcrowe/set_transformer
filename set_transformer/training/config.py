@@ -5,7 +5,7 @@ This module defines the configuration classes and defaults for training experime
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import List, Literal, Optional, Union
 
 import torch
 
@@ -13,6 +13,9 @@ import torch
 @dataclass
 class TrainingConfig:
     """Configuration for training parameters."""
+
+    # Model selection
+    model_type: Literal["pf_st", "set_vae", "set_vqvae"] = "pf_st"
 
     # Model parameters
     num_particles: int = 500
@@ -23,6 +26,14 @@ class TrainingConfig:
     dim_hidden: int = 128
     num_heads: int = 4
     use_layer_norm: bool = True
+
+    # VAE-specific (ignored unless model_type == "set_vae")
+    kl_weight: float = 1.0
+
+    # VQ-VAE-specific (ignored unless model_type == "set_vqvae")
+    codebook_size: int = 64
+    commitment_weight: float = 0.25
+    ema_decay: float = 0.99
 
     # Training parameters
     batch_size: int = 32

@@ -110,6 +110,39 @@ def main() -> None:
         help="Scaling parameter for Sinkhorn loss",
     )
 
+    # Model selection
+    parser.add_argument(
+        "--model_type",
+        type=str,
+        choices=["pf_st", "set_vae", "set_vqvae"],
+        default="pf_st",
+        help="Which model variant to train",
+    )
+    parser.add_argument(
+        "--kl_weight",
+        type=float,
+        default=1.0,
+        help="Weight on KL term (SetVAE only)",
+    )
+    parser.add_argument(
+        "--codebook_size",
+        type=int,
+        default=64,
+        help="Number of codes in VQ-VAE codebook (SetVQVAE only)",
+    )
+    parser.add_argument(
+        "--commitment_weight",
+        type=float,
+        default=0.25,
+        help="Commitment loss weight (SetVQVAE only)",
+    )
+    parser.add_argument(
+        "--ema_decay",
+        type=float,
+        default=0.99,
+        help="EMA decay for VQ codebook updates (SetVQVAE only)",
+    )
+
     # Model architecture settings
     parser.add_argument(
         "--num_particles", type=int, default=500, help="Number of particles"
@@ -197,6 +230,12 @@ def main() -> None:
 
     # Create a single config from command line arguments
     config = TrainingConfig(
+        # Model selection
+        model_type=args.model_type,
+        kl_weight=args.kl_weight,
+        codebook_size=args.codebook_size,
+        commitment_weight=args.commitment_weight,
+        ema_decay=args.ema_decay,
         # Model parameters
         num_particles=args.num_particles,
         dim_particles=args.dim_particles,
