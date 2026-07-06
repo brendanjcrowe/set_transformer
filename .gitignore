@@ -141,3 +141,14 @@ trajectory_renders/
 *.zip
 *.png
 /*.npy
+
+# ST experiment run artifacts (source lives in experiments/*/*.py,
+# outputs land in sibling data/, figures/, runs/ dirs).
+*.pt
+experiments/*/runs/
+experiments/*/data/*.npy
+experiments/*/data/*.npz
+experiments/*/figures/*.svg
+experiments/*/figures/*.png
+experiments/*/figures/*.csv
+experiments/*/figures/*.npy
