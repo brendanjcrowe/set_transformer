@@ -20,7 +20,14 @@ import torch
 
 from set_transformer.data.synthetic_sets import FAMILY_NAMES
 from set_transformer.loss import EarthMoverDistanceLoss
-from set_transformer.models import PFSetTransformer, SetVAE, SetVQVAE
+from set_transformer.models import (
+    DeepSetAE,
+    DeepSetVAE,
+    DeepSetVQVAE,
+    PFSetTransformer,
+    SetVAE,
+    SetVQVAE,
+)
 
 from _common import DATA_DIR
 
@@ -47,6 +54,17 @@ def load_model(ckpt_path: Path, device: str):
         model = SetVAE(**common)
     elif cfg.model_type == "set_vqvae":
         model = SetVQVAE(
+            codebook_size=cfg.codebook_size,
+            commitment_weight=cfg.commitment_weight,
+            ema_decay=cfg.ema_decay,
+            **common,
+        )
+    elif cfg.model_type == "ds_ae":
+        model = DeepSetAE(**common)
+    elif cfg.model_type == "ds_vae":
+        model = DeepSetVAE(**common)
+    elif cfg.model_type == "ds_vqvae":
+        model = DeepSetVQVAE(
             codebook_size=cfg.codebook_size,
             commitment_weight=cfg.commitment_weight,
             ema_decay=cfg.ema_decay,

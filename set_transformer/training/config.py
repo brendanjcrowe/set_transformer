@@ -15,7 +15,9 @@ class TrainingConfig:
     """Configuration for training parameters."""
 
     # Model selection
-    model_type: Literal["pf_st", "set_vae", "set_vqvae"] = "pf_st"
+    model_type: Literal[
+        "pf_st", "set_vae", "set_vqvae", "ds_ae", "ds_vae", "ds_vqvae"
+    ] = "pf_st"
 
     # Model parameters
     num_particles: int = 500

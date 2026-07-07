@@ -114,7 +114,7 @@ def main() -> None:
     parser.add_argument(
         "--model_type",
         type=str,
-        choices=["pf_st", "set_vae", "set_vqvae"],
+        choices=["pf_st", "set_vae", "set_vqvae", "ds_ae", "ds_vae", "ds_vqvae"],
         default="pf_st",
         help="Which model variant to train",
     )

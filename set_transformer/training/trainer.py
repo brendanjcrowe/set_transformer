@@ -28,7 +28,14 @@ from ..loss import (
     HausdorffLoss,
     SinkhornLoss,
 )
-from ..models import PFSetTransformer, SetVAE, SetVQVAE
+from ..models import (
+    DeepSetAE,
+    DeepSetVAE,
+    DeepSetVQVAE,
+    PFSetTransformer,
+    SetVAE,
+    SetVQVAE,
+)
 from ..plots import visualize_particle_filter_reconstruction
 from .config import ExperimentConfig, TrainingConfig
 
@@ -131,6 +138,17 @@ class Trainer:
             model = SetVAE(**common)
         elif self.config.model_type == "set_vqvae":
             model = SetVQVAE(
+                codebook_size=self.config.codebook_size,
+                commitment_weight=self.config.commitment_weight,
+                ema_decay=self.config.ema_decay,
+                **common,
+            )
+        elif self.config.model_type == "ds_ae":
+            model = DeepSetAE(**common)
+        elif self.config.model_type == "ds_vae":
+            model = DeepSetVAE(**common)
+        elif self.config.model_type == "ds_vqvae":
+            model = DeepSetVQVAE(
                 codebook_size=self.config.codebook_size,
                 commitment_weight=self.config.commitment_weight,
                 ema_decay=self.config.ema_decay,

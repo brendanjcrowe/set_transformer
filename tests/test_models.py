@@ -2,7 +2,16 @@ import pytest
 import torch
 import torch.nn as nn
 
-from set_transformer.models import DeepSet, PFSetTransformer, SetTransformer, SetVAE, SetVQVAE
+from set_transformer.models import (
+    DeepSet,
+    DeepSetAE,
+    DeepSetVAE,
+    DeepSetVQVAE,
+    PFSetTransformer,
+    SetTransformer,
+    SetVAE,
+    SetVQVAE,
+)
 
 
 @pytest.fixture
@@ -323,3 +332,68 @@ def test_set_vqvae_codebook_ema_updates_during_training(
     with torch.no_grad():
         _ = model(X)
     assert torch.allclose(before_eval, model.quantizer.embedding)
+
+
+def test_deep_set_ae_shapes(
+    batch_size: int,
+    num_particles: int,
+    dim_particles: int,
+    num_encodings: int,
+    dim_encoder: int,
+) -> None:
+    model = DeepSetAE(
+        num_particles=num_particles,
+        dim_particles=dim_particles,
+        num_encodings=num_encodings,
+        dim_encoder=dim_encoder,
+    )
+    X = torch.randn(batch_size, num_particles, dim_particles)
+    out = model(X)
+    assert out.shape == (batch_size, num_particles, dim_particles)
+    assert not torch.isnan(out).any()
+
+
+def test_deep_set_vae_shapes(
+    batch_size: int,
+    num_particles: int,
+    dim_particles: int,
+    num_encodings: int,
+    dim_encoder: int,
+) -> None:
+    model = DeepSetVAE(
+        num_particles=num_particles,
+        dim_particles=dim_particles,
+        num_encodings=num_encodings,
+        dim_encoder=dim_encoder,
+    )
+    X = torch.randn(batch_size, num_particles, dim_particles)
+    out = model(X)
+    assert out["recon"].shape == (batch_size, num_particles, dim_particles)
+    assert out["mu"].shape == (batch_size, num_encodings, dim_encoder)
+    assert out["logvar"].shape == (batch_size, num_encodings, dim_encoder)
+    assert out["kl"].dim() == 0
+
+
+def test_deep_set_vqvae_shapes_and_grad(
+    batch_size: int,
+    num_particles: int,
+    dim_particles: int,
+    num_encodings: int,
+    dim_encoder: int,
+) -> None:
+    model = DeepSetVQVAE(
+        num_particles=num_particles,
+        dim_particles=dim_particles,
+        num_encodings=num_encodings,
+        dim_encoder=dim_encoder,
+        codebook_size=16,
+    )
+    X = torch.randn(batch_size, num_particles, dim_particles, requires_grad=True)
+    out = model(X)
+    assert out["recon"].shape == (batch_size, num_particles, dim_particles)
+    assert out["z_e"].shape == (batch_size, num_encodings, dim_encoder)
+    assert out["indices"].shape == (batch_size, num_encodings)
+    (out["recon"].pow(2).mean() + 0.25 * out["commitment_loss"]).backward()
+    enc_param = next(model.encoder.parameters())
+    assert enc_param.grad is not None
+    assert enc_param.grad.abs().sum().item() > 0
