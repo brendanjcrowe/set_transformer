@@ -28,7 +28,14 @@ from ..loss import (
     HausdorffLoss,
     SinkhornLoss,
 )
-from ..models import PFSetTransformer
+from ..models import (
+    DeepSetAE,
+    DeepSetVAE,
+    DeepSetVQVAE,
+    PFSetTransformer,
+    SetVAE,
+    SetVQVAE,
+)
 from ..plots import visualize_particle_filter_reconstruction
 from .config import ExperimentConfig, TrainingConfig
 
@@ -115,7 +122,7 @@ class Trainer:
         Returns:
             nn.Module: Initialized model
         """
-        model = PFSetTransformer(
+        common = dict(
             num_particles=self.config.num_particles,
             dim_particles=self.config.dim_particles,
             num_encodings=self.config.num_encodings,
@@ -124,9 +131,32 @@ class Trainer:
             dim_hidden=self.config.dim_hidden,
             num_heads=self.config.num_heads,
             ln=self.config.use_layer_norm,
-        ).to(self.config.device)
-
-        return model
+        )
+        if self.config.model_type == "pf_st":
+            model = PFSetTransformer(**common)
+        elif self.config.model_type == "set_vae":
+            model = SetVAE(**common)
+        elif self.config.model_type == "set_vqvae":
+            model = SetVQVAE(
+                codebook_size=self.config.codebook_size,
+                commitment_weight=self.config.commitment_weight,
+                ema_decay=self.config.ema_decay,
+                **common,
+            )
+        elif self.config.model_type == "ds_ae":
+            model = DeepSetAE(**common)
+        elif self.config.model_type == "ds_vae":
+            model = DeepSetVAE(**common)
+        elif self.config.model_type == "ds_vqvae":
+            model = DeepSetVQVAE(
+                codebook_size=self.config.codebook_size,
+                commitment_weight=self.config.commitment_weight,
+                ema_decay=self.config.ema_decay,
+                **common,
+            )
+        else:
+            raise ValueError(f"Unknown model_type: {self.config.model_type}")
+        return model.to(self.config.device)
 
     def _setup_optimizer(self) -> optim.Optimizer:
         """Setup optimizer.
@@ -250,6 +280,35 @@ class Trainer:
             self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
         self.best_val_loss = checkpoint["best_val_loss"]
 
+    def _split_output(self, output):
+        """Return (recon, aux_dict) regardless of whether the model returned a
+        plain tensor or a dict of components."""
+        if isinstance(output, dict):
+            recon = output["recon"]
+            aux = {k: v for k, v in output.items() if k != "recon"}
+        else:
+            recon, aux = output, {}
+        return recon, aux
+
+    def _compose_loss(self, recon, target, aux):
+        """Compose total loss from reconstruction + weighted auxiliary terms.
+
+        Returns (total_loss, components_dict) where components is per-term
+        scalar floats for logging.
+        """
+        recon_loss = self.train_loss(recon, target)
+        total = recon_loss
+        components = {"recon": recon_loss.item()}
+        if "kl" in aux:
+            total = total + self.config.kl_weight * aux["kl"]
+            components["kl"] = aux["kl"].item()
+        if "commitment_loss" in aux:
+            total = total + self.config.commitment_weight * aux["commitment_loss"]
+            components["commitment_loss"] = aux["commitment_loss"].item()
+        if "perplexity" in aux:
+            components["perplexity"] = aux["perplexity"].item()
+        return total, components
+
     def train_epoch(self) -> float:
         """Train for one epoch.
 
@@ -266,7 +325,8 @@ class Trainer:
             # Forward pass
             self.optimizer.zero_grad()
             output = self.model(batch)
-            loss = self.train_loss(output, batch)
+            recon, aux = self._split_output(output)
+            loss, components = self._compose_loss(recon, batch, aux)
 
             # Backward pass
             loss.backward()
@@ -293,16 +353,17 @@ class Trainer:
                 )
 
                 # Log to wandb with more metrics
-                wandb.log(
-                    {
-                        "train/step_loss": loss.item(),
-                        "train/running_loss": running_loss,
-                        "train/learning_rate": self.optimizer.param_groups[0]["lr"],
-                        "training/step": self.global_step,
-                        "training/epoch": self.current_epoch,
-                    },
-                    step=self.global_step,
-                )
+                wandb_payload = {
+                    "train/step_loss": loss.item(),
+                    "train/running_loss": running_loss,
+                    "train/learning_rate": self.optimizer.param_groups[0]["lr"],
+                    "training/step": self.global_step,
+                    "training/epoch": self.current_epoch,
+                }
+                for name, value in components.items():
+                    wandb_payload[f"train/{name}"] = value
+                    self.writer.add_scalar(f"train/{name}", value, self.global_step)
+                wandb.log(wandb_payload, step=self.global_step)
 
             # Evaluation
             if self.global_step % self.config.eval_freq == 0:
@@ -323,7 +384,7 @@ class Trainer:
                 )
 
                 # Save visualization
-                self._save_visualization(batch, output)
+                self._save_visualization(batch, recon)
 
                 # Save checkpoint if best
                 if val_loss < self.best_val_loss:
@@ -356,13 +417,14 @@ class Trainer:
             for batch in self.val_loader:
                 batch = batch.to(self.config.device)
                 output = self.model(batch)
+                recon, aux = self._split_output(output)
 
                 # Calculate validation loss (using training loss)
-                loss = self.train_loss(output, batch)
+                loss, _ = self._compose_loss(recon, batch, aux)
                 total_loss += loss.item()
 
-                # Calculate Earth Mover Distance (always)
-                emd = self.eval_loss(output, batch)
+                # Calculate Earth Mover Distance on reconstruction (always)
+                emd = self.eval_loss(recon, batch)
                 total_emd += emd.item()
 
                 num_batches += 1
