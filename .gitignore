@@ -130,6 +130,7 @@ sanity_check_*_models/
 data/*.npy
 data/*.npz
 wandb/
+experiments/*
 
 # Run/eval output artifacts
 logs/
