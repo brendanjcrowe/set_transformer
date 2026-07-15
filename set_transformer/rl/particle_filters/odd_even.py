@@ -8,7 +8,7 @@ Particles represent possible mean values in the range [1, n].
 import numpy as np
 from filterpy.monte_carlo import systematic_resample
 
-from .base_pf import BaseParticleFilter
+from .base import BaseParticleFilter
 
 
 class OddEvenParticleFilter(BaseParticleFilter):

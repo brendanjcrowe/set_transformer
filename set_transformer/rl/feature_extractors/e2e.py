@@ -3,59 +3,7 @@ import torch
 import torch.nn as nn
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 
-# Assuming set_transformer.modules can be found (e.g., if set_transformer is installed or in PYTHONPATH)
-from set_transformer.modules import ISAB, PMA, SAB
-
-
-class SetTransformerNetwork(nn.Module):
-    """
-    Set Transformer network that processes sets of particles.
-    This implementation follows the architecture from the Set Transformer paper.
-    Configurable for different particle dimensions and Set Transformer hyperparameters.
-    """
-    def __init__(
-        self,
-        dim_particle_input: int, # Dimension of each particle (e.g., x, y, weight)
-        dim_st_output: int,      # Output dimension of the Set Transformer
-        dim_hidden: int = 128,
-        num_heads: int = 4,
-        num_inds: int = 32,
-        num_st_outputs: int = 1, # Corresponds to PMA num_seeds
-        ln: bool = False
-    ):
-        super(SetTransformerNetwork, self).__init__()
-        
-        self.encoder = nn.Sequential(
-            ISAB(dim_particle_input, dim_hidden, num_heads, num_inds, ln=ln),
-            ISAB(dim_hidden, dim_hidden, num_heads, num_inds, ln=ln)
-        )
-        
-        self.decoder = nn.Sequential(
-            PMA(dim_hidden, num_heads, num_st_outputs, ln=ln),
-            SAB(dim_hidden, dim_hidden, num_heads, ln=ln),
-            SAB(dim_hidden, dim_hidden, num_heads, ln=ln),
-            nn.Linear(dim_hidden, dim_st_output)
-        )
-        
-        self.dim_particle_input = dim_particle_input
-        self.dim_st_output = dim_st_output
-        self.num_st_outputs = num_st_outputs # Number of vectors from PMA
-        
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass through the Set Transformer.
-        
-        Args:
-            x: Input tensor of shape [batch_size, num_particles, dim_particle_input]
-            
-        Returns:
-            output: Tensor of shape [batch_size, num_st_outputs * dim_st_output]
-        """
-        x = self.encoder(x)
-        x = self.decoder(x)
-        # Reshape to [batch_size, num_st_outputs * dim_st_output]
-        # If num_st_outputs is 1, this is equivalent to [batch_size, dim_st_output]
-        return x.view(-1, self.num_st_outputs * self.dim_st_output)
+from set_transformer.models import SetTransformer
 
 
 class CustomSetTransformerExtractor(BaseFeaturesExtractor):
@@ -74,7 +22,7 @@ class CustomSetTransformerExtractor(BaseFeaturesExtractor):
         st_hidden_dim: int = 128,
         st_num_heads: int = 4,
         st_num_inds: int = 32,
-        st_num_outputs: int = 1, # Corresponds to PMA num_seeds in SetTransformerNetwork
+        st_num_outputs: int = 1,  # PMA num_seeds in the underlying SetTransformer
         st_ln: bool = False,
         # MLP for 'obs'
         obs_mlp_hidden_dims: list[int] = [64, 64],
@@ -95,15 +43,17 @@ class CustomSetTransformerExtractor(BaseFeaturesExtractor):
         self.num_particles = observation_space["particles"].shape[0]
         self.particle_dim = observation_space["particles"].shape[1]
         
-        # Create the Set Transformer
-        self.set_transformer = SetTransformerNetwork(
-            dim_particle_input=self.particle_dim,
-            dim_st_output=st_output_dim,
+        self.st_num_outputs = st_num_outputs
+        self.st_output_dim = st_output_dim
+
+        self.set_transformer = SetTransformer(
+            dim_input=self.particle_dim,
+            num_outputs=st_num_outputs,
+            dim_output=st_output_dim,
+            num_inds=st_num_inds,
             dim_hidden=st_hidden_dim,
             num_heads=st_num_heads,
-            num_inds=st_num_inds,
-            num_st_outputs=st_num_outputs,
-            ln=st_ln
+            ln=st_ln,
         )
         
         # Create MLP for original observations
@@ -131,17 +81,10 @@ class CustomSetTransformerExtractor(BaseFeaturesExtractor):
         # Process original observations
         obs_features = self.obs_net(observations["obs"])
         
-        # Process particles with Set Transformer
+        # SetTransformer returns [batch_size, st_num_outputs, st_output_dim];
+        # flatten the last two dims into a single feature vector for SB3.
         particles = observations["particles"]
-        # Add batch dimension if needed (SB3 usually provides batched observations)
-        # However, for consistency and direct calls, this check can be useful.
-        # if len(particles.shape) == 2: # [num_particles, particle_dim]
-        #     particles = particles.unsqueeze(0) # [1, num_particles, particle_dim]
-        
-        particle_features = self.set_transformer(particles) # [batch_size, st_num_outputs * st_output_dim]
-        
-        # Combine features
-        # Ensure obs_features also has a batch dimension if particles were unbatched and processed.
-        # SB3 handles batching, so usually obs_features and particle_features are already batched.
+        particle_features = self.set_transformer(particles).flatten(start_dim=1)
+
         combined = torch.cat([obs_features, particle_features], dim=1)
-        return self.combined_net(combined) 
+        return self.combined_net(combined)
