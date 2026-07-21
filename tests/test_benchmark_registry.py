@@ -20,8 +20,18 @@ from set_transformer.rl.wrappers.shaping import PotentialBasedShapingWrapper
 
 
 def test_registries_populated():
-    assert {"ant_tag", "odd_even"} <= set(ENV_REGISTRY)
+    assert {"ant_tag", "car_flag", "odd_even"} <= set(ENV_REGISTRY)
     assert {"gaussian", "kmoments", "cgf", "st_frozen", "st_finetune", "st_scratch"} <= set(METHOD_REGISTRY)
+
+
+def test_car_flag_spec_is_unshaped_and_maskless():
+    # Hidden-side env: runs sparse first (no potential), and direction is observed
+    # legitimately so nothing is masked and no mapper is needed.
+    spec = get_env_spec("car_flag")
+    assert spec.potential_fn is None
+    assert spec.obs_mask_indices is None
+    assert spec.pf_mapper is None
+    assert spec.success_fn is not None and spec.success_criterion
 
 
 def test_unknown_lookups_raise():
