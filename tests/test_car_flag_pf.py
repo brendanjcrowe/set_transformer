@@ -87,16 +87,84 @@ def test_weights_stay_normalized_and_finite():
 # --- success detector ----------------------------------------------------------
 
 @pytest.mark.parametrize("terminal,length,expected", [
-    (0.0, 40, True),    # reached heaven-right (terminal 0)
-    (1.0, 20, True),    # reached heaven-left (terminal +1)
-    (-5.0, 30, False),  # reached hell
-    (-1.0, 160, False), # timed out (last step is a normal -1)
+    (1.0, 40, True),    # reached heaven
+    (1.0, 159, True),   # reached heaven slowly (step penalty must not flip the verdict)
+    (-1.0, 30, False),  # reached hell
+    (-1.0, 5, False),   # reached hell fast
 ])
 def test_car_flag_success(terminal, length, expected):
-    from set_transformer.rl.benchmark.envs import car_flag_success
-    # Reconstruct the episode return the env would produce: (length-1) steps of -1 + terminal.
-    episode_return = -(length - 1) + terminal
+    from set_transformer.rl.benchmark.envs import CAR_FLAG_STEP_PENALTY, car_flag_success
+    # Reconstruct the return the env produces: (length-1) penalty steps + the terminal.
+    episode_return = CAR_FLAG_STEP_PENALTY * (length - 1) + terminal
     assert car_flag_success(episode_return, length) is expected
+
+
+def test_car_flag_success_rejects_timeout():
+    """A 160-step timeout has no terminal payout and must not count as success."""
+    from set_transformer.rl.benchmark.envs import CAR_FLAG_STEP_PENALTY, car_flag_success
+
+    assert car_flag_success(CAR_FLAG_STEP_PENALTY * 160, 160) is False
+
+
+# --- corrected reward wrapper ---------------------------------------------------
+
+def test_reward_wrapper_pays_by_outcome():
+    """Heaven/hell are decided by which flag the car reaches, not by which side is which."""
+    gym = pytest.importorskip("gymnasium")
+    pytest.importorskip("pdomains")
+
+    from set_transformer.rl.benchmark.envs import (
+        CAR_FLAG_HEAVEN_REWARD,
+        CAR_FLAG_HELL_REWARD,
+        CAR_FLAG_STEP_PENALTY,
+        make_car_flag_base_env,
+    )
+
+    for seed in range(6):  # spans both heaven sides
+        env = make_car_flag_base_env(seed=seed)
+        env.reset(seed=seed)
+        heaven = float(env.unwrapped.heaven_position)
+        rewards = []
+        while True:
+            obs, r, term, trunc, info = env.step([1.0])  # always drive right
+            rewards.append(r)
+            if term or trunc:
+                break
+        assert all(r == CAR_FLAG_STEP_PENALTY for r in rewards[:-1])
+        if term:
+            # Driving right reaches the +1 flag: heaven iff heaven is the right flag.
+            expected = CAR_FLAG_HEAVEN_REWARD if heaven > 0 else CAR_FLAG_HELL_REWARD
+            assert rewards[-1] == expected
+            assert info["reached_heaven"] is (heaven > 0)
+        env.close()
+
+
+def test_information_now_pays():
+    """The whole point of the correction: using the priest must beat gambling."""
+    gym = pytest.importorskip("gymnasium")
+    pytest.importorskip("pdomains")
+
+    from set_transformer.rl.benchmark.envs import make_car_flag_base_env
+
+    def episode_return(policy, seed):
+        env = make_car_flag_base_env(seed=seed)
+        obs, _ = env.reset(seed=seed)
+        total, revealed = 0.0, 0.0
+        while True:
+            if obs[2] != 0.0:
+                revealed = obs[2]
+            obs, r, term, trunc, _ = env.step([policy(revealed)])
+            total += r
+            if term or trunc:
+                env.close()
+                return total
+
+    gambler = np.mean([episode_return(lambda d: 1.0, s) for s in range(40)])
+    informed = np.mean([
+        episode_return(lambda d: float(np.sign(d)) if d != 0.0 else 1.0, s)
+        for s in range(40)
+    ])
+    assert informed > gambler
 
 
 # --- belief potential ----------------------------------------------------------
