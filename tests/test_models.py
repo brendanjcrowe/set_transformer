@@ -2,7 +2,16 @@ import pytest
 import torch
 import torch.nn as nn
 
-from set_transformer.models import DeepSet, SetTransformer
+from set_transformer.models import (
+    DeepSet,
+    DeepSetAE,
+    DeepSetVAE,
+    DeepSetVQVAE,
+    PFSetTransformer,
+    SetTransformer,
+    SetVAE,
+    SetVQVAE,
+)
 
 
 @pytest.fixture
@@ -151,3 +160,240 @@ def test_gradient_flow(
     loss_transformer.backward()
     assert X_transformer.grad is not None
     assert not torch.isnan(X_transformer.grad).any()
+
+
+@pytest.fixture
+def num_particles() -> int:
+    return 64
+
+
+@pytest.fixture
+def dim_particles() -> int:
+    return 2
+
+
+@pytest.fixture
+def num_encodings() -> int:
+    return 8
+
+
+@pytest.fixture
+def dim_encoder() -> int:
+    return 16
+
+
+def test_set_vae_shapes(
+    batch_size: int,
+    num_particles: int,
+    dim_particles: int,
+    num_encodings: int,
+    dim_encoder: int,
+) -> None:
+    model = SetVAE(
+        num_particles=num_particles,
+        dim_particles=dim_particles,
+        num_encodings=num_encodings,
+        dim_encoder=dim_encoder,
+        ln=True,
+    )
+    X = torch.randn(batch_size, num_particles, dim_particles)
+    out = model(X)
+
+    assert out["recon"].shape == (batch_size, num_particles, dim_particles)
+    assert out["mu"].shape == (batch_size, num_encodings, dim_encoder)
+    assert out["logvar"].shape == (batch_size, num_encodings, dim_encoder)
+    assert out["kl"].dim() == 0
+    assert not torch.isnan(out["recon"]).any()
+    assert not torch.isnan(out["kl"]).any()
+
+
+def test_set_vae_eval_uses_mean(
+    batch_size: int,
+    num_particles: int,
+    dim_particles: int,
+    num_encodings: int,
+    dim_encoder: int,
+) -> None:
+    model = SetVAE(
+        num_particles=num_particles,
+        dim_particles=dim_particles,
+        num_encodings=num_encodings,
+        dim_encoder=dim_encoder,
+        ln=True,
+    )
+    model.eval()
+    X = torch.randn(batch_size, num_particles, dim_particles)
+    with torch.no_grad():
+        a = model(X)["recon"]
+        b = model(X)["recon"]
+    assert torch.allclose(a, b)
+
+
+def test_set_vae_gradient_flow(
+    batch_size: int,
+    num_particles: int,
+    dim_particles: int,
+    num_encodings: int,
+    dim_encoder: int,
+) -> None:
+    model = SetVAE(
+        num_particles=num_particles,
+        dim_particles=dim_particles,
+        num_encodings=num_encodings,
+        dim_encoder=dim_encoder,
+        ln=True,
+    )
+    X = torch.randn(batch_size, num_particles, dim_particles, requires_grad=True)
+    out = model(X)
+    (out["recon"].pow(2).mean() + 1e-3 * out["kl"]).backward()
+    assert X.grad is not None
+    assert not torch.isnan(X.grad).any()
+
+
+def test_set_vqvae_shapes(
+    batch_size: int,
+    num_particles: int,
+    dim_particles: int,
+    num_encodings: int,
+    dim_encoder: int,
+) -> None:
+    codebook_size = 32
+    model = SetVQVAE(
+        num_particles=num_particles,
+        dim_particles=dim_particles,
+        num_encodings=num_encodings,
+        dim_encoder=dim_encoder,
+        codebook_size=codebook_size,
+        ln=True,
+    )
+    X = torch.randn(batch_size, num_particles, dim_particles)
+    out = model(X)
+
+    assert out["recon"].shape == (batch_size, num_particles, dim_particles)
+    assert out["z_e"].shape == (batch_size, num_encodings, dim_encoder)
+    assert out["z_q"].shape == (batch_size, num_encodings, dim_encoder)
+    assert out["indices"].shape == (batch_size, num_encodings)
+    assert out["commitment_loss"].dim() == 0
+    assert out["perplexity"].dim() == 0
+    assert out["indices"].max().item() < codebook_size
+    assert out["indices"].min().item() >= 0
+
+
+def test_set_vqvae_straight_through_gradient(
+    batch_size: int,
+    num_particles: int,
+    dim_particles: int,
+    num_encodings: int,
+    dim_encoder: int,
+) -> None:
+    model = SetVQVAE(
+        num_particles=num_particles,
+        dim_particles=dim_particles,
+        num_encodings=num_encodings,
+        dim_encoder=dim_encoder,
+        codebook_size=32,
+        ln=True,
+    )
+    X = torch.randn(batch_size, num_particles, dim_particles, requires_grad=True)
+    out = model(X)
+    (out["recon"].pow(2).mean() + 0.25 * out["commitment_loss"]).backward()
+    # Gradient must flow through the encoder via the straight-through estimator.
+    enc_param = next(model.set_transformer.parameters())
+    assert enc_param.grad is not None
+    assert enc_param.grad.abs().sum().item() > 0
+    assert X.grad is not None
+    assert not torch.isnan(X.grad).any()
+
+
+def test_set_vqvae_codebook_ema_updates_during_training(
+    batch_size: int,
+    num_particles: int,
+    dim_particles: int,
+    num_encodings: int,
+    dim_encoder: int,
+) -> None:
+    torch.manual_seed(0)
+    model = SetVQVAE(
+        num_particles=num_particles,
+        dim_particles=dim_particles,
+        num_encodings=num_encodings,
+        dim_encoder=dim_encoder,
+        codebook_size=16,
+        ln=True,
+    )
+    model.train()
+    before = model.quantizer.embedding.clone()
+    X = torch.randn(batch_size, num_particles, dim_particles)
+    _ = model(X)
+    assert not torch.allclose(before, model.quantizer.embedding)
+
+    model.eval()
+    before_eval = model.quantizer.embedding.clone()
+    with torch.no_grad():
+        _ = model(X)
+    assert torch.allclose(before_eval, model.quantizer.embedding)
+
+
+def test_deep_set_ae_shapes(
+    batch_size: int,
+    num_particles: int,
+    dim_particles: int,
+    num_encodings: int,
+    dim_encoder: int,
+) -> None:
+    model = DeepSetAE(
+        num_particles=num_particles,
+        dim_particles=dim_particles,
+        num_encodings=num_encodings,
+        dim_encoder=dim_encoder,
+    )
+    X = torch.randn(batch_size, num_particles, dim_particles)
+    out = model(X)
+    assert out.shape == (batch_size, num_particles, dim_particles)
+    assert not torch.isnan(out).any()
+
+
+def test_deep_set_vae_shapes(
+    batch_size: int,
+    num_particles: int,
+    dim_particles: int,
+    num_encodings: int,
+    dim_encoder: int,
+) -> None:
+    model = DeepSetVAE(
+        num_particles=num_particles,
+        dim_particles=dim_particles,
+        num_encodings=num_encodings,
+        dim_encoder=dim_encoder,
+    )
+    X = torch.randn(batch_size, num_particles, dim_particles)
+    out = model(X)
+    assert out["recon"].shape == (batch_size, num_particles, dim_particles)
+    assert out["mu"].shape == (batch_size, num_encodings, dim_encoder)
+    assert out["logvar"].shape == (batch_size, num_encodings, dim_encoder)
+    assert out["kl"].dim() == 0
+
+
+def test_deep_set_vqvae_shapes_and_grad(
+    batch_size: int,
+    num_particles: int,
+    dim_particles: int,
+    num_encodings: int,
+    dim_encoder: int,
+) -> None:
+    model = DeepSetVQVAE(
+        num_particles=num_particles,
+        dim_particles=dim_particles,
+        num_encodings=num_encodings,
+        dim_encoder=dim_encoder,
+        codebook_size=16,
+    )
+    X = torch.randn(batch_size, num_particles, dim_particles, requires_grad=True)
+    out = model(X)
+    assert out["recon"].shape == (batch_size, num_particles, dim_particles)
+    assert out["z_e"].shape == (batch_size, num_encodings, dim_encoder)
+    assert out["indices"].shape == (batch_size, num_encodings)
+    (out["recon"].pow(2).mean() + 0.25 * out["commitment_loss"]).backward()
+    enc_param = next(model.encoder.parameters())
+    assert enc_param.grad is not None
+    assert enc_param.grad.abs().sum().item() > 0
