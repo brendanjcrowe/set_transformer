@@ -188,3 +188,17 @@ class CGFExtractor(_BasePFStatExtractor):
             torch.tensor(float(n), device=particles.device)
         )
         return cgf  # [B, num_t]
+
+    @torch.no_grad()
+    def t_value_norms(self) -> torch.Tensor:
+        """Per-point L2 norms ``||t_m||`` of the learned CGF sampling points.
+
+        Diagnostic for *where on the moment<->support-function continuum* the encoder
+        operates. As ``t = s*u`` with unit ``u``: for small ``s`` the CGF's Taylor jet at
+        the origin is the cumulants (moment-equivalent), so norms collapsing toward 0 mean
+        the encoder has degenerated into a reparameterization of the k-moments baseline;
+        for large ``s`` the ``logsumexp`` tends to ``max_i (u . x_i)`` — the support
+        function of the particle set (the PointNet max-pool regime) — capturing non-local
+        structure that finite moments cannot. Returns a ``[num_t]`` tensor.
+        """
+        return torch.linalg.norm(self.t_values.detach(), dim=1)

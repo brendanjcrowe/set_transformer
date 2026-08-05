@@ -7,6 +7,10 @@ from set_transformer.rl.feature_extractors.statistical import (
     GaussianExtractor,
     KMomentsExtractor,
 )
+from set_transformer.rl.feature_extractors.pooling import (
+    DeepSetExtractor,
+    PointNetExtractor,
+)
 from set_transformer.rl.feature_extractors.st import SetTransformerExtractor
 
 __all__ = [
@@ -15,5 +19,7 @@ __all__ = [
     "GaussianExtractor",
     "KMomentsExtractor",
     "CGFExtractor",
+    "DeepSetExtractor",
+    "PointNetExtractor",
     "SetTransformerExtractor",
 ]

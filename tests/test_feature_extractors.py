@@ -15,8 +15,10 @@ import torch
 from set_transformer.models import PFSetTransformer
 from set_transformer.rl.feature_extractors import (
     CGFExtractor,
+    DeepSetExtractor,
     GaussianExtractor,
     KMomentsExtractor,
+    PointNetExtractor,
     SetTransformerExtractor,
 )
 
@@ -48,12 +50,17 @@ def _sample_obs():
 ST_ARCH = dict(num_encodings=4, dim_encoder=2, num_inds=8, dim_hidden=32, num_heads=2, ln=True)
 
 
+POOL_ARCH = dict(num_encodings=4, dim_encoder=8, dim_hidden=32)
+
+
 def _extractors():
     space = _obs_space()
     return [
         GaussianExtractor(space, features_dim=FEATURES_DIM),
         KMomentsExtractor(space, k=4, features_dim=FEATURES_DIM),
         CGFExtractor(space, num_t=16, features_dim=FEATURES_DIM),
+        DeepSetExtractor(space, features_dim=FEATURES_DIM, **POOL_ARCH),
+        PointNetExtractor(space, features_dim=FEATURES_DIM, **POOL_ARCH),
         SetTransformerExtractor(space, features_dim=FEATURES_DIM, **ST_ARCH),
     ]
 
@@ -113,6 +120,51 @@ def test_cgf_learned_points_receive_grad():
     ext(_sample_obs()).sum().backward()
     assert ext.t_values.grad is not None
     assert ext.t_values.grad.abs().sum() > 0
+
+
+def test_cgf_t_value_norms():
+    """The diagnostic returns one L2 norm per learned sample point, matching ||t_m||."""
+    space = _obs_space()
+    ext = CGFExtractor(space, num_t=16, features_dim=FEATURES_DIM)
+    norms = ext.t_value_norms()
+    assert norms.shape == (16,)
+    expected = torch.linalg.norm(ext.t_values.detach(), dim=1)
+    assert torch.allclose(norms, expected)
+    assert (norms >= 0).all()
+
+
+# --- Pooling extractors (DeepSet / PointNet) -----------------------------------
+
+
+@pytest.mark.parametrize("cls", [DeepSetExtractor, PointNetExtractor])
+def test_pooling_stat_width(cls):
+    ext = cls(_obs_space(), num_encodings=8, dim_encoder=16, features_dim=FEATURES_DIM)
+    assert ext._particle_stat_dim() == 8 * 16
+
+
+def test_pooling_encoder_receives_grad():
+    """The learned pooling encoder must get gradients (it is trained from scratch)."""
+    for cls in (DeepSetExtractor, PointNetExtractor):
+        ext = cls(_obs_space(), features_dim=FEATURES_DIM, **POOL_ARCH)
+        ext(_sample_obs()).sum().backward()
+        grads = [p.grad for p in ext.encoder.parameters()]
+        assert any(g is not None and g.abs().sum() > 0 for g in grads)
+
+
+def test_deepset_vs_pointnet_differ():
+    """Same seed/weights aside, mean-pool and max-pool produce different statistics."""
+    torch.manual_seed(0)
+    ds = DeepSetExtractor(_obs_space(), features_dim=FEATURES_DIM, **POOL_ARCH)
+    torch.manual_seed(0)
+    pn = PointNetExtractor(_obs_space(), features_dim=FEATURES_DIM, **POOL_ARCH)
+    # Identically-initialised encoders (same seed) still differ because the pooling op does.
+    particles = torch.randn(BATCH, NUM_PARTICLES, PARTICLE_DIM)
+    ds.eval()
+    pn.eval()
+    with torch.no_grad():
+        assert not torch.allclose(
+            ds._particle_features(particles), pn._particle_features(particles), atol=1e-4
+        )
 
 
 # --- SetTransformerExtractor-specific behavior ---------------------------------
