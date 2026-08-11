@@ -375,10 +375,14 @@ if __name__ == "__main__":
     # POMDP config args
     parser.add_argument("--n_dist_size", type=int, default=10, 
                         help="Maximum number in range [1, n]")
-    parser.add_argument("--mean", type=float, default=None, 
-                        help="Mean of Gaussian (random if None)")
-    parser.add_argument("--std_dev", type=float, default=2.0, 
-                        help="Standard deviation of Gaussian")
+    parser.add_argument("--true_state", type=float, default=None,
+                        help="Fixes the POMDP's true_state to this value (random draw if None)")
+    parser.add_argument("--std_dev", type=float, default=None,
+                        help="Standard deviation of Gaussian. If not set, computed from "
+                             "n_dist_size and --sigma_divisor instead of using a fixed value")
+    parser.add_argument("--sigma_divisor", type=float, default=float(np.sqrt(10)),
+                        help="Only used when --std_dev is not set: "
+                             "std_dev = sqrt(n_dist_size)/sigma_divisor + 1")
     parser.add_argument("--pomdp_seed", type=int, default=None, 
                         help="Random seed for POMDP")
     parser.add_argument("--n_particles", type=int, default=100, 
@@ -408,8 +412,9 @@ if __name__ == "__main__":
     # Create POMDP config
     pomdp_config = OddEvenPOMDPConfig(
         n_dist_size=args.n_dist_size,
-        mean=args.mean,
+        true_state=args.true_state,
         std_dev=args.std_dev,
+        sigma_divisor=args.sigma_divisor,
         seed=args.pomdp_seed,
         n_particles=args.n_particles,
         true_particles=True,
