@@ -1,14 +1,15 @@
 """
-Evaluate a finetune checkpoint on the REAL sparse tag reward.
+Evaluate a weighted-Gaussian checkpoint on the REAL sparse tag reward.
 
-Builds the eval env identically to the training eval env EXCEPT:
-- vis_radius fixed at 3.0 (real POMDP)
-- No PFRewardShapingWrapper (so Monitor captures the raw -1/step / 0-on-tag reward)
+Mirrors eval_true_reward_cgf.py but loads a 4_train_rl_gaussian.py checkpoint.
+Both encoders share the same PFDictWithWeightsObservationWrapper (particles +
+PF weights) dict-obs env, so this script's env setup is identical to the CGF
+eval script's.
 
 Usage:
-    python experiments/ant_tag/eval_scripts/eval_true_reward.py \
-        --model_path sb3_ant_tag_finetune_v2_models/best_model/best_model.zip \
-        --vecnormalize_path sb3_ant_tag_finetune_v2_models/vecnormalize.pkl \
+    python experiments/ant_tag/eval_scripts/eval_true_reward_gaussian.py \
+        --model_path runs/ant_tag_gaussian/<run>/models/best_model/best_model.zip \
+        --vecnormalize_path runs/ant_tag_gaussian/<run>/models/vecnormalize.pkl \
         --n_episodes 50
 """
 import argparse
@@ -30,31 +31,34 @@ if str(_ANT_TAG_DIR) not in sys.path:
 import gymnasium as gym
 import numpy as np
 from stable_baselines3 import PPO
-from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import VecNormalize, DummyVecEnv
 
 import pdomains  # noqa: F401
 from set_transformer.rl.particle_filters.ant_tag import AntTagParticleFilter
-from set_transformer.rl.wrappers.particle_filter import PFDictObservationWrapper
 
 # Sibling module name starts with a digit, so importlib is required.
-_train_rl_frozen = importlib.import_module("4_train_rl_frozen")
-CurriculumVisibilityWrapper = _train_rl_frozen.CurriculumVisibilityWrapper
-_CurriculumRouter = _train_rl_frozen._CurriculumRouter
-ant_tag_pf_interaction_mapper = _train_rl_frozen.ant_tag_pf_interaction_mapper
-get_ant_tag_pf_kwargs = _train_rl_frozen.get_ant_tag_pf_kwargs
+_train_rl_gaussian = importlib.import_module("4_train_rl_gaussian")
+CurriculumVisibilityWrapper = _train_rl_gaussian.CurriculumVisibilityWrapper
+_CurriculumRouter = _train_rl_gaussian._CurriculumRouter
+ant_tag_pf_interaction_mapper = _train_rl_gaussian.ant_tag_pf_interaction_mapper
+get_ant_tag_pf_kwargs = _train_rl_gaussian.get_ant_tag_pf_kwargs
+PFDictWithWeightsObservationWrapper = _train_rl_gaussian.PFDictWithWeightsObservationWrapper
 
 
-def make_eval_env(num_particles: int, obs_mask_indices, seed: int):
+def make_eval_env(num_particles: int, obs_mask_indices, seed: int,
+                   env_id: str = "pdomains-ant-tag-v0",
+                   particle_filter_class: type = AntTagParticleFilter):
     def _init():
-        env = gym.make("pdomains-ant-tag-v0", rendering=False)
+        env = gym.make(env_id, rendering=False)
         env.reset(seed=seed)
         particle_filter_kwargs = get_ant_tag_pf_kwargs(env)
-        env = CurriculumVisibilityWrapper(env, initial_visibility_radius=3.0)
-        env = PFDictObservationWrapper(
+        env = CurriculumVisibilityWrapper(
+            env,
+            initial_visibility_radius=float(env.unwrapped.visible_radius))
+        env = PFDictWithWeightsObservationWrapper(
             env=env,
-            particle_filter_class=AntTagParticleFilter,
+            particle_filter_class=particle_filter_class,
             particle_filter_kwargs=particle_filter_kwargs,
             num_particles=num_particles,
             pf_interaction_mapper=ant_tag_pf_interaction_mapper,
@@ -67,7 +71,8 @@ def make_eval_env(num_particles: int, obs_mask_indices, seed: int):
     return _init
 
 
-def main():
+def main(env_id: str = "pdomains-ant-tag-v0",
+         particle_filter_class: type = AntTagParticleFilter):
     p = argparse.ArgumentParser()
     p.add_argument("--model_path", type=str, required=True)
     p.add_argument("--vecnormalize_path", type=str, default=None,
@@ -75,6 +80,10 @@ def main():
     p.add_argument("--n_episodes", type=int, default=50)
     p.add_argument("--num_particles", type=int, default=100)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument(
+        "--max_steps", type=int, default=400,
+        help="Episode cap of the env under evaluation; an episode that\n             ends strictly before this many steps counts as a tag.\n             400 for the v0/smart/ghost AntTag variants, 200 for\n             pdomains-ant-tag-dens-v0.",
+    )
     p.add_argument("--no_mask", action="store_true")
     p.add_argument("--deterministic", action="store_true", default=True)
     p.add_argument("--stochastic", dest="deterministic", action="store_false")
@@ -82,7 +91,9 @@ def main():
 
     obs_mask = None if args.no_mask else [-2, -1]
 
-    env_fn = make_eval_env(args.num_particles, obs_mask, args.seed)
+    print(f"Env: {env_id}, particle filter: {particle_filter_class.__name__}")
+    env_fn = make_eval_env(args.num_particles, obs_mask, args.seed,
+                            env_id=env_id, particle_filter_class=particle_filter_class)
     env = DummyVecEnv([env_fn])
 
     if args.vecnormalize_path and os.path.exists(args.vecnormalize_path):
@@ -112,22 +123,25 @@ def main():
             done = bool(dones[0])
         rewards.append(ep_r)
         lengths.append(ep_len)
-        # Tagged = episode ended before truncation. AntTag truncates at 400.
-        if ep_len < 400:
+        # Tagged = episode ended before truncation.
+        if ep_len < args.max_steps:
             tagged += 1
 
     rewards = np.array(rewards)
     lengths = np.array(lengths)
 
+    best_idx = int(np.argmax(rewards))
+
     print(f"\n=== Eval over {args.n_episodes} episodes (deterministic={args.deterministic}) ===")
-    print(f"Mean reward : {rewards.mean():.2f} ± {rewards.std():.2f}")
-    print(f"Min / Max   : {rewards.min():.1f} / {rewards.max():.1f}")
-    print(f"Mean length : {lengths.mean():.1f} ± {lengths.std():.1f}")
-    print(f"Tag rate    : {tagged}/{args.n_episodes} ({100*tagged/args.n_episodes:.1f}%)")
+    print(f"Success rate  : {tagged}/{args.n_episodes} ({100*tagged/args.n_episodes:.1f}%)")
+    print(f"Mean reward   : {rewards.mean():.2f} ± {rewards.std():.2f}")
+    print(f"Mean length   : {lengths.mean():.1f} ± {lengths.std():.1f}")
+    print(f"Median length : {np.median(lengths):.1f}")
+    print(f"Best episode  : reward={rewards[best_idx]:.2f}, length={lengths[best_idx]}")
     # Distribution of tag times (only on tagged episodes)
     if tagged > 0:
-        tag_lens = lengths[lengths < 400]
-        print(f"When tagged : mean_len={tag_lens.mean():.1f}, median={np.median(tag_lens):.1f}")
+        tag_lens = lengths[lengths < args.max_steps]
+        print(f"When tagged   : mean_len={tag_lens.mean():.1f}, median_len={np.median(tag_lens):.1f}")
 
 
 if __name__ == "__main__":
