@@ -226,11 +226,38 @@ class CurriculumVisibilityWrapper(gym.Wrapper):
 
     def __init__(self, env: gym.Env, initial_visibility_radius: float = 100.0):
         super().__init__(env)
-        self.visibility_radius = initial_visibility_radius
+        # Publish immediately, not just in set_curriculum_radius(): the PF
+        # interaction mapper only sees the unwrapped env, and falls back to
+        # the env's fixed `visible_radius` (3.0) when this attribute is
+        # absent. Without this, any env whose curriculum radius is never
+        # updated -- every eval / render / dataset-collection script, which
+        # never call set_curriculum_radius -- would silently tell the PF's
+        # negative-information update a different radius than the one this
+        # wrapper actually used to decide reveal/no-reveal. That is harmless
+        # only while initial_visibility_radius happens to equal 3.0 (true of
+        # every caller today) and silently wrong the moment it doesn't.
+        self.set_curriculum_radius(initial_visibility_radius)
 
     def set_curriculum_radius(self, radius: float):
-        """Called by CurriculumCallback via env_method."""
+        """Called by CurriculumCallback via env_method.
+
+        Also publishes the live radius onto the base env so the PF
+        interaction mapper (which only sees `unwrapped_env`) can read the
+        radius that's actually deciding reveal/no-reveal this step, instead
+        of the base env's fixed `visible_radius`.
+        """
         self.visibility_radius = radius
+        self.env.unwrapped.current_visibility_radius = radius
+
+    def set_evasion_scale(self, scale: float):
+        """Called by CurriculumCallback via env_method.
+
+        No-op for envs without an evasion_scale knob (e.g. base AntTagEnv),
+        so this wrapper stays usable for both the dumb and smart target envs.
+        """
+        base = self.env.unwrapped
+        if hasattr(base, "evasion_scale"):
+            base.evasion_scale = scale
 
     def _apply_curriculum_visibility(self, obs: np.ndarray) -> np.ndarray:
         ant_pos = obs[:2]
@@ -277,6 +304,7 @@ class CurriculumCallback(BaseCallback):
         total_timesteps: int,
         schedule: list[tuple[float, float]] | None = None,
         reward_schedule: list[tuple[float, ...]] | None = None,
+        evasion_schedule: list[tuple[float, float]] | None = None,
         verbose: int = 0,
     ):
         super().__init__(verbose)
@@ -293,6 +321,14 @@ class CurriculumCallback(BaseCallback):
                 (1.0, 0.0, 0.0, 50.0),
             ]
         self.reward_schedule = sorted(reward_schedule, key=lambda x: x[0])
+
+        # Constant scale=1.0 (full smart-target strength throughout) is a
+        # no-op that matches SmartAntTagEnv's own default, so omitting this
+        # arg preserves today's behavior exactly. Only meaningful for the
+        # smart target env; harmlessly ignored by the base AntTagEnv.
+        if evasion_schedule is None:
+            evasion_schedule = [(0.0, 1.0), (1.0, 1.0)]
+        self.evasion_schedule = sorted(evasion_schedule, key=lambda x: x[0])
 
     def _interpolate_schedule(self, schedule, progress: float):
         """Linearly interpolate a schedule. Returns all values after the fraction."""
@@ -316,6 +352,7 @@ class CurriculumCallback(BaseCallback):
         reward_vals = self._interpolate_schedule(self.reward_schedule, progress)
         dist_coeff, ent_coeff = reward_vals[0], reward_vals[1]
         tag_bonus_coeff = reward_vals[2] if len(reward_vals) > 2 else 0.0
+        (evasion_scale,) = self._interpolate_schedule(self.evasion_schedule, progress)
 
         # Update all training envs (works through VecNormalize → SubprocVecEnv)
         vec_env = self.training_env
@@ -329,16 +366,19 @@ class CurriculumCallback(BaseCallback):
             for env in vec_env.envs:
                 _set_radius_recursive(env, radius)
                 _set_reward_coeffs_recursive(env, dist_coeff, ent_coeff, tag_bonus_coeff)
+                _set_evasion_scale_recursive(env, evasion_scale)
         elif hasattr(vec_env, "env_method"):
             # SubprocVecEnv — call into subprocesses
             vec_env.env_method("set_curriculum_radius", radius)
             vec_env.env_method("set_reward_coeffs", dist_coeff, ent_coeff, tag_bonus_coeff)
+            vec_env.env_method("set_evasion_scale", evasion_scale)
 
         if self.verbose > 0 and self.num_timesteps % 10000 < (self.training_env.num_envs if self.training_env else 1):
             print(
                 f"[Curriculum] step={self.num_timesteps}, progress={progress:.2f}, "
                 f"vis_radius={radius:.2f}, dist_coeff={dist_coeff:.3f}, "
-                f"ent_coeff={ent_coeff:.3f}, tag_bonus={tag_bonus_coeff:.1f}"
+                f"ent_coeff={ent_coeff:.3f}, tag_bonus={tag_bonus_coeff:.1f}, "
+                f"evasion_scale={evasion_scale:.2f}"
             )
 
         return True
@@ -349,7 +389,17 @@ def _set_radius_recursive(env, radius: float):
     e = env
     while e is not None:
         if isinstance(e, CurriculumVisibilityWrapper):
-            e.visibility_radius = radius
+            e.set_curriculum_radius(radius)
+            return
+        e = getattr(e, "env", None)
+
+
+def _set_evasion_scale_recursive(env, scale: float):
+    """Walk the wrapper stack and set evasion_scale on the base smart-target env."""
+    e = env
+    while e is not None:
+        if isinstance(e, CurriculumVisibilityWrapper):
+            e.set_evasion_scale(scale)
             return
         e = getattr(e, "env", None)
 
@@ -376,6 +426,9 @@ class _CurriculumRouter(gym.Wrapper):
         _set_reward_coeffs_recursive(self.env, distance_coeff, entropy_coeff,
                                      tag_bonus_coeff)
 
+    def set_evasion_scale(self, scale: float):
+        _set_evasion_scale_recursive(self.env, scale)
+
 
 # ---------------------------------------------------------------------------
 # PF interaction mapper for AntTag
@@ -396,6 +449,7 @@ def get_ant_tag_pf_kwargs(env) -> dict:
         "target_step": float(unwrapped.target_step),
         "visibility_radius": float(unwrapped.visible_radius),
         "min_initial_distance": float(unwrapped.min_distance),
+        "tag_radius": float(unwrapped.tag_radius),
     }
 
 
@@ -432,11 +486,104 @@ def ant_tag_pf_interaction_mapper(
     else:
         observed_target = np.array([np.nan, np.nan])
 
+    # getattr default 1.0 keeps this a no-op for envs without the knob
+    # (base AntTagEnv, or SmartAntTagEnv with no evasion curriculum active).
+    evasion_scale = float(getattr(unwrapped_env, "evasion_scale", 1.0))
+
+    # Must track the env's live value: if the PF propagates particles at a
+    # different target speed than the env actually moves the target, the
+    # belief is systematically wrong. Default 0.0 matches SmartAntTagEnv's
+    # own default (constant target_step, no cornered speed-up) and is a
+    # no-op for the base AntTagEnv, which has no such knob.
+    target_speed_scale = float(getattr(unwrapped_env, "target_speed_scale", 0.0))
+
+    # getattr default falls back to the env's fixed radius for envs without
+    # a curriculum wrapper (eval scripts, dataset collection), so the PF's
+    # negative-info update always matches whatever radius actually decided
+    # reveal/no-reveal this step, curriculum or not.
+    current_visibility_radius = float(
+        getattr(unwrapped_env, "current_visibility_radius", unwrapped_env.visible_radius)
+    )
+
+    # Ghost-ping passthrough (GhostAntTagEnv only). base_env_info carries the
+    # ping; the env attributes carry the live sensor parameters (same pattern
+    # as target_speed_scale). For envs without pings these are None/defaults
+    # and the base PFs' **kwargs absorb them silently.
+    # NOTE: info["ghost_ping_is_true"] is deliberately NOT forwarded — it is
+    # ground truth for offline analysis only.
+    ghost_ping = None
+    if base_env_info:
+        ghost_ping = base_env_info.get("ghost_ping", None)
+    ping_beta = float(getattr(unwrapped_env, "ping_beta", 0.35))
+    ping_sigma = float(getattr(unwrapped_env, "ping_sigma", 0.8))
+
+    # Twin-den passthrough (TwinDenAntTagEnv only). The tight/loose
+    # assignment and den geometry are motion-model parameters the PF is
+    # entitled to know (same convention as evasion_scale). None-defaults for
+    # envs without dens; other PFs' **kwargs absorb them silently.
+    # NOTE: info["den_committed"] (which den the target actually chose) is
+    # deliberately NOT forwarded — it is the hidden episode latent, ground
+    # truth for offline analysis only.
+    den_tight = getattr(unwrapped_env, "tight_den", None)
+    den_positions = getattr(unwrapped_env, "den_positions", None)
+    if den_positions is not None:
+        den_positions = np.asarray(den_positions, dtype=np.float64).copy()
+    den_radius_tight = getattr(unwrapped_env, "den_radius_tight", None)
+    den_radius_loose = getattr(unwrapped_env, "den_radius_loose", None)
+
+    # Counterweighted-den passthrough (CounterweightedDenAntTagEnv only). The
+    # per-episode den geometry, the occupancy prior and the spook state are
+    # motion- and observation-model parameters the PF is entitled to know
+    # (same convention as evasion_scale). None-defaults for every other env;
+    # other PFs' **kwargs absorb them silently.
+    # NOTE: info["cden_occupied"] (WHICH den the target actually occupies) is
+    # deliberately NOT forwarded — it is the hidden episode latent, ground
+    # truth for offline analysis only. Same precedent as den_committed.
+    cden_heavy_pos = getattr(unwrapped_env, "cden_heavy_pos", None)
+    if cden_heavy_pos is not None:
+        cden_heavy_pos = np.asarray(cden_heavy_pos, dtype=np.float64).copy()
+    cden_light_pos = getattr(unwrapped_env, "cden_light_pos", None)
+    if cden_light_pos is not None:
+        cden_light_pos = np.asarray(cden_light_pos, dtype=np.float64).copy()
+    cden_w_heavy = getattr(unwrapped_env, "cden_w_heavy", None)
+    cden_r = getattr(unwrapped_env, "cden_r", None)
+    cden_spook_enabled = bool(getattr(unwrapped_env, "cden_spook_enabled",
+                                      False))
+    cden_spooked = bool(getattr(unwrapped_env, "cden_spooked", False))
+    cden_spook_pos = getattr(unwrapped_env, "cden_spook_pos", None)
+    if cden_spook_pos is not None:
+        cden_spook_pos = np.asarray(cden_spook_pos, dtype=np.float64).copy()
+    cden_spook_radius = getattr(unwrapped_env, "cden_spook_radius", None)
+
     return {
-        "predict_args": {"ant_current_pos_from_obs": ant_pos_for_prediction},
+        "predict_args": {
+            "ant_current_pos_from_obs": ant_pos_for_prediction,
+            "evasion_scale": evasion_scale,
+            "target_speed_scale": target_speed_scale,
+            "den_tight": den_tight,
+            "den_positions": den_positions,
+            "den_radius_tight": den_radius_tight,
+            "den_radius_loose": den_radius_loose,
+            "cden_heavy_pos": cden_heavy_pos,
+            "cden_light_pos": cden_light_pos,
+            "cden_w_heavy": cden_w_heavy,
+            "cden_r": cden_r,
+            "cden_spooked": cden_spooked,
+        },
         "update_args": {
             "observed_target_pos": observed_target,
             "ant_current_pos_from_obs": ant_pos,
+            "visibility_radius": current_visibility_radius,
+            "ghost_ping": ghost_ping,
+            "ping_beta": ping_beta,
+            "ping_sigma": ping_sigma,
+            "cden_heavy_pos": cden_heavy_pos,
+            "cden_light_pos": cden_light_pos,
+            "cden_r": cden_r,
+            "cden_spook_enabled": cden_spook_enabled,
+            "cden_spooked": cden_spooked,
+            "cden_spook_pos": cden_spook_pos,
+            "cden_spook_radius": cden_spook_radius,
         },
     }
 
@@ -463,8 +610,21 @@ def make_ant_tag_pretrained_env(
     entropy_coeff: float = 0.0,
     tag_bonus_coeff: float = 0.0,
     initial_visibility_radius: float = 100.0,
+    apply_reward_shaping: bool = True,
 ):
-    """Return a callable that creates a wrapped AntTag env."""
+    """Return a callable that creates a wrapped AntTag env.
+
+    apply_reward_shaping=False skips PFRewardShapingWrapper entirely, so
+    Monitor sees the env's true sparse reward (-1/step, 0-and-terminate on
+    tag). Use this for the eval env: CurriculumCallback only ever updates
+    reward coefficients on the training env (there's no handle to the eval
+    env), so a shaped eval env would silently report reward numbers stuck
+    at their initial (dense, distance-based) coefficients for the entire
+    run — making EvalCallback's "best_model" selection meaningless. Eval
+    envs already fix visibility at the real POMDP radius regardless of
+    training progress; skipping shaping applies that same "always real
+    difficulty" principle to the reward too.
+    """
 
     def _init():
         env = gym.make("pdomains-ant-tag-v0", rendering=False)
@@ -499,10 +659,11 @@ def make_ant_tag_pretrained_env(
             obs_mask_indices=[-2, -1],
         )
 
-        env = PFRewardShapingWrapper(
-            env, distance_coeff=distance_coeff, entropy_coeff=entropy_coeff,
-            tag_bonus_coeff=tag_bonus_coeff,
-        )
+        if apply_reward_shaping:
+            env = PFRewardShapingWrapper(
+                env, distance_coeff=distance_coeff, entropy_coeff=entropy_coeff,
+                tag_bonus_coeff=tag_bonus_coeff,
+            )
 
         if monitor_dir:
             env = Monitor(env, os.path.join(monitor_dir, str(rank)))
@@ -598,9 +759,12 @@ def train_ant_tag_pretrained(
     if use_vec_normalize:
         vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=True)
 
-    # Eval envs — always evaluate at real POMDP difficulty (radius=3.0)
+    # Eval envs — always evaluate at real POMDP difficulty (radius=3.0) and
+    # on the true sparse reward (no shaping, so the metric doesn't depend
+    # on where the training curriculum currently is).
     eval_env_kw = dict(env_kw)
     eval_env_kw["initial_visibility_radius"] = 3.0
+    eval_env_kw["apply_reward_shaping"] = False
     eval_env_fn = make_ant_tag_pretrained_env(
         **eval_env_kw, rank=n_envs + 1, seed=seed
     )
