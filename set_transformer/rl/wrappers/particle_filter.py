@@ -1,4 +1,5 @@
 import gymnasium as gym
+import inspect
 import numpy as np
 import torch  # For PFPlusFeaturesObservationWrapper if converting to torch tensor for ST
 
@@ -6,6 +7,33 @@ from set_transformer.rl.feature_extractors.pretrained import (
     PretrainedSetTransformerProcessor,
 )
 from set_transformer.rl.particle_filters.base import BaseParticleFilter
+
+
+def _call_pf_interaction_mapper(
+    mapper: callable,
+    base_env_obs: np.ndarray,
+    base_env_info: dict,
+    base_env_action: np.ndarray | None,
+    unwrapped_env,
+    previous_base_env_obs: np.ndarray | None,
+) -> dict:
+    """Call env-specific PF mapper, passing previous obs when supported."""
+    kwargs = {
+        "base_env_obs": base_env_obs,
+        "base_env_info": base_env_info,
+        "base_env_action": base_env_action,
+        "unwrapped_env": unwrapped_env,
+    }
+    signature = inspect.signature(mapper)
+    if (
+        "previous_base_env_obs" in signature.parameters
+        or any(
+            param.kind == inspect.Parameter.VAR_KEYWORD
+            for param in signature.parameters.values()
+        )
+    ):
+        kwargs["previous_base_env_obs"] = previous_base_env_obs
+    return mapper(**kwargs)
 
 
 class PFDictObservationWrapper(gym.Wrapper):
@@ -34,6 +62,7 @@ class PFDictObservationWrapper(gym.Wrapper):
         self.num_particles = num_particles
         self.particle_filter: BaseParticleFilter | None = None
         self.obs_mask_indices = obs_mask_indices
+        self._last_base_env_obs_float: np.ndarray | None = None
         
         # This mapper is crucial and env-specific. It defines how to get args for pf methods from env data.
         # Example for AntTag: 
@@ -85,9 +114,11 @@ class PFDictObservationWrapper(gym.Wrapper):
             num_particles=self.num_particles, 
             **pf_init_kwargs
         )
+        self._last_base_env_obs_float = base_env_obs_float.copy()
         return self._get_dict_obs(base_env_obs_float), info
 
     def step(self, action: np.ndarray) -> tuple[dict, float, bool, bool, dict]:
+        previous_base_env_obs = self._last_base_env_obs_float
         base_env_obs, reward, terminated, truncated, info = self.env.step(action)
         base_env_obs_float = base_env_obs.astype(np.float32)
 
@@ -95,11 +126,13 @@ class PFDictObservationWrapper(gym.Wrapper):
         predict_call_kwargs = {}
         update_call_kwargs = {}
         if self.pf_interaction_mapper:
-            mapped_args = self.pf_interaction_mapper(
+            mapped_args = _call_pf_interaction_mapper(
+                self.pf_interaction_mapper,
                 base_env_obs=base_env_obs_float, 
                 base_env_info=info, 
                 base_env_action=action, 
-                unwrapped_env=self.env.unwrapped
+                unwrapped_env=self.env.unwrapped,
+                previous_base_env_obs=previous_base_env_obs,
             )
             predict_call_kwargs = mapped_args.get("predict_args", {})
             update_call_kwargs = mapped_args.get("update_args", {})
@@ -114,6 +147,7 @@ class PFDictObservationWrapper(gym.Wrapper):
         else:
             self.particle_filter.update(base_env_obs_float)
 
+        self._last_base_env_obs_float = base_env_obs_float.copy()
         return self._get_dict_obs(base_env_obs_float), reward, terminated, truncated, info
 
     def _get_dict_obs(self, base_env_obs: np.ndarray) -> dict:
@@ -156,6 +190,7 @@ class PFPlusFeaturesObservationWrapper(gym.Wrapper):
         self.particle_filter: BaseParticleFilter | None = None
         self.pf_interaction_mapper = pf_interaction_mapper
         self.obs_mask_indices = obs_mask_indices
+        self._last_base_env_obs_float: np.ndarray | None = None
         if self.pf_interaction_mapper is None:
             print("Warning: pf_interaction_mapper is not provided. PF predict/update calls will only receive action/obs_from_env directly.")
 
@@ -186,20 +221,24 @@ class PFPlusFeaturesObservationWrapper(gym.Wrapper):
             num_particles=self.num_particles, 
             **pf_init_kwargs
         )
+        self._last_base_env_obs_float = base_env_obs_float.copy()
         return self._get_concatenated_obs(base_env_obs_float), info
 
     def step(self, action: np.ndarray) -> tuple[np.ndarray, float, bool, bool, dict]:
+        previous_base_env_obs = self._last_base_env_obs_float
         base_env_obs, reward, terminated, truncated, info = self.env.step(action)
         base_env_obs_float = base_env_obs.astype(np.float32)
 
         predict_call_kwargs = {}
         update_call_kwargs = {}
         if self.pf_interaction_mapper:
-            mapped_args = self.pf_interaction_mapper(
+            mapped_args = _call_pf_interaction_mapper(
+                self.pf_interaction_mapper,
                 base_env_obs=base_env_obs_float, 
                 base_env_info=info, 
                 base_env_action=action, 
-                unwrapped_env=self.env.unwrapped
+                unwrapped_env=self.env.unwrapped,
+                previous_base_env_obs=previous_base_env_obs,
             )
             predict_call_kwargs = mapped_args.get("predict_args", {})
             update_call_kwargs = mapped_args.get("update_args", {})
@@ -211,6 +250,7 @@ class PFPlusFeaturesObservationWrapper(gym.Wrapper):
         else:
             self.particle_filter.update(base_env_obs_float)
 
+        self._last_base_env_obs_float = base_env_obs_float.copy()
         return self._get_concatenated_obs(base_env_obs_float), reward, terminated, truncated, info
 
     def _get_concatenated_obs(self, base_env_obs: np.ndarray) -> np.ndarray:

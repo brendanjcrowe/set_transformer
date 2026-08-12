@@ -3,6 +3,7 @@ import importlib
 import os
 
 import gymnasium as gym
+import numpy as np
 from stable_baselines3 import PPO, SAC
 from stable_baselines3.common.evaluation import evaluate_policy
 from stable_baselines3.common.utils import set_random_seed
@@ -21,21 +22,63 @@ from set_transformer.rl.wrappers.particle_filter import (
 )
 
 
-# Placeholder for dynamic import of PF and mapper
-def get_env_module_and_pf(env_id_str: str): # Duplicated, ideally in a shared util
+def get_ant_tag_pf_kwargs(env) -> dict:
+    """Build AntTagParticleFilter kwargs from the live AntTag environment."""
+    unwrapped = env.unwrapped
+    cage_max_x = float(unwrapped.cage_max_x)
+    cage_max_y = float(unwrapped.cage_max_y)
+    if not np.isclose(cage_max_x, cage_max_y):
+        raise ValueError(
+            "AntTagParticleFilter currently assumes a square arena, but "
+            f"got cage_max_x={cage_max_x}, cage_max_y={cage_max_y}"
+        )
+    return {
+        "arena_limits": (-cage_max_x, cage_max_x),
+        "target_step": float(unwrapped.target_step),
+        "visibility_radius": float(unwrapped.visible_radius),
+        "min_initial_distance": float(unwrapped.min_distance),
+    }
+
+
+def ant_tag_pf_interaction_mapper(
+    base_env_obs,
+    base_env_info,
+    base_env_action=None,
+    unwrapped_env=None,
+    previous_base_env_obs=None,
+) -> dict:
+    """Bridge AntTag observations to AntTagParticleFilter predict/update args."""
+    ant_pos = base_env_obs[:2].copy()
+    ant_pos_for_prediction = (
+        previous_base_env_obs[:2].copy()
+        if previous_base_env_obs is not None
+        else ant_pos
+    )
+    target_in_obs = base_env_obs[-2:].copy()
+    visible = np.any(target_in_obs != 0.0)
+    observed_target = target_in_obs if visible else np.array([np.nan, np.nan])
+
+    return {
+        "predict_args": {"ant_current_pos_from_obs": ant_pos_for_prediction},
+        "update_args": {
+            "observed_target_pos": observed_target,
+            "ant_current_pos_from_obs": ant_pos,
+        },
+    }
+
+
+def get_env_module_and_pf(env_id_str: str):
     if "ant_tag" in env_id_str.lower():
+        import pdomains  # noqa: F401 -- registers pdomains-ant-tag-v0
+
         pf_module_name = "set_transformer.rl.particle_filters.ant_tag"
         pf_class_name = "AntTagParticleFilter"
-        mapper_module_name = "environments.ant_tag_utils"
-        mapper_func_name = "ant_tag_pf_interaction_mapper"
     else:
         raise ValueError(f"Unsupported env_id for dynamic PF/mapper loading: {env_id_str}.")
     try:
         pf_module = importlib.import_module(pf_module_name)
         particle_filter_class = getattr(pf_module, pf_class_name)
-        mapper_module = importlib.import_module(mapper_module_name)
-        pf_interaction_mapper = getattr(mapper_module, mapper_func_name)
-        return particle_filter_class, pf_interaction_mapper
+        return particle_filter_class, ant_tag_pf_interaction_mapper
     except ImportError as e:
         print(f"Error importing modules for {env_id_str}: {e}")
         raise
@@ -52,12 +95,19 @@ def make_eval_env(env_id, num_particles, particle_filter_class, particle_filter_
     def _init():
         env = gym.make(env_id)
         env.reset(seed=seed)
+        env_pf_config = {}
+        if "ant_tag" in env_id.lower():
+            env_pf_config = get_ant_tag_pf_kwargs(env)
+        resolved_pf_config = {
+            **env_pf_config,
+            **particle_filter_config,
+        }
 
         if training_mode == 'e2e':
             env = PFDictObservationWrapper(
                 env,
                 particle_filter_class=particle_filter_class,
-                particle_filter_kwargs=particle_filter_config,
+                particle_filter_kwargs=resolved_pf_config,
                 num_particles=num_particles,
                 pf_interaction_mapper=pf_interaction_mapper
             )
@@ -69,7 +119,7 @@ def make_eval_env(env_id, num_particles, particle_filter_class, particle_filter_
             env = PFPlusFeaturesObservationWrapper(
                 env,
                 particle_filter_class=particle_filter_class,
-                particle_filter_kwargs=particle_filter_config,
+                particle_filter_kwargs=resolved_pf_config,
                 pretrained_st_processor=st_processor,
                 num_particles=num_particles,
                 pf_interaction_mapper=pf_interaction_mapper
@@ -179,9 +229,6 @@ if __name__ == "__main__":
     # PF args
     parser.add_argument("--num_particles", type=int, default=100)
     parser.add_argument("--pf_initial_spread_std", type=float, default=5.0)
-    parser.add_argument("--pf_arena_min", type=float, default=-10.0)
-    parser.add_argument("--pf_arena_max", type=float, default=10.0)
-    # ... (add other PF config args as in training scripts)
 
     # E2E specific ST params (needed if training_mode='e2e' for policy reconstruction)
     parser.add_argument("--st_output_dim", type=int, default=64)
@@ -206,8 +253,6 @@ if __name__ == "__main__":
     # Reconstruct pf_config (simplified, match with training scripts)
     pf_config = {
         "initial_spread_std": args.pf_initial_spread_std,
-        "arena_limits": (args.pf_arena_min, args.pf_arena_max),
-        # ... add other pf params from parser
     }
     # Reconstruct st_params for e2e if needed (simplified)
     st_params_e2e = {
@@ -230,4 +275,4 @@ if __name__ == "__main__":
         deterministic=args.deterministic_eval,
         vec_normalize_path=args.vec_normalize_path,
         seed=args.seed
-    ) 
+    )

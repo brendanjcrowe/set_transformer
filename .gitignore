@@ -122,6 +122,15 @@ sb3_*_logs/
 sb3_*_models/
 sanity_check_*_logs/
 sanity_check_*_models/
+# The globs above miss the un-infixed names, so list them too. These hold
+# TensorBoard events + eval .npz from sanity/phase runs, not source.
+sanity_check_logs/
+sanity_check_models/
+phase3_logs/
+phase4_eval_logs/
+
+# Timestamped experiment run output (logs, checkpoints, TensorBoard, etc.)
+/runs/
 
 # ST training run output (NOT to be confused with the source-tree
 # experiments/ directory, which holds per-domain pipeline scripts).

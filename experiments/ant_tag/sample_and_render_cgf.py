@@ -1,5 +1,8 @@
 """
-Sample a few trajectories from a trained AntTag policy and render them.
+Sample a few trajectories from a trained weighted-CGF AntTag policy and render them.
+
+Mirrors sample_and_render.py but uses PFDictWithWeightsObservationWrapper
+(particles + PF weights), since WeightedCGFFeaturesExtractor requires both.
 
 Each episode is rendered as a 2D arena plot with:
 - Ant trajectory (blue), colored by time
@@ -9,15 +12,21 @@ Each episode is rendered as a 2D arena plot with:
 - Start / end markers, tag indicator
 
 Usage:
-    python training/sample_and_render_trajectories.py \
-        --model_path sb3_ant_tag_finetune_v2_models/finetune_agent.zip \
-        --vecnormalize_path sb3_ant_tag_finetune_v2_models/vecnormalize.pkl \
+    python experiments/ant_tag/sample_and_render_cgf.py \
+        --model_path runs/ant_tag_cgf/20260729_234035_seed1/models/cgf_agent.zip \
+        --vecnormalize_path runs/ant_tag_cgf/20260729_234035_seed1/models/vecnormalize.pkl \
         --n_episodes 2 \
-        --output_dir trajectory_renders/v2_final
+        --output_dir trajectory_renders/cgf_seed1
 """
 import argparse
 import importlib
 import os
+import sys
+from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 import gymnasium as gym
 import matplotlib
@@ -33,14 +42,14 @@ from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
 import pdomains  # noqa: F401
 from set_transformer.rl.particle_filters.ant_tag import AntTagParticleFilter
-from set_transformer.rl.wrappers.particle_filter import PFDictObservationWrapper
 
 # Sibling module name starts with a digit, so importlib is required.
-_train_rl_frozen = importlib.import_module("4_train_rl_frozen")
-CurriculumVisibilityWrapper = _train_rl_frozen.CurriculumVisibilityWrapper
-_CurriculumRouter = _train_rl_frozen._CurriculumRouter
-ant_tag_pf_interaction_mapper = _train_rl_frozen.ant_tag_pf_interaction_mapper
-get_ant_tag_pf_kwargs = _train_rl_frozen.get_ant_tag_pf_kwargs
+_train_rl_cgf = importlib.import_module("4_train_rl_cgf")
+CurriculumVisibilityWrapper = _train_rl_cgf.CurriculumVisibilityWrapper
+_CurriculumRouter = _train_rl_cgf._CurriculumRouter
+ant_tag_pf_interaction_mapper = _train_rl_cgf.ant_tag_pf_interaction_mapper
+get_ant_tag_pf_kwargs = _train_rl_cgf.get_ant_tag_pf_kwargs
+PFDictWithWeightsObservationWrapper = _train_rl_cgf.PFDictWithWeightsObservationWrapper
 
 
 ARENA_MIN, ARENA_MAX = -4.5, 4.5
@@ -55,7 +64,7 @@ def make_eval_env(num_particles, seed):
         env.reset(seed=seed)
         particle_filter_kwargs = get_ant_tag_pf_kwargs(env)
         env = CurriculumVisibilityWrapper(env, initial_visibility_radius=3.0)
-        env = PFDictObservationWrapper(
+        env = PFDictWithWeightsObservationWrapper(
             env=env,
             particle_filter_class=AntTagParticleFilter,
             particle_filter_kwargs=particle_filter_kwargs,
@@ -70,10 +79,10 @@ def make_eval_env(num_particles, seed):
 
 
 def get_particle_filter(vec_env):
-    """Walk the DummyVecEnv's first env to find the PFDictObservationWrapper."""
+    """Walk the DummyVecEnv's first env to find the PF wrapper."""
     e = vec_env.envs[0]
     while e is not None:
-        if isinstance(e, PFDictObservationWrapper):
+        if isinstance(e, PFDictWithWeightsObservationWrapper):
             return e.particle_filter
         e = getattr(e, "env", None)
     return None
@@ -282,7 +291,7 @@ def main():
         data = rollout_one(model, vec_env, max_steps=400)
         T = len(data["step"]) - 1
         tagged = T < 400
-        out_path = os.path.join(args.output_dir, f"episode_{ep:02d}.gif")
+        out_path = os.path.join(args.output_dir, f"episode_{ep:02d}_cgf.gif")
         render_episode(data, ep, out_path, fps=args.fps)
         print(f"Episode {ep}: len={T}, reward={data['reward'].sum():.0f}, "
               f"{'TAGGED' if tagged else 'timed out'} -> {out_path}")

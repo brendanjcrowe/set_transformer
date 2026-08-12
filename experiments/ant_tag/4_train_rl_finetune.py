@@ -43,6 +43,7 @@ CurriculumVisibilityWrapper = _train_rl_frozen.CurriculumVisibilityWrapper
 PFRewardShapingWrapper = _train_rl_frozen.PFRewardShapingWrapper
 _CurriculumRouter = _train_rl_frozen._CurriculumRouter
 ant_tag_pf_interaction_mapper = _train_rl_frozen.ant_tag_pf_interaction_mapper
+get_ant_tag_pf_kwargs = _train_rl_frozen.get_ant_tag_pf_kwargs
 
 
 # ---------------------------------------------------------------------------
@@ -134,28 +135,42 @@ def make_ant_tag_finetune_env(
     tag_bonus_coeff: float = 0.0,
     initial_visibility_radius: float = 100.0,
     obs_mask_indices: list[int] | None = None,
+    apply_reward_shaping: bool = True,
 ):
-    """Return a callable that creates a wrapped AntTag env with Dict obs."""
+    """Return a callable that creates a wrapped AntTag env with Dict obs.
+
+    apply_reward_shaping=False skips PFRewardShapingWrapper entirely, so
+    Monitor sees the env's true sparse reward (-1/step, 0-and-terminate on
+    tag). Use this for the eval env: CurriculumCallback only ever updates
+    reward coefficients on the training env, so a shaped eval env would
+    report reward numbers stuck at their initial (dense) coefficients for
+    the entire run, making EvalCallback's "best_model" selection
+    meaningless. Eval envs already fix visibility at the real POMDP radius
+    regardless of training progress; this applies that same principle to
+    the reward too.
+    """
 
     def _init():
         env = gym.make("pdomains-ant-tag-v0", rendering=False)
         env.reset(seed=seed + rank)
+        particle_filter_kwargs = get_ant_tag_pf_kwargs(env)
 
         env = CurriculumVisibilityWrapper(env, initial_visibility_radius=initial_visibility_radius)
 
         env = PFDictObservationWrapper(
             env=env,
             particle_filter_class=AntTagParticleFilter,
-            particle_filter_kwargs={},
+            particle_filter_kwargs=particle_filter_kwargs,
             num_particles=num_particles,
             pf_interaction_mapper=ant_tag_pf_interaction_mapper,
             obs_mask_indices=obs_mask_indices,
         )
 
-        env = PFRewardShapingWrapper(
-            env, distance_coeff=distance_coeff, entropy_coeff=entropy_coeff,
-            tag_bonus_coeff=tag_bonus_coeff,
-        )
+        if apply_reward_shaping:
+            env = PFRewardShapingWrapper(
+                env, distance_coeff=distance_coeff, entropy_coeff=entropy_coeff,
+                tag_bonus_coeff=tag_bonus_coeff,
+            )
 
         if monitor_dir:
             env = Monitor(env, os.path.join(monitor_dir, str(rank)))
@@ -230,8 +245,12 @@ def train_ant_tag_finetune(
     if use_vec_normalize:
         vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=True)
 
+    # Eval envs — always evaluate at real POMDP difficulty (radius=3.0) and
+    # on the true sparse reward (no shaping, so the metric doesn't depend
+    # on where the training curriculum currently is).
     eval_env_kw = dict(env_kw)
     eval_env_kw["initial_visibility_radius"] = 3.0
+    eval_env_kw["apply_reward_shaping"] = False
     eval_env_fn = make_ant_tag_finetune_env(
         **eval_env_kw, rank=n_envs + 1, seed=seed
     )

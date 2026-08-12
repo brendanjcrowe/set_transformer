@@ -6,13 +6,26 @@ Builds the eval env identically to the training eval env EXCEPT:
 - No PFRewardShapingWrapper (so Monitor captures the raw -1/step / 0-on-tag reward)
 
 Usage:
-    python training/eval_true_reward.py \
+    python experiments/ant_tag/eval_scripts/eval_true_reward.py \
         --model_path sb3_ant_tag_finetune_v2_models/best_model/best_model.zip \
         --vecnormalize_path sb3_ant_tag_finetune_v2_models/vecnormalize.pkl \
         --n_episodes 50
 """
 import argparse
 import importlib
+import os
+import sys
+from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+# The 4_train_rl_* pipeline scripts live one level up, in experiments/ant_tag/.
+# Only this script's own directory is on sys.path by default, so add theirs.
+_ANT_TAG_DIR = Path(__file__).resolve().parents[1]
+if str(_ANT_TAG_DIR) not in sys.path:
+    sys.path.insert(0, str(_ANT_TAG_DIR))
 
 import gymnasium as gym
 import numpy as np
@@ -30,17 +43,19 @@ _train_rl_frozen = importlib.import_module("4_train_rl_frozen")
 CurriculumVisibilityWrapper = _train_rl_frozen.CurriculumVisibilityWrapper
 _CurriculumRouter = _train_rl_frozen._CurriculumRouter
 ant_tag_pf_interaction_mapper = _train_rl_frozen.ant_tag_pf_interaction_mapper
+get_ant_tag_pf_kwargs = _train_rl_frozen.get_ant_tag_pf_kwargs
 
 
 def make_eval_env(num_particles: int, obs_mask_indices, seed: int):
     def _init():
         env = gym.make("pdomains-ant-tag-v0", rendering=False)
         env.reset(seed=seed)
+        particle_filter_kwargs = get_ant_tag_pf_kwargs(env)
         env = CurriculumVisibilityWrapper(env, initial_visibility_radius=3.0)
         env = PFDictObservationWrapper(
             env=env,
             particle_filter_class=AntTagParticleFilter,
-            particle_filter_kwargs={},
+            particle_filter_kwargs=particle_filter_kwargs,
             num_particles=num_particles,
             pf_interaction_mapper=ant_tag_pf_interaction_mapper,
             obs_mask_indices=obs_mask_indices,
