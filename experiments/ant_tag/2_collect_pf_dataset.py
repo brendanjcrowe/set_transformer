@@ -24,25 +24,8 @@ from tqdm import tqdm
 
 import pdomains  # noqa: F401 — registers pdomains-ant-tag-v0
 
+from set_transformer.rl.mappers import get_ant_tag_pf_kwargs
 from set_transformer.rl.particle_filters.ant_tag import AntTagParticleFilter
-
-
-def get_ant_tag_pf_kwargs(env) -> dict:
-    """Build AntTagParticleFilter kwargs from the live AntTag environment."""
-    unwrapped = env.unwrapped
-    cage_max_x = float(unwrapped.cage_max_x)
-    cage_max_y = float(unwrapped.cage_max_y)
-    if not np.isclose(cage_max_x, cage_max_y):
-        raise ValueError(
-            "AntTagParticleFilter currently assumes a square arena, but "
-            f"got cage_max_x={cage_max_x}, cage_max_y={cage_max_y}"
-        )
-    return {
-        "arena_limits": (-cage_max_x, cage_max_x),
-        "target_step": float(unwrapped.target_step),
-        "visibility_radius": float(unwrapped.visible_radius),
-        "min_initial_distance": float(unwrapped.min_distance),
-    }
 
 
 def collect_dataset(

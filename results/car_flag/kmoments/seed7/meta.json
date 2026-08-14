@@ -1,0 +1,30 @@
+{
+  "env": "car_flag",
+  "method": "kmoments",
+  "seed": 7,
+  "algo": "PPO",
+  "gamma": 0.99,
+  "total_timesteps": 1000000,
+  "num_particles": 100,
+  "shaped": false,
+  "vec_normalize": false,
+  "extractor_kwargs": {
+    "features_dim": 128,
+    "k": 4
+  },
+  "max_ep_steps": 160,
+  "success_criterion": "reached heaven (reconstructed terminal reward >= +0.5; corrected reward)",
+  "git_commit": "2ddfedab8eef887903f1d7acc8563ac937a3e00d",
+  "wall_clock_sec": 1739.1696939468384,
+  "timestamp": "2026-07-23_14-41-26",
+  "extractor_params_total": 13248,
+  "extractor_params_trainable": 13248,
+  "particle_stat_dim": 4,
+  "features_dim": 128,
+  "eval_return_mean": -0.5660000000000001,
+  "eval_return_std": 0.9776778610564935,
+  "eval_length_mean": 37.6,
+  "n_eval_episodes": 20,
+  "final_timestep": 1000000,
+  "success_rate": 0.4
+}
