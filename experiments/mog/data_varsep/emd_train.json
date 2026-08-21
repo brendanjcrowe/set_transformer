@@ -1,0 +1,19 @@
+{
+  "source": "experiments/mog/data_varsep/train.points.npy",
+  "n_samples": 20000,
+  "metric": "debiased_sinkhorn",
+  "p": 2,
+  "blur": 0.05,
+  "dtype": "float32",
+  "shape": [
+    20000,
+    20000
+  ],
+  "offdiag_mean": 3.480919012776328,
+  "offdiag_std": 2.5141201264933875,
+  "offdiag_min": 0.007507070899009705,
+  "offdiag_max": 30.61769676208496,
+  "diag_absmax": 0.0,
+  "hist_sampled_rows": 4000,
+  "wall_seconds": 3620.4
+}

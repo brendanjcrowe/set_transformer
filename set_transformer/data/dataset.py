@@ -61,6 +61,24 @@ class POMDPDataset(Dataset):
         return self.data[idx].to(self.device)
 
 
+class IndexedDataset(Dataset):
+    """Wrap a dataset so each item comes back as ``(sample, index)``.
+
+    Needed by the latent metric-alignment loss: a batch has to know which rows of the
+    precomputed pairwise-EMD matrix it corresponds to, which the plain dataset (yielding
+    bare tensors) throws away.
+    """
+
+    def __init__(self, dataset: Dataset) -> None:
+        self.dataset = dataset
+
+    def __len__(self) -> int:
+        return len(self.dataset)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
+        return self.dataset[idx], idx
+
+
 def get_dataset(data_path: str, device: str = "cpu") -> POMDPDataset:
     """Load dataset from file.
 

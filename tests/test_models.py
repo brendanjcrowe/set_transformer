@@ -8,6 +8,7 @@ from set_transformer.models import (
     DeepSetVAE,
     DeepSetVQVAE,
     PFSetTransformer,
+    PointNetAE,
     SetTransformer,
     SetVAE,
     SetVQVAE,
@@ -397,3 +398,65 @@ def test_deep_set_vqvae_shapes_and_grad(
     enc_param = next(model.encoder.parameters())
     assert enc_param.grad is not None
     assert enc_param.grad.abs().sum().item() > 0
+
+
+@pytest.mark.parametrize("cls", [PFSetTransformer, DeepSetAE, PointNetAE, SetVAE, DeepSetVAE])
+def test_encode_returns_the_bottleneck_code(
+    cls,
+    batch_size: int,
+    num_particles: int,
+    dim_particles: int,
+    num_encodings: int,
+    dim_encoder: int,
+) -> None:
+    """`encode` is the uniform latent accessor the metric-alignment loss reads.
+
+    For the VAEs it must be the deterministic posterior mean, not a sample.
+    """
+    model = cls(
+        num_particles=num_particles,
+        dim_particles=dim_particles,
+        num_encodings=num_encodings,
+        dim_encoder=dim_encoder,
+    )
+    model.eval()
+    X = torch.randn(batch_size, num_particles, dim_particles)
+    z = model.encode(X)
+    assert z.shape == (batch_size, num_encodings, dim_encoder)
+    assert torch.allclose(z, model.encode(X))  # deterministic
+    out = model(X)
+    if isinstance(out, dict):
+        assert torch.allclose(z, out["mu"], atol=1e-6)
+    else:
+        # The AEs must decode exactly what encode returns, so building recon from an
+        # explicit encode() call (what the aligned trainer does) matches forward().
+        assert torch.allclose(model.decoder(z), out, atol=1e-6)
+
+
+def test_point_net_ae_is_a_max_pool_twin_of_deep_set_ae(
+    batch_size: int,
+    num_particles: int,
+    dim_particles: int,
+    num_encodings: int,
+    dim_encoder: int,
+) -> None:
+    """The two pooling autoencoders must differ ONLY in the pooling operator, so the
+    benchmark can attribute any gap between them to mean- vs. max-aggregation."""
+    kwargs = dict(
+        num_particles=num_particles,
+        dim_particles=dim_particles,
+        num_encodings=num_encodings,
+        dim_encoder=dim_encoder,
+    )
+    pn, ds = PointNetAE(**kwargs), DeepSetAE(**kwargs)
+    assert sum(p.numel() for p in pn.parameters()) == sum(p.numel() for p in ds.parameters())
+    assert set(pn.state_dict()) == set(ds.state_dict())
+
+    X = torch.randn(batch_size, num_particles, dim_particles)
+    out = pn(X)
+    assert out.shape == (batch_size, num_particles, dim_particles)
+    assert not torch.isnan(out).any()
+
+    # Permutation invariance of the code (the property the whole benchmark relies on).
+    perm = torch.randperm(num_particles)
+    assert torch.allclose(pn.encode(X), pn.encode(X[:, perm]), atol=1e-5)

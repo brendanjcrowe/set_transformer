@@ -25,6 +25,24 @@ import torch.nn as nn
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 
 
+def load_pretrained_state_dict(model_path: str) -> dict:
+    """Load an autoencoder state_dict from a raw or Trainer/sweep checkpoint file.
+
+    Accepts the three shapes this repo writes: a bare ``state_dict``, a
+    ``set_transformer.training`` checkpoint (``model_state_dict``), and a pretraining
+    sweep checkpoint (``state_dict``).
+    """
+    loaded = torch.load(model_path, map_location="cpu", weights_only=False)
+    if isinstance(loaded, dict):
+        for key in ("model_state_dict", "state_dict"):
+            if key in loaded:
+                return loaded[key]
+        return loaded
+    raise ValueError(
+        f"Expected a state_dict or trainer checkpoint dict, got {type(loaded)}"
+    )
+
+
 class _BasePFStatExtractor(BaseFeaturesExtractor):
     """Shared plumbing for the statistical particle-set extractors.
 
@@ -68,6 +86,56 @@ class _BasePFStatExtractor(BaseFeaturesExtractor):
             nn.Linear(current_dim + stat_dim, features_dim),
             nn.ReLU(),
         )
+
+    # --- pretrained-encoder plumbing ------------------------------------------
+    def _apply_pretrained(
+        self, model: nn.Module, pretrained_model_path: str | None, freeze: bool
+    ) -> nn.Module:
+        """Load pretrained weights into ``model`` and optionally freeze it.
+
+        Shared by the Set Transformer and the pooling encoders so checkpoint handling
+        lives in one place. The *whole* autoencoder is kept attached even though only its
+        encoder half feeds ``forward`` — that way a checkpoint round-trips unchanged.
+        """
+        if pretrained_model_path:
+            model.load_state_dict(load_pretrained_state_dict(pretrained_model_path))
+            print(f"{type(self).__name__}: loaded {pretrained_model_path}")
+        else:
+            print(f"{type(self).__name__}: training from scratch (no pretrained weights)")
+        if freeze:
+            model.requires_grad_(False)
+            model.eval()
+            self._frozen_model = model
+        return model
+
+    def train(self, mode: bool = True) -> "_BasePFStatExtractor":
+        """Keep a frozen encoder in eval mode even when SB3 flips ``train()``."""
+        super().train(mode)
+        frozen = getattr(self, "_frozen_model", None)
+        if frozen is not None:
+            frozen.eval()
+        return self
+
+    def particle_encoder_parameters(self) -> int:
+        """Learned parameters on the particle side that ``forward`` actually uses.
+
+        The pretrained autoencoders keep their decoder attached so checkpoints round-trip
+        unchanged, but it never runs in the policy — counting it would overstate encoder
+        capacity in the fairness audit. Analytic baselines return 0.
+        """
+        if hasattr(self, "encoder"):
+            return sum(p.numel() for p in self.encoder.parameters())
+        head = {id(p) for p in self.obs_net.parameters()}
+        head |= {id(p) for p in self.combined_net.parameters()}
+        return sum(p.numel() for p in self.parameters() if id(p) not in head)
+
+    @staticmethod
+    def _check_freeze(pretrained_model_path: str | None, freeze: bool) -> None:
+        if freeze and not pretrained_model_path:
+            raise ValueError(
+                "freeze=True requires pretrained_model_path (frozen random weights are "
+                "meaningless)."
+            )
 
     # --- subclass hooks -------------------------------------------------------
     def _build_particle_stat(self) -> None:

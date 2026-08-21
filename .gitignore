@@ -165,6 +165,13 @@ trajectory_renders/
 !results/figures/*.png
 !results/figures/*.svg
 
+# Precomputed pairwise-EMD matrices for the latent-alignment loss. 1.6 GB each and fully
+# regenerable from the committed point splits via 8_precompute_emd_matrix.py. The small
+# .json sidecar (metric settings + histogram stats) is deliberately NOT ignored — it is
+# the provenance record for whichever matrix a run was aligned against.
+experiments/*/data*/emd_*.npy
+experiments/*/data*/emd_*.progress.json
+
 # ST experiment run artifacts (source lives in experiments/*/*.py,
 # outputs land in sibling data/, figures/, runs/ dirs).
 *.pt

@@ -59,12 +59,21 @@ class EnvSpec:
 
 @dataclass
 class MethodSpec:
-    """A feature-extractor method. ST methods also take runtime arch + pretrained path."""
+    """A feature-extractor method.
+
+    ``is_pretrainable`` marks the learned set encoders (ST / DeepSet / PointNet), which
+    additionally take the runtime encoder arch and — for the frozen/finetune flavors — a
+    pretrained checkpoint. ``encoder_kind`` and ``aligned`` say *which* checkpoint the
+    sweep runner should hand them: an encoder pretrained with, or without, the latent
+    metric-alignment term.
+    """
 
     name: str
     extractor_class: type
     extractor_kwargs: dict = field(default_factory=dict)
-    is_set_transformer: bool = False
+    is_pretrainable: bool = False
+    encoder_kind: Optional[str] = None  # "st" | "ds" | "pn"
+    aligned: bool = False
 
 
 # --- Environment registry ------------------------------------------------------
@@ -123,16 +132,67 @@ ENV_REGISTRY: dict[str, EnvSpec] = {
 
 # --- Method registry -----------------------------------------------------------
 
+# Capacity-matched configuration (2026-08-20). Every *learned* encoder shares
+# stat_dim = num_encodings * dim_encoder = 16 and ~100-111k encoder parameters:
+# ST at dim_hidden=64/num_inds=32 is 111,106; DeepSet/PointNet at dim_hidden=128,
+# dim_encoder=2 are 101,520 (d=2). Gaussian and k-moments stay analytic with zero learned
+# parameters — being parameter-free sufficient statistics is their purpose, not a
+# confound to correct, so their stat_dim is whatever the statistic itself implies.
+# Only the parity knob is pinned here. The bottleneck (num_encodings / dim_encoder) comes
+# from the shared CLI arch so every learned method moves together when it is changed;
+# dim_hidden is what differs per encoder family to bring their parameter counts in line.
+POOLING_ARCH = {"dim_hidden": 128}
+
+#: stat_dim every learned encoder is matched to.
+MATCHED_STAT_DIM = 16
+#: Learned encoders must land within this fraction of each other's parameter count.
+PARAM_PARITY_TOLERANCE = 0.15
+
+
+def _pretrained_methods() -> dict[str, MethodSpec]:
+    """The 12 pretrained cells: {ST, DeepSet, PointNet} x {unaligned, aligned} x
+    {frozen, finetune}. ``st_frozen`` / ``st_finetune`` keep their historical names."""
+    encoders = {
+        "st": (SetTransformerExtractor, {}),
+        "ds": (DeepSetExtractor, dict(POOLING_ARCH)),
+        "pn": (PointNetExtractor, dict(POOLING_ARCH)),
+    }
+    out: dict[str, MethodSpec] = {}
+    for kind, (cls, arch) in encoders.items():
+        for aligned, arm in ((False, ""), (True, "align_")):
+            for freeze, flavor in ((True, "frozen"), (False, "finetune")):
+                name = f"{kind}_{arm}{flavor}"
+                out[name] = MethodSpec(
+                    name, cls, {**arch, "freeze": freeze},
+                    is_pretrainable=True, encoder_kind=kind, aligned=aligned,
+                )
+    return out
+
+
 METHOD_REGISTRY: dict[str, MethodSpec] = {
+    # --- analytic baselines (no learned particle-side parameters) ---
     "gaussian": MethodSpec("gaussian", GaussianExtractor),
     "kmoments": MethodSpec("kmoments", KMomentsExtractor, {"k": 4}),
     "cgf": MethodSpec("cgf", CGFExtractor, {"num_t": 16}),
-    "deepset": MethodSpec("deepset", DeepSetExtractor, {"num_encodings": 8, "dim_encoder": 16}),
-    "pointnet": MethodSpec("pointnet", PointNetExtractor, {"num_encodings": 8, "dim_encoder": 16}),
-    "st_frozen": MethodSpec("st_frozen", SetTransformerExtractor, {"freeze": True}, is_set_transformer=True),
-    "st_finetune": MethodSpec("st_finetune", SetTransformerExtractor, {"freeze": False}, is_set_transformer=True),
-    "st_scratch": MethodSpec("st_scratch", SetTransformerExtractor, is_set_transformer=True),
+    # --- learned encoders trained from scratch with the policy ---
+    "deepset": MethodSpec("deepset", DeepSetExtractor, dict(POOLING_ARCH),
+                          is_pretrainable=True, encoder_kind="ds"),
+    "pointnet": MethodSpec("pointnet", PointNetExtractor, dict(POOLING_ARCH),
+                           is_pretrainable=True, encoder_kind="pn"),
+    "st_scratch": MethodSpec("st_scratch", SetTransformerExtractor,
+                             is_pretrainable=True, encoder_kind="st"),
+    # --- pretrained, unaligned and alignment-trained, frozen and fine-tuned ---
+    **_pretrained_methods(),
 }
+
+#: Display/plot order: analytic, scratch, then pretrained grouped by encoder.
+METHOD_ORDER: list[str] = [
+    "gaussian", "kmoments", "cgf",
+    "deepset", "pointnet", "st_scratch",
+    "ds_frozen", "ds_finetune", "ds_align_frozen", "ds_align_finetune",
+    "pn_frozen", "pn_finetune", "pn_align_frozen", "pn_align_finetune",
+    "st_frozen", "st_finetune", "st_align_frozen", "st_align_finetune",
+]
 
 
 # --- Lookups / kwargs assembly -------------------------------------------------
@@ -154,14 +214,21 @@ def build_extractor_kwargs(
     features_dim: int,
     obs_mlp_hidden_dims: list[int],
     pretrained_model_path: Optional[str] = None,
-    st_arch: Optional[dict] = None,
+    encoder_arch: Optional[dict] = None,
 ) -> dict:
-    """Merge shared + method-specific + (ST) runtime kwargs for the feature extractor."""
+    """Merge shared + method-specific + (learned-encoder) runtime kwargs.
+
+    ``encoder_arch`` is the ST-shaped arch dict; the pooling extractors accept and ignore
+    the keys they have no use for (``num_inds`` / ``num_heads`` / ``ln``), matching how
+    ``DeepSetAE`` already handles them. Method-specific kwargs are re-applied last so a
+    registry pin (e.g. the pooling ``dim_hidden``) wins over the CLI default.
+    """
     kwargs = dict(features_dim=features_dim, obs_mlp_hidden_dims=list(obs_mlp_hidden_dims))
     kwargs.update(method_spec.extractor_kwargs)
-    if method_spec.is_set_transformer:
-        if st_arch:
-            kwargs.update(st_arch)
+    if method_spec.is_pretrainable:
+        if encoder_arch:
+            kwargs.update(encoder_arch)
+            kwargs.update(method_spec.extractor_kwargs)
         if pretrained_model_path:
             kwargs["pretrained_model_path"] = pretrained_model_path
         elif method_spec.extractor_kwargs.get("freeze"):

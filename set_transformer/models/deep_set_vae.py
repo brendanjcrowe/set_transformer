@@ -40,6 +40,10 @@ class DeepSetVAE(nn.Module):
             return mu + eps * std
         return mu
 
+    def encode(self, X: torch.Tensor) -> torch.Tensor:
+        """Deterministic latent (the posterior mean), for API parity with the AEs."""
+        return self.fc_mu(self.encoder(X))
+
     def forward(self, X: torch.Tensor) -> Dict[str, torch.Tensor]:
         h = self.encoder(X)
         mu = self.fc_mu(h)

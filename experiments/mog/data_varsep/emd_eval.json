@@ -1,0 +1,19 @@
+{
+  "source": "experiments/mog/data_varsep/eval.points.npy",
+  "n_samples": 2000,
+  "metric": "debiased_sinkhorn",
+  "p": 2,
+  "blur": 0.05,
+  "dtype": "float32",
+  "shape": [
+    2000,
+    2000
+  ],
+  "offdiag_mean": 3.518607038636745,
+  "offdiag_std": 2.611733076063126,
+  "offdiag_min": 0.010546764358878136,
+  "offdiag_max": 30.591835021972656,
+  "diag_absmax": 0.0,
+  "hist_sampled_rows": 2000,
+  "wall_seconds": 38.7
+}

@@ -32,5 +32,9 @@ class DeepSetAE(nn.Module):
         )
         self.decoder = PFDecoder(dim_encoder, dim_hidden, num_particles, dim_particles)
 
+    def encode(self, X: torch.Tensor) -> torch.Tensor:
+        """Encode a particle set to its `(batch, num_encodings, dim_encoder)` code."""
+        return self.encoder(X)
+
     def forward(self, X: torch.Tensor) -> torch.Tensor:
-        return self.decoder(self.encoder(X))
+        return self.decoder(self.encode(X))

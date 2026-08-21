@@ -1,0 +1,41 @@
+{
+  "env": "ant_tag",
+  "method": "pointnet",
+  "seed": 1,
+  "algo": "PPO",
+  "gamma": 0.99,
+  "total_timesteps": 2000000,
+  "num_particles": 100,
+  "particle_filter": "AntTagParticleFilter",
+  "particle_filter_kwargs": {
+    "arena_limits": [
+      -4.5,
+      4.5
+    ],
+    "target_step": 0.5,
+    "visibility_radius": 3.0,
+    "min_initial_distance": 5.0
+  },
+  "shaped": true,
+  "vec_normalize": false,
+  "extractor_kwargs": {
+    "features_dim": 128,
+    "num_encodings": 8,
+    "dim_encoder": 16
+  },
+  "max_ep_steps": 400,
+  "success_criterion": "episode_length < max_ep_steps (target tagged before timeout)",
+  "git_commit": "5507af14c4c88b81957a819c86b930c7bec94bb4",
+  "wall_clock_sec": 6146.986934661865,
+  "timestamp": "2026-08-19_23-41-37",
+  "extractor_params_total": 146880,
+  "extractor_params_trainable": 146880,
+  "particle_stat_dim": 128,
+  "features_dim": 128,
+  "eval_return_mean": -400.0,
+  "eval_return_std": 0.0,
+  "eval_length_mean": 400.0,
+  "n_eval_episodes": 10,
+  "final_timestep": 2000000,
+  "success_rate": 0.0
+}

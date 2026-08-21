@@ -14,12 +14,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
 
+from set_transformer.latent_alignment import (
+    LambdaRamp,
+    PearsonAlignmentLoss,
+    flatten_upper_triangle,
+    latent_pairwise_distances,
+    pearson_r,
+)
 from set_transformer.loss import (
     ChamferDistanceLoss,
     EarthMoverDistanceLoss,
@@ -85,6 +92,40 @@ METHOD_COLORS: Dict[str, str] = {
 }
 
 
+def load_emd_matrix(path: Path, n: int, mmap: bool = False) -> np.ndarray:
+    """Load a precomputed pairwise-EMD matrix written by ``8_precompute_emd_matrix.py``.
+
+    Stored as a raw float32 memmap of shape (n, n) — ``n`` comes from the point split so
+    the two cannot silently disagree.
+    """
+    arr = np.memmap(path, dtype=np.float32, mode="r", shape=(n, n))
+    return arr if mmap else np.asarray(arr)
+
+
+def emd_pairs_from_matrix(matrix: np.ndarray) -> torch.Tensor:
+    """Flatten a square EMD matrix to the strict-upper-triangle pair vector."""
+    return flatten_upper_triangle(torch.from_numpy(np.array(matrix, dtype=np.float32)))
+
+
+@dataclass(frozen=True)
+class AlignConfig:
+    """Latent metric-alignment settings (see ``latent_alignment_spec.md``).
+
+    ``lam`` is held at 0 for ``warmup_epochs`` and then ramped linearly over
+    ``ramp_epochs``: alignment must not dominate before reconstruction has partially
+    converged, or the encoder can settle into a degenerate embedding that satisfies the
+    distance correlation while reconstructing nothing.
+    """
+
+    lam: float = 0.1
+    metric: str = "cosine"
+    warmup_epochs: int = 15
+    ramp_epochs: int = 15
+
+    def schedule(self) -> LambdaRamp:
+        return LambdaRamp(self.lam, self.warmup_epochs, self.ramp_epochs)
+
+
 def build_model(method: str) -> nn.Module:
     return METHOD_REGISTRY[method].builder(**ARCH)
 
@@ -93,6 +134,44 @@ def _split_output(output):
     if isinstance(output, dict):
         return output["recon"], {k: v for k, v in output.items() if k != "recon"}
     return output, {}
+
+
+def forward_with_latent(model, batch, is_vae: bool):
+    """Return ``(recon, aux, latent)`` from a single encoder pass.
+
+    For the VAEs the latent is the posterior mean (the decoder still sees the
+    reparameterised sample, exactly as in the unaligned runs).
+    """
+    if is_vae:
+        recon, aux = _split_output(model(batch))
+        return recon, aux, aux["mu"]
+    z = model.encode(batch)
+    return model.decoder(z), {}, z
+
+
+def encode_all(model, points: torch.Tensor, device: str, is_vae: bool,
+               batch_size: int = 256) -> torch.Tensor:
+    """Latent codes for every row of ``points``, flattened to ``(N, latent_dim)``."""
+    model.eval()
+    out = []
+    with torch.no_grad():
+        for s in range(0, len(points), batch_size):
+            z = model.encode(points[s:s + batch_size].to(device))
+            out.append(z.reshape(z.shape[0], -1))
+    return torch.cat(out, dim=0)
+
+
+def alignment_correlation(model, points: torch.Tensor, emd_pairs: torch.Tensor,
+                          metric: str, device: str, is_vae: bool) -> float:
+    """Pearson r between latent and EMD distances over a FIXED held-out pair set.
+
+    ``emd_pairs`` must already be the flattened strict upper triangle of the EMD matrix
+    for exactly these points, so both vectors share a pair ordering.
+    """
+    z = encode_all(model, points, device, is_vae)
+    d_latent = latent_pairwise_distances(z, metric)
+    r = pearson_r(d_latent, emd_pairs.to(d_latent.device))
+    return float("nan") if r is None else float(r)
 
 
 def evaluate(model, val_loader, chamfer, emd, device) -> Tuple[float, float]:
@@ -120,13 +199,24 @@ def train_one(
     device: str,
     num_epochs: int = NUM_EPOCHS,
     loss_type: str = "chamfer",
+    align: Optional[AlignConfig] = None,
+    emd_matrix: Optional[np.ndarray] = None,
+    val_points: Optional[torch.Tensor] = None,
+    val_emd_pairs: Optional[torch.Tensor] = None,
 ) -> Tuple[nn.Module, Dict[str, np.ndarray], float]:
     """Train one (method, seed). Returns (best_model_state, history, best_val_emd).
 
-    ``history`` holds per-epoch arrays: ``epoch``, ``train_loss``, ``val_emd``.
-    The returned state dict is the best-by-val-EMD snapshot (deep-copied to CPU).
-    ``loss_type`` selects the differentiable training objective (chamfer|sinkhorn);
-    model selection and the reported ``val_emd`` always use exact EMD regardless.
+    ``history`` holds per-epoch arrays: ``epoch``, ``train_loss``, ``train_recon``,
+    ``val_emd`` and — when aligning — ``train_align``, ``train_r``, ``val_r``,
+    ``align_lambda``. The returned state dict is the best-by-val-EMD snapshot
+    (deep-copied to CPU). ``loss_type`` selects the differentiable training objective
+    (chamfer|sinkhorn); model selection and the reported ``val_emd`` always use exact EMD.
+
+    Passing ``align`` adds the Pearson latent metric-alignment term. It requires
+    ``train_loader`` to yield ``(batch, indices)`` (wrap the dataset in ``IndexedDataset``)
+    and ``emd_matrix`` to be the precomputed pairwise EMD matrix over the *training* split,
+    indexed by those same indices. ``val_points`` / ``val_emd_pairs`` enable the held-out
+    correlation metric and are otherwise optional.
     """
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -138,32 +228,74 @@ def train_one(
     chamfer = build_train_loss(loss_type)
     emd = EarthMoverDistanceLoss()
 
-    hist = {"epoch": [], "train_loss": [], "val_emd": []}
+    align_loss = PearsonAlignmentLoss(align.metric) if align is not None else None
+    lam_at = align.schedule() if align is not None else None
+    if align is not None and emd_matrix is None:
+        raise ValueError("align requires emd_matrix (the precomputed training EMD matrix)")
+
+    keys = ["epoch", "train_loss", "train_recon", "val_emd"]
+    if align is not None:
+        keys += ["train_align", "train_r", "val_r", "align_lambda"]
+    hist: Dict[str, list] = {k: [] for k in keys}
     best_emd = float("inf")
     best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
 
     for epoch in range(num_epochs):
         model.train()
-        running, nb = 0.0, 0
-        for batch in train_loader:
+        lam = lam_at(epoch) if lam_at is not None else 0.0
+        running, running_recon, running_align, running_r, n_r, nb = 0.0, 0.0, 0.0, 0.0, 0, 0
+        for item in train_loader:
+            idx = None
+            if align is not None:
+                batch, idx = item
+                idx = idx.numpy()
+            else:
+                batch = item
             batch = batch.to(device)
             opt.zero_grad()
-            recon, aux = _split_output(model(batch))
-            loss = chamfer(recon, batch)
+
+            if align is None:
+                recon, aux = _split_output(model(batch))
+            else:
+                recon, aux, z = forward_with_latent(model, batch, spec.is_vae)
+
+            recon_loss = chamfer(recon, batch)
+            loss = recon_loss
             if "kl" in aux:
                 loss = loss + KL_WEIGHT * aux["kl"]
+
+            if align is not None:
+                target = torch.from_numpy(np.ascontiguousarray(emd_matrix[np.ix_(idx, idx)]))
+                a_loss, r = align_loss(z, target.to(device))
+                loss = loss + lam * a_loss
+                running_align += float(a_loss.detach())
+                if r is not None:
+                    running_r += float(r.detach())
+                    n_r += 1
+
             loss.backward()
             if CLIP_GRAD_NORM > 0:
                 nn.utils.clip_grad_norm_(model.parameters(), CLIP_GRAD_NORM)
             opt.step()
             running += loss.item()
+            running_recon += float(recon_loss.detach())
             nb += 1
         sched.step()
 
         _, val_emd = evaluate(model, val_loader, chamfer, emd, device)
         hist["epoch"].append(epoch)
         hist["train_loss"].append(running / nb)
+        hist["train_recon"].append(running_recon / nb)
         hist["val_emd"].append(val_emd)
+        if align is not None:
+            hist["train_align"].append(running_align / nb)
+            hist["train_r"].append(running_r / n_r if n_r else float("nan"))
+            hist["align_lambda"].append(lam)
+            hist["val_r"].append(
+                alignment_correlation(model, val_points, val_emd_pairs, align.metric,
+                                      device, spec.is_vae)
+                if val_points is not None and val_emd_pairs is not None else float("nan")
+            )
         if val_emd < best_emd:
             best_emd = val_emd
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}

@@ -232,3 +232,59 @@ def test_st_finetune_encoder_receives_grad(tmp_path):
 def test_st_freeze_without_checkpoint_rejected():
     with pytest.raises(ValueError, match="freeze"):
         SetTransformerExtractor(_obs_space(), freeze=True, features_dim=FEATURES_DIM, **ST_ARCH)
+
+
+# --- pretrained pooling encoders (2026-08-20) ---------------------------------------
+
+def _dict_space(particle_dim=2, num_particles=100, obs_dim=8):
+    import gymnasium as gym
+    return gym.spaces.Dict({
+        "obs": gym.spaces.Box(-1.0, 1.0, (obs_dim,)),
+        "particles": gym.spaces.Box(-9.0, 9.0, (num_particles, particle_dim)),
+    })
+
+
+@pytest.mark.parametrize("kind", ["ds", "pn"])
+def test_pooling_extractor_loads_and_freezes_a_pretrained_checkpoint(tmp_path, kind):
+    """Frozen means: weights come from the checkpoint, and nothing on the particle side
+    is trainable or leaves eval mode when SB3 flips train()."""
+    import torch
+    from set_transformer.models import DeepSetAE, PointNetAE
+    from set_transformer.rl.feature_extractors import DeepSetExtractor, PointNetExtractor
+
+    ae_cls, ex_cls = ({"ds": (DeepSetAE, DeepSetExtractor),
+                       "pn": (PointNetAE, PointNetExtractor)})[kind]
+    arch = dict(num_particles=100, dim_particles=2, num_encodings=8, dim_encoder=2,
+                dim_hidden=128)
+    ckpt = tmp_path / "pretrained.pt"
+    torch.save(ae_cls(**arch).state_dict(), ckpt)
+
+    space = _dict_space()
+    frozen = ex_cls(space, pretrained_model_path=str(ckpt), freeze=True,
+                    num_encodings=8, dim_encoder=2, dim_hidden=128)
+    assert all(not p.requires_grad for p in frozen.encoder.parameters())
+    assert frozen.particle_encoder_parameters() > 0
+    frozen.train(True)
+    assert not frozen.encoder.training, "frozen encoder must stay in eval mode"
+
+    finetune = ex_cls(space, pretrained_model_path=str(ckpt), freeze=False,
+                      num_encodings=8, dim_encoder=2, dim_hidden=128)
+    assert all(p.requires_grad for p in finetune.encoder.parameters())
+    # Both arms start from the same weights; only requires_grad differs.
+    for a, b in zip(frozen.encoder.parameters(), finetune.encoder.parameters()):
+        assert torch.allclose(a, b)
+
+
+def test_freeze_without_a_checkpoint_is_refused():
+    from set_transformer.rl.feature_extractors import DeepSetExtractor
+    with pytest.raises(ValueError, match="freeze"):
+        DeepSetExtractor(_dict_space(), freeze=True)
+
+
+def test_pretrained_and_scratch_pooling_extractors_have_identical_shapes():
+    import torch
+    from set_transformer.rl.feature_extractors import PointNetExtractor
+    space = _dict_space()
+    scratch = PointNetExtractor(space, num_encodings=8, dim_encoder=2, dim_hidden=128)
+    obs = {"obs": torch.randn(4, 8), "particles": torch.randn(4, 100, 2)}
+    assert scratch(obs).shape == (4, 128)

@@ -98,9 +98,12 @@ def _best_run_per_method(runs_dir: Path):
 
 
 def _recon(model, x):
+    # Follow the model's device rather than assuming CPU: callers may hand us a model
+    # already placed on the GPU for other work in the same script.
+    device = next(model.parameters()).device
     with torch.no_grad():
-        out = model(x)
-    return (out["recon"] if isinstance(out, dict) else out)
+        out = model(x.to(device))
+    return (out["recon"] if isinstance(out, dict) else out).cpu()
 
 
 def _examples_per_n(eval_pts, eval_n, n_max):
@@ -132,19 +135,32 @@ def plot_reconstruction(models, eval_pts, eval_n, out_path: Path, n_max=10):
 def render_reconstruction_grid(models, examples, out_path: Path, title: str):
     """Grid: rows = the n values in ``examples`` (dict {n: (num_particles,2)}),
     cols = Input + one per method's loaded best model."""
+    columns = [("Input", None)] + [
+        (METHOD_REGISTRY[m].label, models[m][0]) for m in METHOD_ORDER if m in models
+    ]
+    render_model_grid(columns, examples, out_path, title)
+
+
+def render_model_grid(columns, examples, out_path: Path, title: str,
+                      row_label=lambda k: f"n={k}"):
+    """Generic point-set grid.
+
+    Args:
+        columns: list of ``(label, model_or_None)``. ``None`` plots the raw input, any
+            model plots its reconstruction of that input. Arbitrary column sets (e.g.
+            the same method aligned vs. unaligned) are the reason this is separate from
+            ``render_reconstruction_grid``.
+        examples: ``{row_key: (num_particles, 2)}``.
+    """
     rows = sorted(examples)
-    method_labels = [METHOD_REGISTRY[m].label for m in METHOD_ORDER if m in models]
-    active = [m for m in METHOD_ORDER if m in models]
-    columns = ["Input"] + method_labels
 
     # Reconstruct every cell first so the bounding box covers inputs + recons.
-    recons = {m: {} for m in active}
-    for n, pts in examples.items():
-        x = torch.from_numpy(pts).unsqueeze(0)
-        for m in active:
-            recons[m][n] = _recon(models[m][0], x)[0].numpy()
-    all_arrays = list(examples.values()) + [recons[m][n] for m in active for n in rows]
-    xlim, ylim = _square_bbox(all_arrays)
+    cells = {}
+    for k, pts in examples.items():
+        x = torch.from_numpy(np.asarray(pts, dtype=np.float32)).unsqueeze(0)
+        for label, model in columns:
+            cells[(label, k)] = pts if model is None else _recon(model, x)[0].numpy()
+    xlim, ylim = _square_bbox(list(cells.values()))
 
     fig, axes = plt.subplots(
         len(rows), len(columns),
@@ -153,21 +169,23 @@ def render_reconstruction_grid(models, examples, out_path: Path, title: str):
         gridspec_kw={"hspace": 0.05, "wspace": 0.05},
     )
     axes = np.atleast_2d(axes)
-    for r, n in enumerate(rows):
-        cells = [examples[n]] + [recons[m][n] for m in active]
-        for c, pts in enumerate(cells):
+    for r, k in enumerate(rows):
+        for c, (label, _) in enumerate(columns):
             ax = axes[r, c]
+            pts = cells[(label, k)]
             ax.scatter(pts[:, 0], pts[:, 1], s=6, alpha=0.7)
             ax.set_aspect("equal", adjustable="box")
             ax.set_xlim(xlim)
             ax.set_ylim(ylim)
             ax.tick_params(labelsize=6)
             if r == 0:
-                ax.set_title(columns[c], fontsize=11, pad=4)
+                ax.set_title(label, fontsize=11, pad=4)
             if c == 0:
-                ax.set_ylabel(f"n={n}", fontsize=10)
-    fig.suptitle(title, fontsize=13)
-    fig.subplots_adjust(top=0.95, bottom=0.04, left=0.06, right=0.99)
+                ax.set_ylabel(row_label(k), fontsize=10)
+    # Two-line column headers need extra headroom or they collide with the suptitle.
+    two_line = any("\n" in label for label, _ in columns)
+    fig.suptitle(title, fontsize=13, y=1.02 if two_line else 0.995)
+    fig.subplots_adjust(top=0.90 if two_line else 0.95, bottom=0.04, left=0.06, right=0.99)
     _save(fig, out_path)
 
 

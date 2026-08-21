@@ -129,9 +129,16 @@ def encoder_cost(features_extractor) -> dict:
             stat_dim = int(features_extractor._particle_stat_dim())
         except Exception:
             stat_dim = None
+    # Encoder-only count is the one the capacity-fairness claim rests on: the pretrained
+    # autoencoders keep an unused decoder attached so checkpoints round-trip, and it would
+    # otherwise inflate the comparison.
+    encoder_params = None
+    if hasattr(features_extractor, "particle_encoder_parameters"):
+        encoder_params = int(features_extractor.particle_encoder_parameters())
     return {
         "extractor_params_total": int(total),
         "extractor_params_trainable": int(trainable),
+        "extractor_params_encoder": encoder_params,
         "particle_stat_dim": stat_dim,
         "features_dim": int(features_extractor.features_dim),
     }
@@ -170,12 +177,15 @@ def main():
     p.add_argument("--batch_size", type=int, default=64)
     p.add_argument("--features_dim", type=int, default=128)
     p.add_argument("--obs_mlp_hidden_dims", type=int, nargs="+", default=[64, 64])
-    # ST-only:
+    # Learned set encoders (ST / DeepSet / PointNet). Defaults are the capacity-matched
+    # configuration: stat_dim = num_encodings * dim_encoder = 16 for every learned method,
+    # and dim_hidden=64 puts the ST encoder (111k params) within 15% of the pooling
+    # encoders (101k), which pin dim_hidden=128 in the registry.
     p.add_argument("--pretrained_model_path", default=None)
     p.add_argument("--num_encodings", type=int, default=8)
     p.add_argument("--dim_encoder", type=int, default=2)
     p.add_argument("--num_inds", type=int, default=32)
-    p.add_argument("--dim_hidden", type=int, default=128)
+    p.add_argument("--dim_hidden", type=int, default=64)
     p.add_argument("--num_heads", type=int, default=4)
     p.add_argument("--no_ln", action="store_true")
     # infra:
@@ -191,14 +201,14 @@ def main():
     algo_name = args.algo or env_spec.default_algo
     total_timesteps = args.total_timesteps or env_spec.default_timesteps
 
-    st_arch = dict(
+    encoder_arch = dict(
         num_encodings=args.num_encodings, dim_encoder=args.dim_encoder,
         num_inds=args.num_inds, dim_hidden=args.dim_hidden,
         num_heads=args.num_heads, ln=not args.no_ln,
     )
     extractor_kwargs = build_extractor_kwargs(
         method_spec, args.features_dim, args.obs_mlp_hidden_dims,
-        pretrained_model_path=args.pretrained_model_path, st_arch=st_arch,
+        pretrained_model_path=args.pretrained_model_path, encoder_arch=encoder_arch,
     )
 
     run_dir = Path(args.results_dir) / args.env / args.method / f"seed{args.seed}"

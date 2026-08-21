@@ -46,6 +46,17 @@ class PFSetTransformer(nn.Module):
         )
         self.decoder = PFDecoder(dim_encoder, dim_hidden, num_particles, dim_particles)
 
+    def encode(self, X: torch.Tensor) -> torch.Tensor:
+        """Encode a particle set to its bottleneck code.
+
+        Args:
+            X (torch.Tensor): Input tensor of shape (batch_size, set_size, dim_particles)
+
+        Returns:
+            torch.Tensor: Latent of shape (batch_size, num_encodings, dim_encoder)
+        """
+        return self.set_transformer(X)
+
     def forward(self, X: torch.Tensor) -> torch.Tensor:
         """Forward pass of the PFSetTransformer.
 
@@ -55,4 +66,4 @@ class PFSetTransformer(nn.Module):
         Returns:
             torch.Tensor: Output tensor of shape (batch_size, num_particles, dim_particles)
         """
-        return self.decoder(self.set_transformer(X))
+        return self.decoder(self.encode(X))

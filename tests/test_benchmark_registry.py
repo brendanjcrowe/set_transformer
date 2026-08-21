@@ -46,21 +46,36 @@ def test_st_frozen_requires_path():
         build_extractor_kwargs(get_method_spec("st_frozen"), 128, [64, 64])
 
 
-def test_st_arch_and_path_injected_for_st_only():
-    st_arch = dict(num_encodings=4, dim_encoder=2, num_inds=8, dim_hidden=32, num_heads=2, ln=True)
-    kw = build_extractor_kwargs(
-        get_method_spec("st_finetune"), 128, [64, 64],
-        pretrained_model_path="/tmp/x.pt", st_arch=st_arch,
-    )
-    assert kw["pretrained_model_path"] == "/tmp/x.pt"
-    assert kw["num_encodings"] == 4
-    # Non-ST methods ignore ST arch / path.
+def test_encoder_arch_and_path_injected_for_learned_encoders_only():
+    encoder_arch = dict(num_encodings=4, dim_encoder=2, num_inds=8, dim_hidden=32,
+                        num_heads=2, ln=True)
+    for method in ("st_finetune", "ds_finetune", "pn_finetune"):
+        kw = build_extractor_kwargs(
+            get_method_spec(method), 128, [64, 64],
+            pretrained_model_path="/tmp/x.pt", encoder_arch=encoder_arch,
+        )
+        assert kw["pretrained_model_path"] == "/tmp/x.pt"
+        assert kw["num_encodings"] == 4
+    # Analytic baselines ignore the encoder arch and the checkpoint path entirely.
     kw2 = build_extractor_kwargs(
         get_method_spec("gaussian"), 128, [64, 64],
-        pretrained_model_path="/tmp/x.pt", st_arch=st_arch,
+        pretrained_model_path="/tmp/x.pt", encoder_arch=encoder_arch,
     )
     assert "pretrained_model_path" not in kw2
     assert "num_encodings" not in kw2
+
+
+def test_registry_pins_win_over_cli_encoder_arch():
+    # The pooling encoders pin dim_hidden=128 to hit parameter parity with the ST at
+    # dim_hidden=64; a CLI-supplied arch must not silently override that. The bottleneck
+    # is deliberately NOT pinned, so --dim_encoder moves every learned method together.
+    kw = build_extractor_kwargs(
+        get_method_spec("deepset"), 128, [64, 64],
+        encoder_arch=dict(num_encodings=8, dim_encoder=2, num_inds=32, dim_hidden=64,
+                          num_heads=4, ln=True),
+    )
+    assert kw["dim_hidden"] == 128
+    assert kw["dim_encoder"] == 2  # bottleneck still follows the shared arch
 
 
 def test_shaping_policy_per_env():
@@ -100,3 +115,56 @@ def test_shaping_wrapper_reports_true_reward_when_applied():
     wrapped.reset()
     _, shaped, _, _, info = wrapped.step(wrapped.action_space.sample())
     assert info["true_reward"] == pytest.approx(shaped)  # zero potential => no change
+
+
+# --- capacity fairness (2026-08-20) -------------------------------------------------
+
+def _build_extractor(method: str, particle_dim: int = 2):
+    """Instantiate a method's extractor without a checkpoint (drops `freeze`, which
+    legitimately refuses to build on random weights)."""
+    import gymnasium as gym
+    from set_transformer.rl.benchmark.registry import METHOD_REGISTRY
+
+    spec = METHOD_REGISTRY[method]
+    space = gym.spaces.Dict({
+        "obs": gym.spaces.Box(-1.0, 1.0, (8,)),
+        "particles": gym.spaces.Box(-9.0, 9.0, (100, particle_dim)),
+    })
+    kwargs = dict(features_dim=128, obs_mlp_hidden_dims=[64, 64])
+    kwargs.update(spec.extractor_kwargs)
+    if spec.is_pretrainable:
+        kwargs.update(num_encodings=8, dim_encoder=2, num_inds=32, dim_hidden=64,
+                      num_heads=4, ln=True)
+        kwargs.update(spec.extractor_kwargs)
+        kwargs.pop("freeze", None)
+    return spec.extractor_class(space, **kwargs)
+
+
+def test_every_learned_encoder_shares_the_matched_bottleneck():
+    from set_transformer.rl.benchmark.registry import (
+        MATCHED_STAT_DIM, METHOD_ORDER, METHOD_REGISTRY,
+    )
+    learned = [m for m in METHOD_ORDER if METHOD_REGISTRY[m].is_pretrainable]
+    for method in learned:
+        stat = _build_extractor(method)._particle_stat_dim()
+        assert stat == MATCHED_STAT_DIM, f"{method} has stat_dim {stat}"
+
+
+def test_learned_encoder_parameter_counts_are_within_tolerance():
+    # The paper's fairness claim: no learned encoder has a large capacity advantage. The
+    # analytic baselines are excluded by design -- being parameter-free is their point.
+    from set_transformer.rl.benchmark.registry import (
+        METHOD_ORDER, METHOD_REGISTRY, PARAM_PARITY_TOLERANCE,
+    )
+    counts = {
+        m: _build_extractor(m).particle_encoder_parameters()
+        for m in METHOD_ORDER if METHOD_REGISTRY[m].is_pretrainable
+    }
+    lo, hi = min(counts.values()), max(counts.values())
+    assert lo > 0
+    assert (hi - lo) / lo <= PARAM_PARITY_TOLERANCE, counts
+
+
+def test_analytic_baselines_have_no_particle_side_encoder():
+    for method in ("gaussian", "kmoments"):
+        assert _build_extractor(method).particle_encoder_parameters() == 0

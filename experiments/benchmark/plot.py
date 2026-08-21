@@ -45,23 +45,45 @@ from set_transformer.rl.benchmark.results import (
 
 #: Fixed method -> color so figures are consistent across the paper. Learned encoders
 #: (ours) get the warm colors; statistical baselines the cool ones.
+# One color per method, stable across every figure. Families:
+#   blue/cyan  analytic (gaussian, kmoments)      purple  CGF
+#   green      DeepSet (mean-pool)                olive   PointNet (max-pool)
+#   red/orange Set Transformer
+# Within a family, the alignment-trained arms are the lighter shades, so an aligned/
+# unaligned pair reads as a pair.
 METHOD_COLORS = {
-    "st_frozen": "tab:red",
-    "st_finetune": "tab:orange",
-    "st_scratch": "tab:brown",
-    "cgf": "tab:purple",
-    # Learned fixed-pool baselines (mean / max) — green family, between stats and ST.
-    "deepset": "tab:green",
-    "pointnet": "tab:olive",
     "gaussian": "tab:blue",
     "kmoments": "tab:cyan",
+    "cgf": "tab:purple",
+    # from-scratch learned encoders
+    "deepset": "tab:green",
+    "pointnet": "tab:olive",
+    "st_scratch": "tab:brown",
+    # pretrained DeepSet
+    "ds_frozen": "#1b7837", "ds_finetune": "#5aae61",
+    "ds_align_frozen": "#a6dba0", "ds_align_finetune": "#d9f0d3",
+    # pretrained PointNet
+    "pn_frozen": "#7f6000", "pn_finetune": "#bf9000",
+    "pn_align_frozen": "#d6b656", "pn_align_finetune": "#ead9a0",
+    # pretrained Set Transformer
+    "st_frozen": "tab:red", "st_finetune": "tab:orange",
+    "st_align_frozen": "#fb9a99", "st_align_finetune": "#fdd0a2",
 }
 #: Preferred left-to-right / legend order; unknown methods are appended alphabetically.
 #: analytic stats -> CGF -> learned fixed-pool (deepset/pointnet) -> Set Transformers.
-METHOD_ORDER = [
-    "gaussian", "kmoments", "cgf", "deepset", "pointnet",
-    "st_scratch", "st_finetune", "st_frozen",
-]
+# Import the canonical order from the registry so the plot table cannot drift from the
+# methods that actually exist. Falls back to a literal list on a plotting-only machine,
+# where the registry's gym/SB3 imports are unavailable by design.
+try:
+    from set_transformer.rl.benchmark.registry import METHOD_ORDER
+except Exception:  # pragma: no cover - plotting-only environment
+    METHOD_ORDER = [
+        "gaussian", "kmoments", "cgf",
+        "deepset", "pointnet", "st_scratch",
+        "ds_frozen", "ds_finetune", "ds_align_frozen", "ds_align_finetune",
+        "pn_frozen", "pn_finetune", "pn_align_frozen", "pn_align_finetune",
+        "st_frozen", "st_finetune", "st_align_frozen", "st_align_finetune",
+    ]
 
 
 def order_methods(methods) -> list[str]:
