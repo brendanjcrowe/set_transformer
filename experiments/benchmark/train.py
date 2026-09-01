@@ -20,6 +20,7 @@ into the run dir, from which curves, success rate, and the summary table are bui
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import subprocess
 import sys
@@ -84,11 +85,15 @@ def make_env_thunk(env_spec, seed: int, for_eval: bool, pf_kwargs_record: dict |
             num_particles=env_spec.num_particles,
             pf_interaction_mapper=env_spec.pf_mapper,
             obs_mask_indices=env_spec.obs_mask_indices,
+            particle_origin_fn=env_spec.particle_origin_fn,
         )
         # Shaping only during training; eval sees the true (unshaped) reward.
         if not for_eval and env_spec.potential_fn is not None:
             env = PotentialBasedShapingWrapper(
-                env, env_spec.potential_fn, gamma=env_spec.gamma
+                env, env_spec.potential_fn,
+                gamma=(env_spec.shaping_gamma if env_spec.shaping_gamma is not None
+                       else env_spec.gamma),
+                zero_at_termination=env_spec.shaping_zero_at_termination,
             )
         return Monitor(env)
 
@@ -120,6 +125,26 @@ def build_model(algo_name, vec_env, extractor_class, extractor_kwargs, args, gam
     raise ValueError(f"Unknown algo {algo_name}")
 
 
+def find_features_extractor(policy):
+    """The policy's particle-set feature extractor, across algorithms.
+
+    PPO's ``ActorCriticPolicy`` exposes ``features_extractor`` directly, but SAC builds
+    separate actor and critic extractors and leaves the top-level attribute ``None`` --
+    so reading it unconditionally crashes every SAC run at the point the run record is
+    written, i.e. after the training has already been paid for.
+    """
+    fe = getattr(policy, "features_extractor", None)
+    if fe is not None:
+        return fe
+    for attr in ("actor", "critic"):
+        sub = getattr(policy, attr, None)
+        fe = getattr(sub, "features_extractor", None)
+        if fe is not None:
+            return fe
+    raise AttributeError(
+        f"No features_extractor found on {type(policy).__name__} or its actor/critic.")
+
+
 def encoder_cost(features_extractor) -> dict:
     total = sum(p.numel() for p in features_extractor.parameters())
     trainable = sum(p.numel() for p in features_extractor.parameters() if p.requires_grad)
@@ -135,12 +160,22 @@ def encoder_cost(features_extractor) -> dict:
     encoder_params = None
     if hasattr(features_extractor, "particle_encoder_parameters"):
         encoder_params = int(features_extractor.particle_encoder_parameters())
+    # Record the *resolved* config, not just the CLI overrides: most extractor knobs now
+    # default in the class, so meta.json would otherwise not say what was actually run
+    # (and the plot legends read their hyperparameters from here).
+    resolved = {
+        k: getattr(features_extractor, k)
+        for k in ("num_t", "stat_dim", "t_init_mode", "t_clamp", "t_frozen",
+                  "particle_scale", "num_encodings", "dim_encoder", "dim_hidden", "k")
+        if hasattr(features_extractor, k)
+    }
     return {
         "extractor_params_total": int(total),
         "extractor_params_trainable": int(trainable),
         "extractor_params_encoder": encoder_params,
         "particle_stat_dim": stat_dim,
         "features_dim": int(features_extractor.features_dim),
+        "extractor_config": resolved,
     }
 
 
@@ -182,6 +217,10 @@ def main():
     # and dim_hidden=64 puts the ST encoder (111k params) within 15% of the pooling
     # encoders (101k), which pin dim_hidden=128 in the registry.
     p.add_argument("--pretrained_model_path", default=None)
+    p.add_argument("--init_policy", default=None,
+                   help="SB3 zip whose POLICY weights initialize this run (e.g. a "
+                        "behaviour-cloned locomotion warm-start). Distinct from "
+                        "--pretrained_model_path, which loads only the particle encoder.")
     p.add_argument("--num_encodings", type=int, default=8)
     p.add_argument("--dim_encoder", type=int, default=2)
     p.add_argument("--num_inds", type=int, default=32)
@@ -193,10 +232,17 @@ def main():
     p.add_argument("--eval_freq", type=int, default=20000, help="env steps between evals")
     p.add_argument("--n_eval_episodes", type=int, default=10)
     p.add_argument("--vec_normalize", action="store_true", help="normalize obs (opt-in)")
+    p.add_argument("--no_shaping", action="store_true",
+                   help="disable this env's potential-based shaping. On a hidden-state "
+                        "env the true-state potential is not predictable from the agent's "
+                        "observation, so it can act as advantage noise rather than "
+                        "guidance -- Ng et al.'s guarantee is an MDP result.")
     p.add_argument("--device", default="auto")
     args = p.parse_args()
 
     env_spec = get_env_spec(args.env)
+    if args.no_shaping:
+        env_spec = dataclasses.replace(env_spec, potential_fn=None)
     method_spec = get_method_spec(args.method)
     algo_name = args.algo or env_spec.default_algo
     total_timesteps = args.total_timesteps or env_spec.default_timesteps
@@ -209,6 +255,7 @@ def main():
     extractor_kwargs = build_extractor_kwargs(
         method_spec, args.features_dim, args.obs_mlp_hidden_dims,
         pretrained_model_path=args.pretrained_model_path, encoder_arch=encoder_arch,
+        particle_scale=env_spec.particle_scale,
     )
 
     run_dir = Path(args.results_dir) / args.env / args.method / f"seed{args.seed}"
@@ -246,9 +293,16 @@ def main():
         [eval_cb, CGFTNormCallback(run_dir, log_freq=args.eval_freq, verbose=1)]
     )
 
-    cost = encoder_cost(model.policy.features_extractor)
+    cost = encoder_cost(find_features_extractor(model.policy))
     print(f"[benchmark] env={args.env} method={args.method} algo={algo_name} "
           f"seed={args.seed} steps={total_timesteps} | encoder {cost}")
+
+    if args.init_policy:
+        # Warm-start the whole policy (extractor + MLP + heads) from a compatible run.
+        # Strict load: a silent shape mismatch here would look like a normal-but-bad run.
+        donor = ALGOS[algo_name].load(args.init_policy, device=args.device)
+        model.policy.load_state_dict(donor.policy.state_dict())
+        print(f"[benchmark] initialized policy from {args.init_policy}")
 
     start = time.time()
     model.learn(total_timesteps=total_timesteps, callback=callbacks, progress_bar=False)
@@ -266,6 +320,7 @@ def main():
         "gamma": env_spec.gamma,
         "total_timesteps": total_timesteps,
         "num_particles": env_spec.num_particles,
+        "init_policy": args.init_policy,
         "particle_filter": env_spec.particle_filter_class.__name__,
         "particle_filter_kwargs": {
             k: list(v) if isinstance(v, tuple) else v for k, v in pf_kwargs_record.items()

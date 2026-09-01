@@ -90,7 +90,7 @@ def knn_overlap(d_latent_sq: torch.Tensor, d_emd_sq: torch.Tensor, k: int) -> fl
 
 def score_run(model, points: torch.Tensor, emd_sq: torch.Tensor, emd_pairs: torch.Tensor,
               metric: str, device: str, is_vae: bool, k: int):
-    z = encode_all(model, points, device, is_vae)
+    z = encode_all(model, points, device)
     d_latent_sq = _full_latent_matrix(z, metric)
     d_latent = latent_pairwise_distances(z, metric)
     r = pearson_r(d_latent, emd_pairs.to(d_latent.device))

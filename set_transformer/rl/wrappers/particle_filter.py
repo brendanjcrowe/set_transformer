@@ -55,6 +55,7 @@ class PFDictObservationWrapper(gym.Wrapper):
                  # It should return a dict like {"predict": {kwargs for pf.predict}, "update": {kwargs for pf.update}}
                  pf_interaction_mapper: callable = None,
                  obs_mask_indices: list[int] | None = None,
+                 particle_origin_fn: callable = None,
                 ):
         super().__init__(env)
         self.particle_filter_class = particle_filter_class
@@ -62,6 +63,18 @@ class PFDictObservationWrapper(gym.Wrapper):
         self.num_particles = num_particles
         self.particle_filter: BaseParticleFilter | None = None
         self.obs_mask_indices = obs_mask_indices
+        # Optional base-obs -> origin hook. When set, the particle set handed to the
+        # policy is expressed RELATIVE to that origin (normally the agent's own
+        # position). The filter itself keeps working in world coordinates -- only the
+        # view the encoder sees is re-centred.
+        #
+        # This matters when the optimal policy is "move toward somewhere the belief
+        # points at". In world coordinates the encoder produces a permutation-invariant
+        # summary of absolute positions while the agent's own position arrives through a
+        # separate MLP, so the network has to *learn* to subtract one from the other
+        # before any relational quantity (which mode is nearest? in what direction?) is
+        # available. Re-centring makes that geometry immediate for every method equally.
+        self.particle_origin_fn = particle_origin_fn
         self._last_base_env_obs_float: np.ndarray | None = None
         
         # This mapper is crucial and env-specific. It defines how to get args for pf methods from env data.
@@ -152,6 +165,9 @@ class PFDictObservationWrapper(gym.Wrapper):
 
     def _get_dict_obs(self, base_env_obs: np.ndarray) -> dict:
         particles_state = self.particle_filter.particles.astype(np.float32)
+        if self.particle_origin_fn is not None:
+            origin = np.asarray(self.particle_origin_fn(base_env_obs), dtype=np.float32)
+            particles_state = particles_state - origin[None, :]
         # If particles also include weights as the last dim, make sure ST network expects that.
         # The BaseParticleFilter defines particle_dim, which should be used by the ST network.
         agent_obs = base_env_obs
@@ -181,6 +197,7 @@ class PFPlusFeaturesObservationWrapper(gym.Wrapper):
                  num_particles: int,
                  pf_interaction_mapper: callable = None,
                  obs_mask_indices: list[int] | None = None,
+                 particle_origin_fn: callable = None,
                 ):
         super().__init__(env)
         self.particle_filter_class = particle_filter_class
@@ -190,6 +207,18 @@ class PFPlusFeaturesObservationWrapper(gym.Wrapper):
         self.particle_filter: BaseParticleFilter | None = None
         self.pf_interaction_mapper = pf_interaction_mapper
         self.obs_mask_indices = obs_mask_indices
+        # Optional base-obs -> origin hook. When set, the particle set handed to the
+        # policy is expressed RELATIVE to that origin (normally the agent's own
+        # position). The filter itself keeps working in world coordinates -- only the
+        # view the encoder sees is re-centred.
+        #
+        # This matters when the optimal policy is "move toward somewhere the belief
+        # points at". In world coordinates the encoder produces a permutation-invariant
+        # summary of absolute positions while the agent's own position arrives through a
+        # separate MLP, so the network has to *learn* to subtract one from the other
+        # before any relational quantity (which mode is nearest? in what direction?) is
+        # available. Re-centring makes that geometry immediate for every method equally.
+        self.particle_origin_fn = particle_origin_fn
         self._last_base_env_obs_float: np.ndarray | None = None
         if self.pf_interaction_mapper is None:
             print("Warning: pf_interaction_mapper is not provided. PF predict/update calls will only receive action/obs_from_env directly.")

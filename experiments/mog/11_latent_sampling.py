@@ -146,7 +146,7 @@ def decode(model, z_flat: torch.Tensor) -> np.ndarray:
 
 def analyse_model(model, points, device, is_vae, metric, sim_scale, pool_size,
                   bounds_percentile, seed):
-    z = encode_all(model, points, device, is_vae).cpu().double()
+    z = encode_all(model, points, device).cpu().double()
     low, high = latent_bounds(z, bounds_percentile)
     g = torch.Generator().manual_seed(seed)
     pool = sample_uniform_box(low, high, pool_size, g)

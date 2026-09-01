@@ -11,6 +11,7 @@ pytest.importorskip("stable_baselines3")
 
 import numpy as np
 import torch
+import torch
 
 from set_transformer.models import PFSetTransformer
 from set_transformer.rl.feature_extractors import (
@@ -123,14 +124,26 @@ def test_cgf_learned_points_receive_grad():
 
 
 def test_cgf_t_value_norms():
-    """The diagnostic returns one L2 norm per learned sample point, matching ||t_m||."""
+    """One L2 norm per sample point, reported POST-clamp.
+
+    The forward pass evaluates the CGF at the clamped t, so the raw parameter norms
+    would overstate where on the moment<->support-function continuum the encoder is
+    actually operating. Note the clamp is elementwise, so it bites direction-dependently:
+    at t_clamp=2.0 an axis-aligned point caps at 2.0 while a diagonal one reaches 2*sqrt(2).
+    """
     space = _obs_space()
     ext = CGFExtractor(space, num_t=16, features_dim=FEATURES_DIM)
     norms = ext.t_value_norms()
     assert norms.shape == (16,)
-    expected = torch.linalg.norm(ext.t_values.detach(), dim=1)
-    assert torch.allclose(norms, expected)
+    clamped = torch.clamp(ext.t_values.detach(), -ext.t_clamp, ext.t_clamp)
+    assert torch.allclose(norms, torch.linalg.norm(clamped, dim=1))
     assert (norms >= 0).all()
+    assert norms.max() <= ext.t_clamp * (ext.particle_dim ** 0.5) + 1e-6
+
+    # Without a clamp the diagnostic is exactly the raw parameter norms.
+    unclamped = CGFExtractor(space, num_t=16, t_clamp=None, features_dim=FEATURES_DIM)
+    assert torch.allclose(unclamped.t_value_norms(),
+                          torch.linalg.norm(unclamped.t_values.detach(), dim=1))
 
 
 # --- Pooling extractors (DeepSet / PointNet) -----------------------------------
@@ -288,3 +301,131 @@ def test_pretrained_and_scratch_pooling_extractors_have_identical_shapes():
     scratch = PointNetExtractor(space, num_encodings=8, dim_encoder=2, dim_hidden=128)
     obs = {"obs": torch.randn(4, 8), "particles": torch.randn(4, 100, 2)}
     assert scratch(obs).shape == (4, 128)
+
+
+# --- CGF: collaborator's implementation, matched bottleneck (2026-08-24) -------------
+
+def _cgf(**kw):
+    from set_transformer.rl.feature_extractors import CGFExtractor
+    return CGFExtractor(_dict_space(particle_dim=kw.pop("particle_dim", 2)), **kw)
+
+
+def test_cgf_decouples_sampling_resolution_from_the_bottleneck():
+    """num_t sets how finely the CGF curve is sampled; stat_dim is what the policy sees.
+    Keeping them independent is what lets CGF use the collaborator's 64-point sampling
+    while still matching every other method's 16-wide bottleneck."""
+    import torch
+    for num_t in (16, 64, 128):
+        e = _cgf(num_t=num_t, stat_dim=16)
+        assert e._particle_stat_dim() == 16
+        assert e.t_values.shape == (num_t, 2)
+        out = e({"obs": torch.randn(3, 8), "particles": torch.randn(3, 100, 2)})
+        assert out.shape == (3, 128)
+
+
+def test_cgf_weighted_matches_unweighted_under_uniform_weights():
+    """The equivalence that keeps already-finished runs valid: on an env whose filter
+    always resamples to uniform weights (car_flag), exposing weights changes nothing."""
+    import torch
+    torch.manual_seed(0)
+    e = _cgf().eval()
+    obs = {"obs": torch.randn(4, 8), "particles": torch.randn(4, 100, 2)}
+    unweighted = e(obs)
+    weighted = e({**obs, "weights": torch.full((4, 100), 1 / 100)})
+    assert torch.allclose(unweighted, weighted, atol=1e-5)
+
+
+def test_cgf_weights_actually_change_the_statistic():
+    import torch
+    torch.manual_seed(0)
+    e = _cgf().eval()
+    obs = {"obs": torch.randn(2, 8), "particles": torch.randn(2, 100, 2)}
+    skewed = torch.zeros(2, 100)
+    skewed[:, :5] = 0.2  # all mass on five particles
+    assert not torch.allclose(e(obs), e({**obs, "weights": skewed}), atol=1e-3)
+
+
+@pytest.mark.parametrize("weights", [None, "uniform", "skewed"])
+def test_cgf_is_permutation_invariant(weights):
+    import torch
+    torch.manual_seed(0)
+    e = _cgf().eval()
+    obs = {"obs": torch.randn(2, 8), "particles": torch.randn(2, 100, 2)}
+    if weights == "uniform":
+        obs["weights"] = torch.full((2, 100), 1 / 100)
+    elif weights == "skewed":
+        obs["weights"] = torch.rand(2, 100)
+    perm = torch.randperm(100)
+    shuffled = {k: (v[:, perm] if k in ("particles", "weights") else v)
+                for k, v in obs.items()}
+    assert torch.allclose(e(obs), e(shuffled), atol=1e-5)
+
+
+def test_cgf_t_clamp_bounds_the_sampling_points():
+    import torch
+    e = _cgf(t_clamp=0.5, t_init_mode="random", t_init_scale=5.0)
+    assert e.t_value_norms().max() <= 0.5 * (2 ** 0.5) + 1e-6
+
+
+def test_cgf_frozen_t_is_not_trainable_but_still_saves():
+    import torch
+    frozen = _cgf(t_frozen=True)
+    assert "t_values" in frozen.state_dict()          # buffer still round-trips
+    assert not any(p is frozen.t_values for p in frozen.parameters())
+    learned = _cgf(t_frozen=False)
+    assert any(p is learned.t_values for p in learned.parameters())
+
+
+@pytest.mark.parametrize("mode", ["spread", "linspace_all_dims", "linspace_first_dim",
+                                  "random"])
+@pytest.mark.parametrize("particle_dim", [1, 2])
+def test_cgf_t_init_modes_produce_usable_points(mode, particle_dim):
+    import torch
+    e = _cgf(num_t=64, t_init_mode=mode, particle_dim=particle_dim)
+    assert e.t_values.shape == (64, particle_dim)
+    assert torch.isfinite(e.t_values).all()
+    out = e({"obs": torch.randn(2, 8), "particles": torch.randn(2, 100, particle_dim)})
+    assert torch.isfinite(out).all()
+
+
+def test_cgf_spread_init_covers_directions_and_magnitudes():
+    """'spread' exists so t starts where the signal is, instead of needing ||t|| to grow
+    ~10x from a small init before the encoder sees anything."""
+    e = _cgf(num_t=64, t_init_mode="spread")
+    norms = e.t_value_norms()
+    assert norms.min() < 0.3 and norms.max() > 2.0   # log-spaced magnitudes
+    angles = torch.atan2(e.t_values[:, 1], e.t_values[:, 0])
+    assert len(torch.unique(torch.round(angles * 100))) >= 8  # 8 distinct directions
+
+
+def test_cgf_rejects_bad_configuration():
+    with pytest.raises(ValueError, match="num_t"):
+        _cgf(num_t=0)
+    with pytest.raises(ValueError, match="particle_scale"):
+        _cgf(particle_scale=0.0)
+    with pytest.raises(ValueError, match="Unknown t_init_mode"):
+        _cgf(t_init_mode="nope")
+    with pytest.raises(ValueError, match="divisible"):
+        _cgf(num_t=12, t_init_mode="spread")
+
+
+def test_cgf_particle_scale_changes_the_statistic():
+    """exp(t.x) is scale-sensitive, so the same t-range means different things on
+    different arenas -- hence the per-env scale rather than a hardcoded constant."""
+    import torch
+    torch.manual_seed(0)
+    obs = {"obs": torch.randn(2, 8), "particles": 4.0 * torch.randn(2, 100, 2)}
+    a, b = _cgf(particle_scale=1.0).eval(), _cgf(particle_scale=4.5).eval()
+    b.load_state_dict(a.state_dict())
+    assert not torch.allclose(a(obs), b(obs), atol=1e-3)
+
+
+def test_cgf_survives_extreme_particles():
+    """exp_arg_clamp is the overflow guard; a diverged filter must not produce NaNs that
+    silently poison the policy."""
+    import torch
+    e = _cgf().eval()
+    obs = {"obs": torch.randn(2, 8), "particles": torch.full((2, 100, 2), 1e6)}
+    assert torch.isfinite(e(obs)).all()
+    obs["particles"][0, 0] = float("nan")
+    assert torch.isfinite(e(obs)).all()

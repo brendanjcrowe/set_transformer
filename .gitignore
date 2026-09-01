@@ -171,6 +171,12 @@ trajectory_renders/
 # the provenance record for whichever matrix a run was aligned against.
 experiments/*/data*/emd_*.npy
 experiments/*/data*/emd_*.progress.json
+experiments/benchmark/pretrain/data/**/*.npy
+experiments/benchmark/pretrain/data/**/emd_*.progress.json
+# Pretrained encoder weights are large and regenerable from the committed pipeline; the
+# meta.json (arch, alignment settings, val EMD / val_r) is the provenance record.
+experiments/benchmark/pretrained/**/*.pt
+experiments/benchmark/pretrained/**/history.npz
 
 # ST experiment run artifacts (source lives in experiments/*/*.py,
 # outputs land in sibling data/, figures/, runs/ dirs).

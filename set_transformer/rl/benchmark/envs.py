@@ -15,15 +15,70 @@ import numpy as np
 
 # --- Ant-Tag -------------------------------------------------------------------
 
-def make_ant_tag_base_env(seed: int = 0, rendering: bool = False) -> gym.Env:
+#: Ant-Tag tag bonus. The stock reward is -1/step with 0 on the tag, so tagging is worth
+#: only the steps it saves and the terminal event is not distinguished at all. This makes
+#: reaching the target explicitly valuable.
+ANT_TAG_TAG_BONUS = 100.0
+#: Step penalty paired with the bonus. Smaller than the stock -1 so a long successful
+#: episode still beats a short unsuccessful one: 400 steps cost 40, well under the bonus.
+ANT_TAG_STEP_PENALTY = -0.1
+
+
+class AntTagRewardWrapper(gym.Wrapper):
+    """Pay an explicit bonus for tagging, with a smaller per-step cost.
+
+    Stock Ant-Tag pays -1/step and 0 on the tag, so a tag is worth only the steps it
+    saves and carries no distinct signal. Measured over a 2-seed x 8-method x 2M-step
+    pilot, PPO never tagged once: every run sat at exactly -400.0. Potential-based shaping
+    cannot repair that -- shaping provably preserves the optimal policy, so it can guide a
+    learner that is already exploring the right region but cannot make an unexplored
+    terminal event worth finding.
+
+    That the task is reachable at all is established separately: the pretrained locomotion
+    policy tags 4/20 episodes and moves the ant 4.9 units, where random actions tag 0/20
+    and move 2.2. The gap is motor learning and exploration, not feasibility.
+
+    Only the scalar reward changes; observations, dynamics and termination are untouched,
+    and the wrapper sits below every method so all methods see one task.
+    """
+
+    def __init__(self, env: gym.Env, tag_bonus: float = ANT_TAG_TAG_BONUS,
+                 step_penalty: float = ANT_TAG_STEP_PENALTY):
+        super().__init__(env)
+        self.tag_bonus = tag_bonus
+        self.step_penalty = step_penalty
+
+    def step(self, action):
+        obs, _, terminated, truncated, info = self.env.step(action)
+        reward = self.step_penalty + (self.tag_bonus if terminated else 0.0)
+        info["tagged"] = bool(terminated)
+        return obs, reward, terminated, truncated, info
+
+
+def ant_tag_success(episode_return: float, episode_length: int) -> bool:
+    """Success = the target was tagged before the horizon.
+
+    Recovered from the return rather than the length so it stays correct under either
+    reward: with the bonus, only a tagging episode can finish above zero.
+    """
+    return episode_return > 0.0
+
+
+def make_ant_tag_base_env(seed: int = 0, rendering: bool = False,
+                          tag_bonus_reward: bool = False) -> gym.Env:
     """Registered Ant-Tag POMDP (native target visibility radius 3.0, TimeLimit 400).
 
     No curriculum wrapper: the base env already zeros ``obs[-2:]`` when the target is out
     of visual range, giving a genuine POMDP.
+
+    ``tag_bonus_reward`` applies :class:`AntTagRewardWrapper`; see it for why the stock
+    reward could not be learned from.
     """
     import pdomains  # noqa: F401  (registers pdomains-* envs on import)
 
     env = gym.make("pdomains-ant-tag-v0", rendering=rendering)
+    if tag_bonus_reward:
+        env = AntTagRewardWrapper(env)
     env.reset(seed=seed)
     return env
 
@@ -164,16 +219,133 @@ class OddEvenPOMDPGymAdapter(gym.Wrapper):
         return obs, reward, terminated, truncated, info
 
 
+class OddEvenParityRewardWrapper(gym.Wrapper):
+    """Gate Odd-Even's squared-error reward on getting the parity right.
+
+    The stock reward is ``-(predicted - true_state)^2``. Under it the optimal action is
+    ``argmin_a E[(a - s)^2]`` = round(E[s]) -- a function of the belief **mean alone**.
+    Measured over 24,000 real belief states, the optimal action differs from round(mean)
+    in 0.0% of them, so mean+covariance is a sufficient statistic and no belief encoder
+    can beat the Gaussian baseline however well it represents the posterior. That is the
+    same defect Car-Flag had, and potential-based shaping cannot repair it: shaping
+    preserves the optimal policy, so the *task reward* has to change.
+
+    Here a prediction of the wrong parity earns the worst reward the task can give,
+    ``-(n - 1)^2``, instead of being scored on distance. Parity is knowable exactly (every
+    observation shares ``true_state``'s parity), so this asks the agent for something the
+    belief genuinely contains -- and it is precisely what a mean cannot express: the mean
+    of a comb sits *between* its teeth, on a state of the opposite parity. Under the gated
+    reward the optimal action differs from round(mean) 39.2% of the time, and the expected
+    reward gap is ~31 per step (-1.70 optimal vs -32.65 for round(mean)).
+
+    Only the scalar reward is recomputed; observations, dynamics and termination are
+    untouched, and the wrapper sits below every method so all methods see one task.
+    Reading ``true_state`` here is not a leak -- it determines the reward, never the
+    observation, exactly as the stock reward already does.
+    """
+
+    def __init__(self, env: gym.Env):
+        super().__init__(env)
+        n = int(env.unwrapped.n_dist_size)
+        self.n_dist_size = n
+        self.worst_reward = -float((n - 1) ** 2)
+
+    def step(self, action):
+        obs, _, terminated, truncated, info = self.env.step(action)
+        predicted_state = int(action) + 1          # actions are 0-indexed predictions
+        true_state = int(self.env.unwrapped.true_state)
+        if predicted_state % 2 == true_state % 2:
+            reward = -float((predicted_state - true_state) ** 2)
+        else:
+            reward = self.worst_reward
+        info["predicted_state"] = predicted_state
+        info["true_state"] = true_state
+        info["parity_correct"] = predicted_state % 2 == true_state % 2
+        return obs, reward, terminated, truncated, info
+
+
+#: Worst per-step reward at the registry's n_dist_size=10, i.e. -(n-1)^2.
+ODD_EVEN_WORST_REWARD = -81.0
+
+
+#: Success threshold on mean per-step reward. Parity dominates the reward (-81 for a
+#: wrong-parity guess against 0 to -16 for a right-parity one), so the per-step mean is
+#: essentially -81 x (fraction of steps on the wrong parity). -2.0 therefore means the
+#: agent spends under ~2.5% of steps on an impossible state. Calibrated against the probe
+#: policies so the metric separates the two strategies rather than saturating: tracking
+#: the posterior mode scores -0.19/step (passes by 10x) while rounding the posterior mean
+#: -- the Gaussian's own rule -- scores -4.24/step (fails by 2x). A looser gate passes
+#: both, because the mean-tracker does recover the parity late in an episode; the whole
+#: difference lives in the early, genuinely multimodal steps.
+ODD_EVEN_SUCCESS_PER_STEP = -2.0
+
+
+def odd_even_success(episode_return: float, episode_length: int) -> bool:
+    """Success = the agent tracked the belief closely enough to stay on the true parity."""
+    if episode_length <= 0:
+        return False
+    return (episode_return / episode_length) > ODD_EVEN_SUCCESS_PER_STEP
+
+
 def make_odd_even_base_env(
     seed: int = 0,
     n_dist_size: int = 10,
     std_dev: float = 2.0,
     max_steps: int = 100,
+    n_obs_samples: int = 1,
+    parity_gated_reward: bool = True,
 ) -> gym.Env:
-    """OddEvenPOMDP (raw-particle observations, dense ``-squared_error`` reward)."""
+    """OddEvenPOMDP with raw observation samples and a parity-gated dense reward.
+
+    ``parity_gated_reward`` applies :class:`OddEvenParityRewardWrapper` -- required for
+    this env to discriminate belief encoders at all (see that class). Set it False only to
+    reproduce the stock ``-squared_error`` task.
+
+    ``n_obs_samples`` is how many iid observation draws the agent gets per step, and it
+    decides whether this environment is a belief benchmark at all. The env's default of
+    100 makes the exact posterior collapse to a **point mass after a single step** -- with
+    that much evidence the latent is effectively observed, every method sees the same
+    delta, and no belief encoder can differentiate. At 1 sample/step the posterior stays
+    genuinely multimodal over the parity comb for ~10 steps (mean support 3.9 states at
+    t=1, 1.8 at t=10), which is the regime where the belief representation matters.
+    """
     from pdomains.odd_even_pomdp import OddEvenPOMDP, OddEvenPOMDPConfig
 
-    cfg = OddEvenPOMDPConfig(n_dist_size=n_dist_size, std_dev=std_dev, seed=seed)
+    cfg = OddEvenPOMDPConfig(n_dist_size=n_dist_size, std_dev=std_dev, seed=seed,
+                             n_particles=n_obs_samples)
     env = OddEvenPOMDPGymAdapter(OddEvenPOMDP(config=cfg), max_steps=max_steps)
+    if parity_gated_reward:
+        env = OddEvenParityRewardWrapper(env)
     env.reset(seed=seed)
     return env
+
+
+# --- Multimodal Search ---------------------------------------------------------
+
+def make_msearch_base_env(seed: int = 0, **config_kwargs) -> gym.Env:
+    """Multimodal Search: a static target hidden in one of K random Gaussian modes.
+
+    Built so a Gaussian belief summary provably cannot compete — the belief mean is pinned
+    at the origin every episode, so it carries zero information about the target, while
+    the mode geometry stays random so there is no fixed sweep to memorise instead. See
+    :mod:`set_transformer.rl.envs.multimodal_search`.
+    """
+    from set_transformer.rl.envs.multimodal_search import (
+        MultimodalSearchConfig,
+        MultimodalSearchEnv,
+    )
+
+    cfg = MultimodalSearchConfig(seed=seed, **config_kwargs)
+    env = MultimodalSearchEnv(cfg)
+    env.reset(seed=seed)
+    return env
+
+
+def msearch_success(episode_return: float, episode_length: int) -> bool:
+    """Success = the target was found.
+
+    The find bonus equals the horizon and each step costs 1, so a found episode returns
+    ``find_bonus - steps > 0`` and an unfound one returns ``-max_steps < 0``. There is no
+    ambiguous middle.
+    """
+    return episode_return > 0.0

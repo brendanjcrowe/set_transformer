@@ -168,3 +168,40 @@ def test_learned_encoder_parameter_counts_are_within_tolerance():
 def test_analytic_baselines_have_no_particle_side_encoder():
     for method in ("gaussian", "kmoments"):
         assert _build_extractor(method).particle_encoder_parameters() == 0
+
+
+def test_find_features_extractor_handles_sac_style_policies():
+    """Regression: SAC leaves `policy.features_extractor` as None and builds separate
+    actor/critic extractors, so reading it unconditionally crashed every SAC run -- after
+    training had already been paid for."""
+    import importlib.util
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    sys.path.insert(0, str(root / "experiments" / "benchmark"))
+    spec = importlib.util.spec_from_file_location(
+        "_bench_train", root / "experiments" / "benchmark" / "train.py")
+    train = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(train)
+
+    sentinel = object()
+
+    class _PPOish:
+        features_extractor = sentinel
+
+    class _Sub:
+        features_extractor = sentinel
+
+    class _SACish:
+        features_extractor = None
+        actor = _Sub()
+
+    assert train.find_features_extractor(_PPOish()) is sentinel
+    assert train.find_features_extractor(_SACish()) is sentinel
+
+    class _Neither:
+        features_extractor = None
+
+    with pytest.raises(AttributeError):
+        train.find_features_extractor(_Neither())

@@ -1,0 +1,19 @@
+{
+  "source": "experiments/benchmark/pretrain/data/msearch/train.points.npy",
+  "n_samples": 9598,
+  "metric": "debiased_sinkhorn",
+  "p": 2,
+  "blur": 0.05,
+  "dtype": "float32",
+  "shape": [
+    9598,
+    9598
+  ],
+  "offdiag_mean": 188.32188863713836,
+  "offdiag_std": 138.6985673187044,
+  "offdiag_min": -0.27221789956092834,
+  "offdiag_max": 1082.7039794921875,
+  "diag_absmax": 0.0,
+  "stats_sampled_rows": 4000,
+  "wall_seconds": 1064.0
+}

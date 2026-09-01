@@ -109,7 +109,11 @@ def build_method_labels(runs) -> dict[str, str]:
     labels = {}
     for method, method_runs in by_method.items():
         meta = next((r.meta for r in method_runs if r.meta), {})
-        ek = meta.get("extractor_kwargs") or {}
+        # extractor_config holds the RESOLVED settings (class defaults included);
+        # extractor_kwargs only ever held CLI/registry overrides, so older run records
+        # fall back to it.
+        ek = {**(meta.get("extractor_kwargs") or {}),
+              **(meta.get("extractor_config") or {})}
         tags = [f"{disp}={ek[key]}" for key, disp in _LEGEND_HYPERPARAMS.items() if key in ek]
         labels[method] = f"{method} ({', '.join(tags)})" if tags else method
     return labels

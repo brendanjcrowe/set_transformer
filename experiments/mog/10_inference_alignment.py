@@ -66,7 +66,7 @@ def build_columns(models, methods):
 
 
 def _latent_neighbours(model, points, device, is_vae, metric, query_idx, k):
-    z = encode_all(model, points, device, is_vae)
+    z = encode_all(model, points, device)
     flat = z.reshape(len(z), -1)
     if metric == "cosine":
         normed = torch.nn.functional.normalize(flat, dim=1, eps=1e-8)

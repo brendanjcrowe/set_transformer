@@ -1,4 +1,8 @@
-"""Precompute the full pairwise debiased-Sinkhorn distance matrix over a MoG split.
+"""Precompute the pairwise debiased-Sinkhorn distance matrix over a MoG split.
+
+Thin CLI over :mod:`set_transformer.emd_matrix`, which holds the actual computation and
+is shared with the benchmark's pretraining pipeline. Only the paths, the histogram figure
+and the split handling are specific to this study.
 
 The latent metric-alignment loss needs a *fixed reference geometry* over the training
 set. Recomputing it inside the training loop would be both slow and redundant (the target
@@ -40,143 +44,16 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from geomloss import SamplesLoss
+from set_transformer.emd_matrix import (
+    compute_matrix,
+    matrix_stats,
+    verify_against_geomloss,
+    write_sidecar,
+)
 
 from _common import DATA_DIR, SINKHORN_BLUR
 
 FIG_DIR_DEFAULT = Path("experiments/mog/figures_align")
-
-
-def _self_terms(pts: torch.Tensor, ot: SamplesLoss, chunk: int) -> torch.Tensor:
-    """OT_eps(x_i, x_i) for every sample — the debiasing correction."""
-    out = torch.empty(len(pts), device=pts.device)
-    with torch.no_grad():
-        for s in range(0, len(pts), chunk):
-            block = pts[s:s + chunk]
-            out[s:s + chunk] = ot(block, block.clone())
-    return out
-
-
-def _cross_block(
-    pts: torch.Tensor,
-    rows: torch.Tensor,
-    cols: torch.Tensor,
-    ot: SamplesLoss,
-    self_terms: torch.Tensor,
-    pair_chunk: int,
-) -> torch.Tensor:
-    """Debiased Sinkhorn for every (row, col) pair; returns ``(len(rows), len(cols))``."""
-    ri = rows.repeat_interleave(len(cols))
-    ci = cols.repeat(len(rows))
-    vals = torch.empty(len(ri), device=pts.device)
-    with torch.no_grad():
-        for s in range(0, len(ri), pair_chunk):
-            a, b = ri[s:s + pair_chunk], ci[s:s + pair_chunk]
-            vals[s:s + pair_chunk] = (
-                ot(pts[a], pts[b]) - 0.5 * self_terms[a] - 0.5 * self_terms[b]
-            )
-    return vals.view(len(rows), len(cols))
-
-
-def verify_against_geomloss(pts, ot, self_terms, blur, p, n_pairs=64) -> float:
-    """Max |manual debias - geomloss(debias=True)| over a sample of pairs."""
-    ref = SamplesLoss("sinkhorn", p=p, blur=blur, debias=True)
-    g = torch.Generator(device="cpu").manual_seed(0)
-    a = torch.randint(0, len(pts), (n_pairs,), generator=g).to(pts.device)
-    b = torch.randint(0, len(pts), (n_pairs,), generator=g).to(pts.device)
-    with torch.no_grad():
-        mine = ot(pts[a], pts[b]) - 0.5 * self_terms[a] - 0.5 * self_terms[b]
-        theirs = ref(pts[a], pts[b])
-    return float((mine - theirs).abs().max())
-
-
-def compute_matrix(
-    points: np.ndarray,
-    out_path: Path,
-    blur: float,
-    p: int,
-    block: int,
-    pair_chunk: int,
-    device: str,
-    resume: bool,
-    verify: bool,
-) -> np.memmap:
-    n = len(points)
-    pts = torch.from_numpy(points).float().to(device)
-    ot = SamplesLoss("sinkhorn", p=p, blur=blur, debias=False)
-
-    progress_path = out_path.with_suffix(".progress.json")
-    start_block = 0
-    mode = "w+"
-    if resume and out_path.exists() and progress_path.exists():
-        state = json.loads(progress_path.read_text())
-        if state.get("n") == n and state.get("block") == block:
-            start_block, mode = state["next_row_block"], "r+"
-            print(f"resuming at row block {start_block}", flush=True)
-
-    matrix = np.memmap(out_path, dtype=np.float32, mode=mode, shape=(n, n))
-    if mode == "w+":
-        matrix[:] = 0.0
-
-    print("computing self terms ...", flush=True)
-    self_terms = _self_terms(pts, ot, pair_chunk)
-    print(f"  OT_eps(x,x): mean {self_terms.mean():.5f}  max {self_terms.max():.5f}", flush=True)
-    if verify:
-        err = verify_against_geomloss(pts, ot, self_terms, blur, p)
-        print(f"  max |manual debias - geomloss(debias=True)| = {err:.2e}", flush=True)
-
-    row_blocks = list(range(0, n, block))
-    total_pairs = n * (n - 1) // 2
-    t0 = time.time()
-
-    def _pairs_in_row_block(i0: int) -> int:
-        """Unordered pairs a row block owns: its cross columns plus its own triangle."""
-        h = min(i0 + block, n) - i0
-        return h * (n - i0 - h) + h * (h - 1) // 2
-
-    done_pairs = sum(_pairs_in_row_block(i0) for i0 in row_blocks[:start_block])
-    for bi in range(start_block, len(row_blocks)):
-        i0 = row_blocks[bi]
-        i1 = min(i0 + block, n)
-        rows = torch.arange(i0, i1, device=device)
-        for j0 in range(i0, n, block):
-            j1 = min(j0 + block, n)
-            cols = torch.arange(j0, j1, device=device)
-            vals = _cross_block(pts, rows, cols, ot, self_terms, pair_chunk).cpu().numpy()
-            if j0 == i0:  # diagonal block: keep only the strict upper triangle
-                vals = np.triu(vals, k=1)
-                matrix[i0:i1, j0:j1] = vals
-                matrix[i0:i1, j0:j1] += vals.T
-            else:
-                matrix[i0:i1, j0:j1] = vals
-                matrix[j0:j1, i0:i1] = vals.T
-        matrix.flush()
-        progress_path.write_text(json.dumps(
-            {"n": n, "block": block, "next_row_block": bi + 1, "blur": blur, "p": p}))
-        done_pairs += _pairs_in_row_block(i0)
-        frac = done_pairs / total_pairs
-        elapsed = time.time() - t0
-        eta = elapsed / max(frac, 1e-9) * (1 - frac) if bi > start_block else float("nan")
-        print(f"  row block {bi + 1}/{len(row_blocks)}  {100 * frac:5.1f}%  "
-              f"elapsed {elapsed / 60:.1f}m  eta {eta / 60:.1f}m", flush=True)
-
-    np.fill_diagonal(matrix, 0.0)
-    matrix.flush()
-    return matrix
-
-
-def write_sidecar(out_path: Path, points_path: Path, n: int, blur: float, p: int,
-                  stats: dict) -> None:
-    out_path.with_suffix(".json").write_text(json.dumps({
-        "source": str(points_path),
-        "n_samples": n,
-        "metric": "debiased_sinkhorn",
-        "p": p,
-        "blur": blur,
-        "dtype": "float32",
-        "shape": [n, n],
-        **stats,
-    }, indent=2))
 
 
 def plot_histogram(matrix: np.ndarray, fig_path: Path, title: str, max_rows: int = 4000) -> dict:
@@ -193,14 +70,6 @@ def plot_histogram(matrix: np.ndarray, fig_path: Path, title: str, max_rows: int
     fig_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(fig_path, dpi=150)
     plt.close(fig)
-    return {
-        "offdiag_mean": float(vals.mean()),
-        "offdiag_std": float(vals.std()),
-        "offdiag_min": float(vals.min()),
-        "offdiag_max": float(vals.max()),
-        "diag_absmax": float(np.abs(np.diag(sub)).max()),
-        "hist_sampled_rows": int(len(sub)),
-    }
 
 
 def main() -> None:
@@ -234,10 +103,11 @@ def main() -> None:
             points, out_path, args.blur, args.p, args.block, args.pair_chunk,
             args.device, resume=not args.no_resume, verify=args.verify,
         )
-        stats = plot_histogram(
+        plot_histogram(
             matrix, args.fig_dir / f"emd_matrix_hist_{split}.png",
             f"pairwise debiased Sinkhorn ({split}, blur={args.blur})",
         )
+        stats = matrix_stats(matrix)
         stats["wall_seconds"] = round(time.time() - t0, 1)
         write_sidecar(out_path, points_path, len(points), args.blur, args.p, stats)
         print(json.dumps(stats, indent=2), flush=True)
