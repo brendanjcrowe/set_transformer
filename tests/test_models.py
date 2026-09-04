@@ -8,6 +8,7 @@ from set_transformer.models import (
     DeepSetVAE,
     DeepSetVQVAE,
     PFSetTransformer,
+    PointNetAE,
     SetTransformer,
     SetVAE,
     SetVQVAE,
@@ -427,3 +428,86 @@ def test_pf_set_transformer_defaults_to_symmetric():
     )
     assert model(torch.randn(2, 32, 4)).shape == torch.Size([2, 32, 4])
 
+
+
+# ---------------------------------------------------------------------------
+# encode(): the uniform latent accessor the metric-alignment loss reads
+# (brought in from exp/PaperResults, Phase 1 of the alignment integration)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("cls", [PFSetTransformer, DeepSetAE, PointNetAE, SetVAE, DeepSetVAE])
+def test_encode_returns_the_bottleneck_code(
+    cls,
+    batch_size: int,
+    num_particles: int,
+    dim_particles: int,
+    num_encodings: int,
+    dim_encoder: int,
+) -> None:
+    """`encode` is the uniform latent accessor the metric-alignment loss reads.
+
+    For the VAEs it must be the deterministic posterior mean, not a sample.
+    """
+    model = cls(
+        num_particles=num_particles,
+        dim_particles=dim_particles,
+        num_encodings=num_encodings,
+        dim_encoder=dim_encoder,
+    )
+    model.eval()
+    X = torch.randn(batch_size, num_particles, dim_particles)
+    z = model.encode(X)
+    assert z.shape == (batch_size, num_encodings, dim_encoder)
+    assert torch.allclose(z, model.encode(X))  # deterministic
+    out = model(X)
+    if isinstance(out, dict):
+        assert torch.allclose(z, out["mu"], atol=1e-6)
+    else:
+        # The AEs must decode exactly what encode returns, so building recon from an
+        # explicit encode() call (what the aligned trainer does) matches forward().
+        assert torch.allclose(model.decoder(z), out, atol=1e-6)
+
+
+def test_encode_works_with_an_asymmetric_decoder(
+    batch_size: int, num_particles: int, num_encodings: int, dim_encoder: int
+) -> None:
+    """Our weighted pretraining builds PFSetTransformer with a D+1 input and a
+    D output; encode() must see the D+1 input and forward() the D output."""
+    model = PFSetTransformer(
+        num_particles=num_particles, dim_particles=3, num_encodings=num_encodings,
+        dim_encoder=dim_encoder, dim_output_particles=2)
+    X = torch.randn(batch_size, num_particles, 3)
+    z = model.encode(X)
+    assert z.shape == (batch_size, num_encodings, dim_encoder)
+    assert model(X).shape == (batch_size, num_particles, 2)
+    assert torch.allclose(model.decoder(z), model(X), atol=1e-6)
+
+
+def test_point_net_ae_is_a_max_pool_twin_of_deep_set_ae(
+    batch_size: int,
+    num_particles: int,
+    dim_particles: int,
+    num_encodings: int,
+    dim_encoder: int,
+) -> None:
+    """The two pooling autoencoders must differ ONLY in the pooling operator, so the
+    benchmark can attribute any gap between them to mean- vs. max-aggregation."""
+    kwargs = dict(
+        num_particles=num_particles,
+        dim_particles=dim_particles,
+        num_encodings=num_encodings,
+        dim_encoder=dim_encoder,
+    )
+    pn, ds = PointNetAE(**kwargs), DeepSetAE(**kwargs)
+    assert sum(p.numel() for p in pn.parameters()) == sum(p.numel() for p in ds.parameters())
+    assert set(pn.state_dict()) == set(ds.state_dict())
+
+    X = torch.randn(batch_size, num_particles, dim_particles)
+    out = pn(X)
+    assert out.shape == (batch_size, num_particles, dim_particles)
+    assert not torch.isnan(out).any()
+
+    # Permutation invariance of the code (the property the whole benchmark relies on).
+    perm = torch.randperm(num_particles)
+    assert torch.allclose(pn.encode(X), pn.encode(X[:, perm]), atol=1e-5)

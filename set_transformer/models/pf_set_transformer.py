@@ -64,6 +64,21 @@ class PFSetTransformer(nn.Module):
             dim_encoder, dim_hidden, num_particles, dim_output_particles
         )
 
+    def encode(self, X: torch.Tensor) -> torch.Tensor:
+        """Encode a particle set to its bottleneck code.
+
+        The uniform latent accessor the latent metric-alignment loss reads
+        (``set_transformer.latent_alignment``); every autoencoder in
+        ``set_transformer.models`` exposes the same method.
+
+        Args:
+            X (torch.Tensor): Input tensor of shape (batch_size, set_size, dim_particles)
+
+        Returns:
+            torch.Tensor: Latent of shape (batch_size, num_encodings, dim_encoder)
+        """
+        return self.set_transformer(X)
+
     def forward(self, X: torch.Tensor) -> torch.Tensor:
         """Forward pass of the PFSetTransformer.
 
@@ -74,4 +89,4 @@ class PFSetTransformer(nn.Module):
             torch.Tensor: Output tensor of shape
                 (batch_size, num_particles, dim_output_particles)
         """
-        return self.decoder(self.set_transformer(X))
+        return self.decoder(self.encode(X))

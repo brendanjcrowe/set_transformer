@@ -4,14 +4,14 @@ import torch
 import torch.nn as nn
 
 from set_transformer.modules import PFDecoder
-from set_transformer.models.deep_set import DeepSet
+from set_transformer.models.point_net import PointNet
 
 
-class DeepSetAE(nn.Module):
-    """Deep Sets autoencoder — analogous to `PFSetTransformer` but with a
-    mean-pool `DeepSet` encoder instead of a Set Transformer. Extra kwargs
-    (`num_inds`, `num_heads`, `ln`) are accepted for API parity with the ST
-    variants but silently ignored.
+class PointNetAE(nn.Module):
+    """PointNet autoencoder — a structural twin of `DeepSetAE` whose encoder max-pools
+    instead of mean-pooling, so the pooling operator is the only difference between the
+    two pretrained pooling baselines. Extra kwargs (`num_inds`, `num_heads`, `ln`) are
+    accepted for API parity with the ST variants but silently ignored.
     """
 
     def __init__(
@@ -24,7 +24,7 @@ class DeepSetAE(nn.Module):
         **_: Any,
     ) -> None:
         super().__init__()
-        self.encoder = DeepSet(
+        self.encoder = PointNet(
             dim_input=dim_particles,
             num_outputs=num_encodings,
             dim_output=dim_encoder,
