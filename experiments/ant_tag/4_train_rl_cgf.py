@@ -541,6 +541,48 @@ def _parse_reward_schedule(reward_schedule: str) -> list[tuple[float, ...]]:
     return schedule
 
 
+def _resolve_reward_shaping(parser, args) -> None:
+    """Reconcile --distance_coeff/--entropy_coeff with --reward_schedule, in place.
+
+    CurriculumCallback writes the schedule's interpolated coefficients into
+    every env on every step, so a coefficient flag given alongside a schedule
+    used to govern the first n_envs steps only, while run_config.json recorded
+    it as live. Nobody noticed because the default schedule's first waypoint
+    equals the flag defaults. Two outcomes now:
+
+    * ``--reward_schedule none`` (or empty): the flags (defaults 1.0 / 0.0)
+      become a constant schedule, so they really do hold for the whole run.
+    * a schedule plus an explicit flag: ``parser.error``. The user asked for
+      two things that cannot both happen.
+
+    In both cases ``args.distance_coeff`` / ``args.entropy_coeff`` are set to
+    the values in force at progress 0 and ``args.reward_schedule`` to a
+    parseable string, so ``run_config.json`` records what actually ran.
+    Shared by the Gaussian and ST arms.
+    """
+    explicit = [f"--{name}" for name in ("distance_coeff", "entropy_coeff")
+                if getattr(args, name) is not None]
+    schedule_str = (args.reward_schedule or "").strip()
+    if schedule_str.lower() in ("", "none"):
+        distance = 1.0 if args.distance_coeff is None else float(args.distance_coeff)
+        entropy = 0.0 if args.entropy_coeff is None else float(args.entropy_coeff)
+        args.reward_schedule = f"0:{distance}:{entropy}:0,1:{distance}:{entropy}:0"
+    else:
+        if explicit:
+            parser.error(
+                f"{' and '.join(explicit)} cannot be combined with "
+                "--reward_schedule: the schedule sets the shaping coefficients "
+                "on every step, so the flag would govern the first rollout "
+                "only. Either drop the flag and put the values in the schedule "
+                "(entries are frac:distance:entropy[:tag_bonus]) or pass "
+                "--reward_schedule none to run on constant coefficients."
+            )
+        first = _parse_reward_schedule(schedule_str)[0]
+        distance, entropy = float(first[1]), float(first[2])
+    args.distance_coeff = distance
+    args.entropy_coeff = entropy
+
+
 class _TeeStream:
     """Duplicates writes to multiple streams (e.g. the real stdout + a log file)."""
 
@@ -661,8 +703,16 @@ def main(encoder: str = "cgf"):
         help="Policy/value MLP sizes, e.g. '256,256'.",
     )
 
-    parser.add_argument("--distance_coeff", type=float, default=1.0)
-    parser.add_argument("--entropy_coeff", type=float, default=0.0)
+    parser.add_argument(
+        "--distance_coeff", type=float, default=None,
+        help="Constant PF-mean-distance shaping coefficient (default 1.0). "
+             "Only honoured with --reward_schedule none: the schedule sets "
+             "these coefficients on every step, so combining the two is an "
+             "error rather than a silent override.")
+    parser.add_argument(
+        "--entropy_coeff", type=float, default=None,
+        help="Constant PF belief-entropy shaping coefficient (default 0.0). "
+             "NOT PPO's entropy bonus. Same rule as --distance_coeff.")
     parser.add_argument(
         "--curriculum",
         type=str,
@@ -674,6 +724,10 @@ def main(encoder: str = "cgf"):
         "--reward_schedule",
         type=str,
         default="0:1:0:0,0.3:1:0:0,0.7:0:0:50,1:0:0:50",
+        help="Shaping schedule 'frac:distance:entropy[:tag_bonus],...', "
+             "interpolated over training progress and applied on every step. "
+             "Pass 'none' to run on the constant --distance_coeff / "
+             "--entropy_coeff values instead; giving both is an error.",
     )
     parser.add_argument(
         "--evasion_curriculum",
@@ -731,6 +785,7 @@ def main(encoder: str = "cgf"):
     parser.add_argument("--n_eval_episodes", type=int, default=20)
 
     args = parser.parse_args()
+    _resolve_reward_shaping(parser, args)
     if args.list_variants:
         variants.print_variants()
         return

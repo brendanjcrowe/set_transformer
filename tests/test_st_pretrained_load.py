@@ -121,3 +121,33 @@ def test_unfrozen_encoder_does_move_during_learn(pieces):
                for p in model.policy.features_extractor.encoder.parameters())
     model.learn(total_timesteps=128)
     assert _encoder_delta(model, reference) > 0.0, "encoder did not train"
+
+
+def test_num_heads_mismatch_is_refused_when_the_checkpoint_records_it(pieces, tmp_path):
+    """A strict load_state_dict cannot see num_heads: the MAB projections are
+    dim_hidden x dim_hidden however the heads split them, so a 4-head
+    checkpoint loads into an 8-head encoder without complaint and computes
+    something else. 3_train_st.py checkpoints carry their TrainingConfig, so
+    the extractor compares the recorded geometry and refuses."""
+    m, venv, ck_path, _reference = pieces
+    from set_transformer.training.config import TrainingConfig
+
+    state = torch.load(ck_path, map_location="cpu", weights_only=False)["model_state_dict"]
+    config = TrainingConfig(
+        num_particles=100, dim_particles=2, num_encodings=8, dim_encoder=8,
+        num_inds=32, dim_hidden=128, num_heads=4, use_layer_norm=True,
+        weighted_particles=True)
+    path = tmp_path / "with_config.pt"
+    torch.save({"model_state_dict": state, "config": config}, path)
+
+    common = dict(num_encodings=8, dim_encoder=8, num_inds=32, dim_hidden=128,
+                  ln=True, arena_scale=7.0, weight_channel=True,
+                  pretrained_st_model_path=str(path))
+    # Matching geometry loads.
+    m.SetTransformerFeaturesExtractor(venv.observation_space, num_heads=4, **common)
+    # Only the head count differs: no shape changes, must still be refused.
+    with pytest.raises(RuntimeError, match="num_heads"):
+        m.SetTransformerFeaturesExtractor(venv.observation_space, num_heads=2, **common)
+    # A checkpoint without a config (older files) still loads on shapes alone.
+    m.SetTransformerFeaturesExtractor(venv.observation_space, num_heads=2, **{
+        **common, "pretrained_st_model_path": ck_path})

@@ -134,6 +134,22 @@ class SetTransformerFeaturesExtractor(BaseFeaturesExtractor):
         )
         self.encoder = pf_st.set_transformer
 
+        # Compared against the TrainingConfig a 3_train_st.py checkpoint
+        # carries. A strict load_state_dict catches every mismatch that
+        # changes a parameter shape, but num_heads changes none (the MAB's
+        # projections are dim_hidden x dim_hidden however the heads split
+        # them), so a 4-head checkpoint loads silently into an 8-head encoder
+        # that computes something else. Field names follow TrainingConfig.
+        self._st_geometry = dict(
+            num_encodings=num_encodings,
+            dim_encoder=dim_encoder,
+            num_inds=num_inds,
+            dim_hidden=dim_hidden,
+            num_heads=num_heads,
+            use_layer_norm=bool(ln),
+            weighted_particles=self.weight_channel,
+        )
+
         if pretrained_st_model_path:
             self._load_pretrained_encoder(pretrained_st_model_path, dim_input)
         else:
@@ -158,6 +174,46 @@ class SetTransformerFeaturesExtractor(BaseFeaturesExtractor):
               f"(weight_channel={self.weight_channel}), "
               f"st_output_dim={st_output_dim}, features_dim={self.features_dim}")
 
+    def _check_checkpoint_geometry(self, config, path: str) -> None:
+        """Refuse a checkpoint whose recorded geometry contradicts this run's.
+
+        ``config`` is the TrainingConfig (or a dict of it) that
+        ``Trainer.save_checkpoint`` stores. Fields it does not carry are
+        skipped, so older checkpoints still load and the strict state_dict
+        load remains the backstop for shape-changing mismatches.
+        """
+        if config is None:
+            return
+        geometry = getattr(self, "_st_geometry", None)
+        if not geometry:
+            return
+
+        def _get(field):
+            if isinstance(config, dict):
+                return config.get(field)
+            return getattr(config, field, None)
+
+        mismatches = []
+        for field, expected in geometry.items():
+            actual = _get(field)
+            if actual is None:
+                continue
+            if isinstance(expected, bool):
+                actual = bool(actual)
+            if actual != expected:
+                mismatches.append(
+                    f"{field}: checkpoint={actual!r}, this run={expected!r}")
+        if mismatches:
+            raise RuntimeError(
+                f"Checkpoint {path} was pretrained with a different encoder "
+                "geometry than this run requests:\n  "
+                + "\n  ".join(mismatches)
+                + "\nPass the matching --num_encodings/--dim_encoder/--num_inds/"
+                "--dim_hidden/--num_heads/--ln flags (or --no_st_weight_channel "
+                "for an unweighted checkpoint). A num_heads mismatch changes "
+                "no parameter shape and would otherwise load silently."
+            )
+
     def _load_pretrained_encoder(self, path: str, dim_input: int) -> None:
         """Load the SetTransformer encoder out of a 3_train_st.py checkpoint.
 
@@ -167,6 +223,7 @@ class SetTransformerFeaturesExtractor(BaseFeaturesExtractor):
         loaded = torch.load(path, map_location="cpu", weights_only=False)
         if isinstance(loaded, dict) and "model_state_dict" in loaded:
             state_dict = loaded["model_state_dict"]
+            self._check_checkpoint_geometry(loaded.get("config"), path)
         elif isinstance(loaded, dict):
             state_dict = loaded
         else:

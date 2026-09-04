@@ -517,8 +517,16 @@ def main(encoder: str = "st"):
         help="Policy/value MLP sizes, e.g. '256,256'.",
     )
 
-    parser.add_argument("--distance_coeff", type=float, default=1.0)
-    parser.add_argument("--entropy_coeff", type=float, default=0.0)
+    parser.add_argument(
+        "--distance_coeff", type=float, default=None,
+        help="Constant PF-mean-distance shaping coefficient (default 1.0). "
+             "Only honoured with --reward_schedule none: the schedule sets "
+             "these coefficients on every step, so combining the two is an "
+             "error rather than a silent override.")
+    parser.add_argument(
+        "--entropy_coeff", type=float, default=None,
+        help="Constant PF belief-entropy shaping coefficient (default 0.0). "
+             "NOT PPO's entropy bonus. Same rule as --distance_coeff.")
     parser.add_argument(
         "--curriculum",
         type=str,
@@ -530,6 +538,10 @@ def main(encoder: str = "st"):
         "--reward_schedule",
         type=str,
         default="0:1:0:0,0.3:1:0:0,0.7:0:0:50,1:0:0:50",
+        help="Shaping schedule 'frac:distance:entropy[:tag_bonus],...', "
+             "interpolated over training progress and applied on every step. "
+             "Pass 'none' to run on the constant --distance_coeff / "
+             "--entropy_coeff values instead; giving both is an error.",
     )
     parser.add_argument(
         "--evasion_curriculum",
@@ -586,6 +598,7 @@ def main(encoder: str = "st"):
     parser.add_argument("--n_eval_episodes", type=int, default=20)
 
     args = parser.parse_args()
+    _train_rl_cgf._resolve_reward_shaping(parser, args)
     if args.list_variants:
         variants.print_variants()
         return
