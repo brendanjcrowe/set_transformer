@@ -124,6 +124,13 @@ def main() -> None:
                         help="Epochs over which lambda ramps linearly to its target.")
     parser.add_argument("--align_val_max_samples", type=int, default=2000,
                         help="Val rows used for the held-out val/align_r metric.")
+    parser.add_argument(
+        "--max_samples", type=int, default=None,
+        help="Train on the first K rows of the dataset only (file order; the "
+             "collectors shuffle after rebalancing). With --emd_matrix_path the "
+             "matrix's own row count is used and this must agree with it. Give "
+             "the PLAIN arm the same value as the aligned arm's matrix so the two "
+             "train on identical rows.")
 
     # Model architecture. dim_particles is the COORDINATE dimension; in
     # weighted mode the encoder input is dim_particles + 1 internally.
@@ -215,8 +222,10 @@ def main() -> None:
     # checked before any data is loaded; frame and row count are checked
     # again against the loaded dataset below.
     aligning = args.align_lambda > 0
-    max_samples = None
+    max_samples = args.max_samples
     sidecar = None
+    if max_samples is not None and int(max_samples) <= 0:
+        parser.error("--max_samples must be positive")
     if args.align_lambda < 0:
         parser.error("--align_lambda must be >= 0")
     if aligning:
@@ -246,6 +255,9 @@ def main() -> None:
                          + "\n  ".join(problems)
                          + "\nRecompute it with 2b_precompute_emd.py using the same flags.")
         max_samples = int(sidecar["n_samples"])
+        if args.max_samples is not None and int(args.max_samples) != max_samples:
+            parser.error(f"--max_samples {args.max_samples} contradicts the matrix, "
+                         f"which covers the first {max_samples} rows. Omit the flag.")
         if args.batch_size < 16:
             print(f"WARNING: --batch_size {args.batch_size} gives only "
                   f"{args.batch_size * (args.batch_size - 1) // 2} pairs per batch for "
