@@ -38,6 +38,15 @@ from ..models import (
 )
 from ..plots import visualize_particle_filter_reconstruction
 from .config import ExperimentConfig, TrainingConfig
+from ..data.dataset import IndexedDataset, POMDPDataset
+from ..emd_matrix import load_matrix
+from ..latent_alignment import (
+    LambdaRamp,
+    PearsonAlignmentLoss,
+    flatten_upper_triangle,
+    latent_pairwise_distances,
+    pearson_r,
+)
 
 
 class Trainer:
@@ -90,6 +99,10 @@ class Trainer:
         self.current_epoch = 0
         self.global_step = 0
         self.best_val_loss = float("inf")
+        self.best_epoch = 0
+
+        # Latent metric alignment (off unless config.align_lambda > 0).
+        self._setup_alignment()
 
         # Initialize wandb
         self._setup_wandb()
@@ -267,7 +280,13 @@ class Trainer:
                 self.scheduler.state_dict() if self.scheduler else None
             ),
             "best_val_loss": self.best_val_loss,
+            "best_epoch": self.best_epoch,
             "config": self.config,
+            # The coordinate frame the encoder was trained in, so the RL
+            # side can check it applies the same (x - centre) / scale.
+            "particle_scale": getattr(self._base_dataset, "particle_scale", None),
+            "particle_centre": getattr(self._base_dataset, "particle_centre", None),
+            "alignment": self._alignment_record(),
         }
 
         # Save latest checkpoint
@@ -318,17 +337,161 @@ class Trainer:
             self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
         self.best_val_loss = checkpoint["best_val_loss"]
 
-    def _split_batch(self, batch):
-        """Return (particles, weights) on the training device.
+    # ------------------------------------------------------------------
+    # Latent metric alignment
+    # ------------------------------------------------------------------
 
-        A weighted dataset yields (particles, weights) pairs; an unweighted one
-        yields a bare tensor and weights is None.
+    @staticmethod
+    def _unwrap_dataset(dataset):
+        """(innermost dataset, indexed?) through Subset / IndexedDataset layers."""
+        indexed = False
+        while True:
+            if isinstance(dataset, IndexedDataset):
+                indexed = True
+            if isinstance(dataset, POMDPDataset):
+                break
+            inner = getattr(dataset, "dataset", None)
+            if inner is None:
+                break
+            dataset = inner
+        return dataset, indexed
+
+    def _setup_alignment(self) -> None:
+        """Wire the alignment term up from config, or leave it off.
+
+        On: loads the pairwise-EMD matrix (memmap; its size must match the
+        base dataset exactly), builds the Pearson loss and the lambda ramp,
+        and fixes a held-out set of val rows for val/align_r.
         """
-        if isinstance(batch, (tuple, list)):
-            particles, weights = batch
+        base, indexed = self._unwrap_dataset(self.train_loader.dataset)
+        self._base_dataset = base
+        self._indexed_loader = indexed
+        self.align_loss = None
+        self.emd_matrix = None
+        self._lambda_ramp = None
+        self._val_align_indices = None
+        self._val_align_pairs = None
+
+        lam = float(getattr(self.config, "align_lambda", 0.0) or 0.0)
+        if lam <= 0.0:
+            return
+        path = getattr(self.config, "emd_matrix_path", None)
+        if not path:
+            raise ValueError(
+                "align_lambda > 0 requires emd_matrix_path (the pairwise EMD "
+                "matrix over the dataset; see 2b_precompute_emd.py)")
+        if not indexed:
+            raise ValueError(
+                "align_lambda > 0 requires the loaders to carry dataset row "
+                "indices: build them with get_data_loader(indexed=True)")
+        if not isinstance(base, POMDPDataset):
+            raise ValueError(
+                f"alignment needs a POMDPDataset at the base of the loader, "
+                f"got {type(base).__name__}")
+        n = len(base)
+        self.emd_matrix = load_matrix(Path(path), n, mmap=True)
+        self.align_loss = PearsonAlignmentLoss(self.config.align_metric)
+        self._lambda_ramp = LambdaRamp(
+            lam, self.config.align_warmup_epochs, self.config.align_ramp_epochs)
+
+        val_dataset = self.val_loader.dataset
+        val_idx = np.asarray(getattr(val_dataset, "indices", np.arange(n)), dtype=np.int64)
+        val_idx = np.sort(val_idx)[: int(self.config.align_val_max_samples)]
+        if len(val_idx) >= 2:
+            sub = np.array(self.emd_matrix[np.ix_(val_idx, val_idx)], dtype=np.float32)
+            self._val_align_indices = val_idx
+            self._val_align_pairs = flatten_upper_triangle(torch.from_numpy(sub))
+        self.logger.info(
+            f"Latent alignment ON: lambda={lam} ({self.config.align_metric}), "
+            f"warmup {self.config.align_warmup_epochs} ep, ramp "
+            f"{self.config.align_ramp_epochs} ep, matrix {path} over {n} rows, "
+            f"val_r over {len(val_idx)} held-out rows")
+
+    def _align_lambda(self, epoch: int) -> float:
+        return 0.0 if self._lambda_ramp is None else float(self._lambda_ramp(epoch))
+
+    def _alignment_record(self) -> Optional[dict]:
+        """What a checkpoint records about alignment (None when off)."""
+        if self.align_loss is None:
+            return None
+        return {
+            "lambda": float(self.config.align_lambda),
+            "metric": self.config.align_metric,
+            "warmup_epochs": int(self.config.align_warmup_epochs),
+            "ramp_epochs": int(self.config.align_ramp_epochs),
+            "emd_matrix_path": str(self.config.emd_matrix_path),
+            "lambda_at_best_epoch": self._align_lambda(self.best_epoch),
+        }
+
+    def _forward_with_latent(self, model_input, need_latent: bool):
+        """``(recon, aux, latent)`` from one encoder pass.
+
+        Without alignment this is plain ``model(x)`` (latent None). With it,
+        the autoencoders decode an explicit ``encode()`` -- identical to
+        ``forward`` for PFSetTransformer / DeepSetAE -- and the VAEs expose
+        their posterior mean while the decoder still sees the sample. The
+        VQ-VAEs quantize the code, so aligning their pre-quantization latent
+        would optimize something the decoder never sees; refused.
+        """
+        if not need_latent:
+            recon, aux = self._split_output(self.model(model_input))
+            return recon, aux, None
+        if self.config.model_type in ("pf_st", "ds_ae"):
+            latent = self.model.encode(model_input)
+            return self.model.decoder(latent), {}, latent
+        if self.config.model_type in ("set_vae", "ds_vae"):
+            recon, aux = self._split_output(self.model(model_input))
+            return recon, aux, aux["mu"]
+        raise ValueError(
+            f"latent alignment is not supported for model_type="
+            f"{self.config.model_type!r}")
+
+    def _validation_alignment_r(self) -> float:
+        """Pearson r between latent and EMD distances over the fixed val rows."""
+        if self._val_align_indices is None:
+            return float("nan")
+        self.model.eval()
+        codes = []
+        base = self._base_dataset
+        with torch.no_grad():
+            for s in range(0, len(self._val_align_indices), 256):
+                rows = self._val_align_indices[s:s + 256]
+                samples = [base[int(i)] for i in rows]
+                if base.is_weighted:
+                    particles = torch.stack([p for p, _ in samples])
+                    weights = torch.stack([w for _, w in samples])
+                else:
+                    particles, weights = torch.stack(samples), None
+                particles = particles.to(self.config.device)
+                weights = None if weights is None else weights.to(self.config.device)
+                _, _, z = self._forward_with_latent(
+                    self._model_input(particles, weights), need_latent=True)
+                codes.append(z.reshape(z.shape[0], -1))
+        z = torch.cat(codes, dim=0)
+        r = pearson_r(latent_pairwise_distances(z, self.config.align_metric),
+                      self._val_align_pairs.to(z.device))
+        return float("nan") if r is None else float(r)
+
+    def _split_batch(self, batch):
+        """Return (particles, weights, indices) on the training device.
+
+        The loader yields a bare tensor (unweighted), a (particles, weights)
+        tuple (weighted), or -- when built with get_data_loader(indexed=True)
+        for the alignment term -- either of those wrapped as (sample, idx).
+        `indices` are BASE dataset rows (IndexedDataset wraps the base dataset
+        before the split), which is how the EMD matrix is indexed; None when
+        the loader is not indexed. `weights` is None for unweighted sets.
+        """
+        indices = None
+        sample = batch
+        if self._indexed_loader:
+            sample, indices = batch
+            indices = np.asarray(indices.cpu().numpy(), dtype=np.int64)
+        if isinstance(sample, (tuple, list)):
+            particles, weights = sample
             return (particles.to(self.config.device),
-                    weights.to(self.config.device))
-        return batch.to(self.config.device), None
+                    weights.to(self.config.device), indices)
+        return sample.to(self.config.device), None, indices
 
     def _model_input(self, particles, weights):
         """Build the encoder input.
@@ -360,7 +523,8 @@ class Trainer:
             recon, aux = output, {}
         return recon, aux
 
-    def _compose_loss(self, recon, target, aux, target_weights=None):
+    def _compose_loss(self, recon, target, aux, target_weights=None,
+                      latent=None, batch_indices=None, align_lambda=0.0):
         """Compose total loss from reconstruction + weighted auxiliary terms.
 
         `target_weights` turns the reconstruction term into a comparison of
@@ -368,6 +532,14 @@ class Trainer:
         the uniform reconstruction. It is passed straight through to the loss,
         so a loss with no weighted formulation (Chamfer) raises rather than
         quietly optimizing something else.
+
+        `latent` + `batch_indices` (+ `align_lambda`) add the latent metric-
+        alignment term: 1 - pearson_r between the batch's latent pairwise
+        distances and the matching entries of the precomputed EMD matrix.
+        The term is added even at lambda 0 during warmup so its value is
+        logged; only its weight is 0. evaluate() passes no latent, so the
+        VALIDATION loss stays reconstruction-only and model selection is
+        blind to alignment (val/align_r is reported separately).
 
         Returns (total_loss, components_dict) where components is per-term
         scalar floats for logging.
@@ -380,6 +552,16 @@ class Trainer:
             )
         total = recon_loss
         components = {"recon": recon_loss.item()}
+        if (self.align_loss is not None and latent is not None
+                and batch_indices is not None):
+            sub = np.array(self.emd_matrix[np.ix_(batch_indices, batch_indices)],
+                           dtype=np.float32)
+            align_term, r = self.align_loss(latent, torch.from_numpy(sub).to(latent.device))
+            total = total + align_lambda * align_term
+            components["align"] = float(align_term.detach())
+            components["align_lambda"] = float(align_lambda)
+            if r is not None:
+                components["align_r"] = float(r.detach())
         if "kl" in aux:
             total = total + self.config.kl_weight * aux["kl"]
             components["kl"] = aux["kl"].item()
@@ -400,15 +582,18 @@ class Trainer:
         total_loss = 0
         num_batches = 0
 
+        align_lambda = self._align_lambda(self.current_epoch)
         for batch in self.train_loader:
-            particles, weights = self._split_batch(batch)
+            particles, weights, indices = self._split_batch(batch)
 
             # Forward pass
             self.optimizer.zero_grad()
-            output = self.model(self._model_input(particles, weights))
-            recon, aux = self._split_output(output)
+            recon, aux, latent = self._forward_with_latent(
+                self._model_input(particles, weights),
+                need_latent=self.align_loss is not None)
             loss, components = self._compose_loss(
-                recon, particles, aux, target_weights=weights
+                recon, particles, aux, target_weights=weights,
+                latent=latent, batch_indices=indices, align_lambda=align_lambda,
             )
 
             # Backward pass
@@ -456,10 +641,14 @@ class Trainer:
                 self.writer.add_scalar("val/loss", val_loss, self.global_step)
 
                 # Log to wandb with evaluation metrics
+                if "align_r" in val_metrics:
+                    self.writer.add_scalar("val/align_r", val_metrics["align_r"], self.global_step)
                 wandb.log(
                     {
                         "val/loss": val_loss,
                         "val/earth_mover_distance": val_metrics["emd"],
+                        **({"val/align_r": val_metrics["align_r"]}
+                           if "align_r" in val_metrics else {}),
                         "val/step": self.global_step,
                         "val/epoch": self.current_epoch,
                     },
@@ -474,6 +663,7 @@ class Trainer:
                 # Save checkpoint if best
                 if val_loss < self.best_val_loss:
                     self.best_val_loss = val_loss
+                    self.best_epoch = self.current_epoch
                     self.save_checkpoint(is_best=True)
                     wandb.log(
                         {"val/best_loss": val_loss},
@@ -500,7 +690,7 @@ class Trainer:
 
         with torch.no_grad():
             for batch in self.val_loader:
-                particles, weights = self._split_batch(batch)
+                particles, weights, _indices = self._split_batch(batch)
                 output = self.model(self._model_input(particles, weights))
                 recon, aux = self._split_output(output)
 
@@ -524,6 +714,8 @@ class Trainer:
         metrics = {
             "emd": avg_emd,
         }
+        if self.align_loss is not None:
+            metrics["align_r"] = self._validation_alignment_r()
 
         return avg_loss, metrics
 
@@ -605,6 +797,19 @@ class Trainer:
                 },
                 step=self.global_step,
             )
+
+        # Model selection is by reconstruction val loss, which is blind to
+        # alignment. If the best epoch predates the end of the lambda ramp,
+        # checkpoint_best.pt is a partially- or un-aligned encoder wearing an
+        # "aligned" label -- nothing downstream can detect that, so say it.
+        if self.align_loss is not None:
+            lam_best = self._align_lambda(self.best_epoch)
+            if lam_best < float(self.config.align_lambda):
+                self.logger.warning(
+                    f"best-by-val-loss epoch {self.best_epoch} has align_lambda="
+                    f"{lam_best:.3f} < target {self.config.align_lambda}; "
+                    "checkpoint_best.pt is NOT fully aligned. Train longer, lower "
+                    "the alignment weight, or shorten the warmup/ramp.")
 
         # Always leave a checkpoint behind. Checkpoints are otherwise written
         # only at save_freq / eval_freq boundaries, so a run with fewer total

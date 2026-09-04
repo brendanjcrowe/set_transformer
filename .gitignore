@@ -163,3 +163,9 @@ experiments/*/figures/*.csv
 experiments/*/figures/*.npy
 # Odd-Even episode renders (regenerable via experiments/odd_even/viz/animate_episode.py)
 experiments/odd_even/viz/out/
+
+# Pairwise-EMD matrices for latent alignment (4 N^2 bytes, regenerable via
+# experiments/ant_tag/2b_precompute_emd.py). The small .json sidecar beside
+# each one is the provenance record and is NOT ignored.
+experiments/*/data/*_emd.npy
+experiments/*/data/*_emd.progress.json

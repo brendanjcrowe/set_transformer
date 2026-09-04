@@ -31,6 +31,7 @@ Usage:
 """
 
 import argparse
+import json
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -47,6 +48,7 @@ import torch
 import torch.multiprocessing as mp
 
 from set_transformer.data.dataset import get_data_loader
+from set_transformer.emd_matrix import dataset_sha256, read_sidecar
 from set_transformer.training.config import ExperimentConfig, TrainingConfig
 from set_transformer.training.trainer import Trainer
 
@@ -100,6 +102,28 @@ def main() -> None:
         help="Sinkhorn regularization in COORDINATE UNITS; must be well below "
              "the smallest belief structure to resolve.")
     parser.add_argument("--sinkhorn_scaling", type=float, default=0.5)
+
+    # Latent metric alignment (optional; needs 2b_precompute_emd.py first).
+    parser.add_argument(
+        "--align_lambda", type=float, default=0.0,
+        help="Weight of the latent metric-alignment term, 1 - pearson_r between "
+             "the batch's latent pairwise distances and the precomputed pairwise "
+             "EMD distances. 0 (default) = off. The collaborator's MoG operating "
+             "point was 0.2 with warmup 15 / ramp 15 over 60 epochs; re-tune per "
+             "domain (our encoders converge or collapse far sooner).")
+    parser.add_argument(
+        "--emd_matrix_path", type=str, default=None,
+        help="Matrix from 2b_precompute_emd.py over THIS dataset. Its .json "
+             "sidecar must agree with this run on blur, scaling, weightedness, "
+             "frame and dataset hash, or the run is refused.")
+    parser.add_argument("--align_metric", type=str, default="cosine",
+                        choices=["cosine", "euclidean"])
+    parser.add_argument("--align_warmup_epochs", type=int, default=0,
+                        help="Epochs with lambda held at 0.")
+    parser.add_argument("--align_ramp_epochs", type=int, default=0,
+                        help="Epochs over which lambda ramps linearly to its target.")
+    parser.add_argument("--align_val_max_samples", type=int, default=2000,
+                        help="Val rows used for the held-out val/align_r metric.")
 
     # Model architecture. dim_particles is the COORDINATE dimension; in
     # weighted mode the encoder input is dim_particles + 1 internally.
@@ -186,6 +210,47 @@ def main() -> None:
     # 0 already). None = the value recorded in the dataset, 0.0 if none.
     particle_centre = 0.0 if args.no_particle_scaling else None
 
+    # Alignment: the matrix must have been built from this exact dataset,
+    # in this frame, with this metric. Everything the sidecar records is
+    # checked before any data is loaded; frame and row count are checked
+    # again against the loaded dataset below.
+    aligning = args.align_lambda > 0
+    max_samples = None
+    sidecar = None
+    if args.align_lambda < 0:
+        parser.error("--align_lambda must be >= 0")
+    if aligning:
+        if not args.emd_matrix_path:
+            parser.error("--align_lambda > 0 needs --emd_matrix_path "
+                         "(run 2b_precompute_emd.py on this dataset first)")
+        try:
+            sidecar = read_sidecar(Path(args.emd_matrix_path))
+        except FileNotFoundError as exc:
+            parser.error(str(exc))
+        problems = []
+        if abs(float(sidecar["blur"]) - args.sinkhorn_blur) > 1e-12:
+            problems.append(f"blur: matrix {sidecar['blur']}, this run {args.sinkhorn_blur}")
+        if abs(float(sidecar.get("scaling", 0.5)) - args.sinkhorn_scaling) > 1e-12:
+            problems.append(f"scaling: matrix {sidecar.get('scaling', 0.5)}, "
+                            f"this run {args.sinkhorn_scaling}")
+        if bool(sidecar.get("weighted", False)) != weighted:
+            problems.append(f"weighted: matrix {sidecar.get('weighted', False)}, "
+                            f"this run {weighted} (--ignore_weights must match)")
+        if sidecar.get("data_sha256"):
+            actual = dataset_sha256(Path(args.data_path))
+            if actual != sidecar["data_sha256"]:
+                problems.append("data_sha256: the matrix was built from a different "
+                                f"dataset file ({sidecar.get('data_path')})")
+        if problems:
+            parser.error("--emd_matrix_path does not match this run:\n  "
+                         + "\n  ".join(problems)
+                         + "\nRecompute it with 2b_precompute_emd.py using the same flags.")
+        max_samples = int(sidecar["n_samples"])
+        if args.batch_size < 16:
+            print(f"WARNING: --batch_size {args.batch_size} gives only "
+                  f"{args.batch_size * (args.batch_size - 1) // 2} pairs per batch for "
+                  "the alignment correlation; 16 (120 pairs) is the practical floor.")
+
     # Load data
     train_loader, val_loader, train_size, val_size = get_data_loader(
         batch_size=args.batch_size,
@@ -197,6 +262,8 @@ def main() -> None:
         particle_scale=particle_scale,
         particle_centre=particle_centre,
         seed=args.seed,
+        indexed=aligning,
+        max_samples=max_samples,
     )
     print(f"Dataset: {train_size} train / {val_size} val samples "
           f"({'weighted' if weighted else 'unweighted'} particle sets)")
@@ -215,6 +282,20 @@ def main() -> None:
                 f"--{flag} {given} contradicts the dataset ({actual}). Omit "
                 "the flag to take it from the data."
             )
+    if sidecar is not None:
+        frame_problems = []
+        for key, actual in (("particle_scale", base_dataset.particle_scale),
+                            ("particle_centre", base_dataset.particle_centre)):
+            recorded = sidecar.get(key)
+            if recorded is not None and abs(float(recorded) - float(actual)) > 1e-9:
+                frame_problems.append(f"{key}: matrix {recorded}, this run {actual}")
+        if len(base_dataset) != int(sidecar["n_samples"]):
+            frame_problems.append(f"n_samples: matrix {sidecar['n_samples']}, "
+                                  f"dataset {len(base_dataset)}")
+        if frame_problems:
+            parser.error("--emd_matrix_path was built in a different coordinate frame "
+                         "or over different rows than this run loads:\n  "
+                         + "\n  ".join(frame_problems))
 
     # Build configs
     training_config = TrainingConfig(
@@ -241,6 +322,12 @@ def main() -> None:
         device=device,
         num_workers=args.num_workers,
         seed=args.seed,
+        align_lambda=args.align_lambda,
+        align_metric=args.align_metric,
+        align_warmup_epochs=args.align_warmup_epochs,
+        align_ramp_epochs=args.align_ramp_epochs,
+        emd_matrix_path=args.emd_matrix_path if aligning else None,
+        align_val_max_samples=args.align_val_max_samples,
         log_freq=args.log_freq,
         eval_freq=args.eval_freq,
         save_freq=args.save_freq,
@@ -270,6 +357,17 @@ def main() -> None:
           f"[particle_centre / particle_scale]; seed={args.seed}; "
           f"sinkhorn_blur={args.sinkhorn_blur} "
           f"(= {args.sinkhorn_blur * applied_scale:.4f} env units)")
+    if aligning:
+        print(f"Latent alignment: lambda={args.align_lambda} ({args.align_metric}), "
+              f"warmup {args.align_warmup_epochs} / ramp {args.align_ramp_epochs} epochs "
+              f"of {args.num_epochs}; matrix {args.emd_matrix_path} "
+              f"({'weighted' if sidecar.get('weighted') else 'uniform'}, "
+              f"{sidecar['n_samples']} rows, offdiag std {sidecar.get('offdiag_std', float('nan')):.4g})")
+        if args.align_warmup_epochs + args.align_ramp_epochs >= args.num_epochs:
+            print("WARNING: warmup + ramp >= num_epochs: lambda never reaches its "
+                  "target, so no checkpoint from this run is fully aligned.")
+    else:
+        print("Latent alignment: off")
 
     # Train
     trainer = Trainer(

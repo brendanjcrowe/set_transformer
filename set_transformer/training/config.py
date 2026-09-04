@@ -73,6 +73,29 @@ class TrainingConfig:
     sinkhorn_blur: float = 0.05
     sinkhorn_scaling: float = 0.5
 
+    # Latent metric alignment (set_transformer.latent_alignment). Adds
+    # align_lambda * (1 - pearson_r) between the batch's latent pairwise
+    # (cosine) distances and the corresponding entries of a precomputed
+    # pairwise debiased-Sinkhorn matrix over the dataset (emd_matrix.py --
+    # weighted when the dataset is). 0.0 = off (the default; nothing else in
+    # this block is read then). lambda is held at 0 for align_warmup_epochs and
+    # ramped linearly over align_ramp_epochs: alignment must not dominate
+    # before reconstruction has partially converged. The collaborator's MoG
+    # operating point was 0.2 / 15 / 15 over 60 epochs; our encoders converge
+    # (Ant-Tag, ~10 epochs) or collapse (Odd-Even, ~30) far sooner, so the
+    # schedule is a per-domain hyperparameter, not a constant.
+    # Requires the loaders to be built with get_data_loader(indexed=True).
+    # Model selection (best_val_loss) stays on the reconstruction loss alone,
+    # blind to alignment; val/align_r is logged separately.
+    align_lambda: float = 0.0
+    align_metric: str = "cosine"  # ["cosine", "euclidean"]
+    align_warmup_epochs: int = 0
+    align_ramp_epochs: int = 0
+    emd_matrix_path: Optional[str] = None
+    # Held-out latent<->EMD correlation is computed over at most this many
+    # val rows (pairs grow quadratically: 2000 rows = 2M pairs).
+    align_val_max_samples: int = 2000
+
     # Hardware
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     num_workers: int = 4

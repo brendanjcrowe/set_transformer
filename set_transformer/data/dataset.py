@@ -218,6 +218,7 @@ def get_dataset(
     load_weights: bool = True,
     particle_scale: Optional[float] = None,
     particle_centre: Optional[float] = None,
+    max_samples: Optional[int] = None,
 ) -> POMDPDataset:
     """Load dataset from file.
 
@@ -249,12 +250,21 @@ def get_dataset(
         particle_centre (float, optional): Subtract this before dividing.
             None (the default) means "use the centre recorded in the file"
             (top-level array or metadata JSON), falling back to 0.0.
+        max_samples (int, optional): Keep only the first ``max_samples`` rows,
+            in file order. Used when a precomputed pairwise-EMD matrix (the
+            alignment target) was built over a prefix of the dataset: the
+            matrix is indexed by row, so the dataset must be cut to the same
+            rows. None = all rows.
 
     Returns:
         POMDPDataset: Dataset object.
     """
+    if max_samples is not None and int(max_samples) <= 0:
+        raise ValueError(f"max_samples must be positive, got {max_samples}")
     loaded = np.load(data_path)
     if isinstance(loaded, np.ndarray):
+        if max_samples is not None:
+            loaded = loaded[: int(max_samples)]
         scale = 1.0 if particle_scale is None else float(particle_scale)
         centre = 0.0 if particle_centre is None else float(particle_centre)
         return POMDPDataset(loaded, None, device, particle_scale=scale,
@@ -270,6 +280,10 @@ def get_dataset(
             f"{data_path} has no 'particles' array; found {loaded.files}"
         )
     weights = loaded["weights"] if (load_weights and "weights" in loaded) else None
+    if max_samples is not None:
+        particles = particles[: int(max_samples)]
+        if weights is not None:
+            weights = weights[: int(max_samples)]
 
     if particle_scale is None:
         stored = loaded["particle_scale"] if "particle_scale" in loaded else None
@@ -292,6 +306,8 @@ def get_data_loader(
     particle_scale: Optional[float] = None,
     particle_centre: Optional[float] = None,
     seed: Optional[int] = None,
+    indexed: bool = False,
+    max_samples: Optional[int] = None,
 ) -> Tuple[DataLoader, DataLoader, int, int]:
     """Create data loaders for training and evaluation.
 
@@ -326,7 +342,14 @@ def get_data_loader(
     dataset = get_dataset(
         data_path, dataset_device, load_weights=load_weights,
         particle_scale=particle_scale, particle_centre=particle_centre,
+        max_samples=max_samples,
     )
+    if indexed:
+        # Wrap the BASE dataset, before the split, so the index each item
+        # carries is the base row -- the row the pairwise-EMD matrix the
+        # alignment loss reads is indexed by. Wrapping the Subsets instead
+        # would yield positions within the split.
+        dataset = IndexedDataset(dataset)
     train_size = int(train_split * len(dataset))
     eval_size = len(dataset) - train_size
 

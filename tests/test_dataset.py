@@ -311,3 +311,34 @@ def test_data_loader_split_is_reproducible_with_a_seed(temp_data_file):
     assert a != c
     # Still a partition.
     assert sorted(a[0] + a[1]) == list(range(100))
+
+
+# --- indexed loaders and max_samples (alignment support) -------------------
+
+
+def test_indexed_loader_yields_base_rows_after_the_split(temp_weighted_npz):
+    """The alignment loss indexes the EMD matrix by dataset row, so the index a
+    batch carries must be the BASE row even though the loader is a Subset."""
+    from set_transformer.data.dataset import IndexedDataset
+
+    train_loader, eval_loader, _, _ = get_data_loader(
+        batch_size=8, data_path=temp_weighted_npz, device="cpu", seed=3, indexed=True)
+    subset = train_loader.dataset
+    assert isinstance(subset.dataset, IndexedDataset)
+    base = subset.dataset.dataset
+    (particles, weights), idx = next(iter(train_loader))
+    assert particles.shape[0] == weights.shape[0] == idx.shape[0] == 8
+    for row, p, w in zip(idx.tolist(), particles, weights):
+        bp, bw = base[row]
+        assert torch.equal(p, bp) and torch.equal(w, bw)
+    # Train and eval indices partition the base rows.
+    all_idx = sorted(set(subset.indices) | set(eval_loader.dataset.indices))
+    assert all_idx == list(range(len(base)))
+
+
+def test_max_samples_keeps_the_first_rows_in_file_order(temp_weighted_npz, sample_data):
+    dataset = get_dataset(temp_weighted_npz, max_samples=17)
+    assert len(dataset) == 17
+    assert torch.allclose(dataset.data, torch.from_numpy(sample_data[:17]))
+    with pytest.raises(ValueError):
+        get_dataset(temp_weighted_npz, max_samples=0)
