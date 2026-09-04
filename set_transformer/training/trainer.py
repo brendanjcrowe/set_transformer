@@ -72,6 +72,13 @@ class Trainer:
         self.logger = logger or self._setup_logger()
         self.writer = SummaryWriter(self.exp_config.log_dir)
 
+        # Seed before the model is built so its init is reproducible and
+        # recorded (the config, seed included, goes into every checkpoint).
+        seed = getattr(self.config, "seed", None)
+        if seed is not None:
+            torch.manual_seed(int(seed))
+            np.random.seed(int(seed))
+
         # Initialize model, optimizer, scheduler, and losses
         self.model = self._setup_model()
         self.optimizer = self._setup_optimizer()
@@ -202,7 +209,22 @@ class Trainer:
             nn.Module: Initialized loss function
         """
         if self.config.loss_type == "emd":
-            return EarthMoverDistanceLoss()
+            # EarthMoverDistanceLoss goes through POT in numpy and returns a
+            # tensor with no grad_fn; loss.backward() raises on the first
+            # step. It is the EVAL metric (self.eval_loss), never trainable.
+            raise ValueError(
+                "loss_type='emd' is not differentiable and cannot be trained "
+                "on (it is the evaluation metric). Use 'sinkhorn' (weighted "
+                "or unweighted) or 'chamfer' (unweighted only)."
+            )
+        elif self.config.loss_type == "hausdorff":
+            # geomloss raises KeyError: None inside its kernel table for this
+            # loss; it has never trained here. Refuse up front rather than
+            # crash after the data has loaded.
+            raise ValueError(
+                "loss_type='hausdorff' is broken upstream in geomloss "
+                "(KeyError: None). Use 'sinkhorn'."
+            )
         elif self.config.loss_type == "chamfer":
             return ChamferDistanceLoss()
         elif self.config.loss_type == "sinkhorn":
@@ -213,8 +235,6 @@ class Trainer:
                 blur=self.config.sinkhorn_blur,
                 scaling=self.config.sinkhorn_scaling,
             )
-        elif self.config.loss_type == "hausdorff":
-            return HausdorffLoss(blur=self.config.sinkhorn_blur)
         else:
             raise ValueError(f"Unknown loss type: {self.config.loss_type}")
 
@@ -285,7 +305,10 @@ class Trainer:
         Args:
             checkpoint_path: Path to checkpoint file
         """
-        checkpoint = torch.load(checkpoint_path)
+        # save_checkpoint pickles the TrainingConfig dataclass under "config";
+        # torch >= 2.6 defaults to weights_only=True and refuses it.
+        checkpoint = torch.load(
+            checkpoint_path, map_location=self.config.device, weights_only=False)
 
         self.current_epoch = checkpoint["epoch"]
         self.global_step = checkpoint["global_step"]

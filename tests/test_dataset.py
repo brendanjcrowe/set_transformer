@@ -1,5 +1,6 @@
 """Test dataset utilities."""
 
+import json
 import os
 import tempfile
 import numpy as np
@@ -225,3 +226,88 @@ def test_nonfinite_weights_rejected_at_load(sample_data, sample_weights):
     with pytest.raises(ValueError, match="NaN or inf"):
         POMDPDataset(sample_data, bad)
 
+
+
+# --- particle_centre: the other half of the RL-side (x - centre) / scale ---
+
+
+def test_particle_centre_is_subtracted_before_scaling(sample_data):
+    dataset = POMDPDataset(sample_data, particle_centre=2.0, particle_scale=4.0)
+    expected = (torch.from_numpy(sample_data) - 2.0) / 4.0
+    assert torch.allclose(dataset.data, expected)
+    assert dataset.particle_centre == 2.0
+    assert dataset.particle_scale == 4.0
+
+
+def test_particle_centre_defaults_to_zero(sample_data):
+    dataset = POMDPDataset(sample_data, particle_scale=4.0)
+    assert dataset.particle_centre == 0.0
+    assert torch.allclose(dataset.data, torch.from_numpy(sample_data) / 4.0)
+
+
+def test_non_finite_particle_centre_rejected(sample_data):
+    with pytest.raises(ValueError, match="particle_centre"):
+        POMDPDataset(sample_data, particle_centre=float("nan"))
+
+
+def test_stored_particle_centre_is_used_by_default(sample_data, sample_weights, tmp_path):
+    """The Odd-Even collector writes a top-level particle_centre array.
+
+    Before 2026-09-03 only particle_scale was applied at load, so an encoder
+    was pretrained on inputs in about [0.04, 2.04] and then handed [-1, 1]
+    at RL time.
+    """
+    path = tmp_path / "centred.npz"
+    np.savez(path, particles=sample_data, weights=sample_weights,
+             particle_scale=np.float32(24.5), particle_centre=np.float32(25.5))
+    dataset = get_dataset(str(path))
+    expected = (torch.from_numpy(sample_data) - 25.5) / 24.5
+    assert torch.allclose(dataset.data, expected)
+    assert dataset.particle_centre == pytest.approx(25.5)
+
+
+def test_particle_centre_falls_back_to_metadata_json(sample_data, tmp_path):
+    """Datasets collected before the top-level key carry it in metadata only."""
+    path = tmp_path / "legacy_centred.npz"
+    np.savez(path, particles=sample_data, particle_scale=np.float32(24.5),
+             metadata=json.dumps({"particle_centre": 25.5, "variant": "oe50"}))
+    dataset = get_dataset(str(path))
+    expected = (torch.from_numpy(sample_data) - 25.5) / 24.5
+    assert torch.allclose(dataset.data, expected)
+
+
+def test_explicit_particle_centre_overrides_the_stored_one(sample_data, tmp_path):
+    path = tmp_path / "centred.npz"
+    np.savez(path, particles=sample_data, particle_scale=np.float32(2.0),
+             particle_centre=np.float32(25.5))
+    dataset = get_dataset(str(path), particle_centre=0.0)
+    assert dataset.particle_centre == 0.0
+    assert torch.allclose(dataset.data, torch.from_numpy(sample_data) / 2.0)
+
+
+def test_missing_particle_centre_defaults_to_zero(temp_weighted_npz):
+    dataset = get_dataset(temp_weighted_npz)
+    assert dataset.particle_centre == 0.0
+
+
+# --- seeded split -----------------------------------------------------------
+
+
+def _split_indices(path, seed):
+    train_loader, eval_loader, _, _ = get_data_loader(
+        batch_size=8, data_path=path, device="cpu", seed=seed)
+    return list(train_loader.dataset.indices), list(eval_loader.dataset.indices)
+
+
+def test_data_loader_split_is_reproducible_with_a_seed(temp_data_file):
+    """An unseeded split gave a different val set on every invocation, so
+    best_val_loss was not comparable across runs and a resumed run trained on
+    former val samples. The alignment loss (Phase 2) also indexes a
+    precomputed EMD matrix by dataset row, which needs a stable split."""
+    a = _split_indices(temp_data_file, seed=7)
+    b = _split_indices(temp_data_file, seed=7)
+    c = _split_indices(temp_data_file, seed=8)
+    assert a == b
+    assert a != c
+    # Still a partition.
+    assert sorted(a[0] + a[1]) == list(range(100))

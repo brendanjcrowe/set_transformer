@@ -94,6 +94,7 @@ class ExperimentRunner:
         self.logger.info(f"Starting experiments for {self.experiment_name}")
         self.logger.info(f"Number of configurations: {len(configs)}")
 
+        failures: list[tuple[str, str]] = []
         for i, config in enumerate(configs):
             # Create run name
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -124,15 +125,27 @@ class ExperimentRunner:
                 trainer.load_checkpoint(Path(resume_from))
                 self.logger.info(f"Resumed from checkpoint: {resume_from}")
 
-            # Train
+            # Train. A failure is recorded and the remaining configs still
+            # run, but it must not end in "All experiments completed!": that
+            # message used to be printed after every run had crashed on step
+            # one (the old default loss was non-differentiable).
             try:
                 trainer.train()
             except Exception as e:
-                self.logger.error(f"Error during training: {str(e)}")
+                self.logger.error(f"Error during training ({run_name}): {e}")
+                failures.append((run_name, repr(e)))
                 continue
 
             self.logger.info(f"Completed run: {run_name}\n")
 
+        if failures:
+            summary = "\n".join(f"  {name}: {err}" for name, err in failures)
+            self.logger.error(
+                f"{len(failures)} of {len(configs)} runs FAILED:\n{summary}")
+            raise RuntimeError(
+                f"{len(failures)} of {len(configs)} training runs failed; "
+                "see the log above."
+            )
         self.logger.info("All experiments completed!")
 
 

@@ -34,6 +34,7 @@ tests at the wrong file.
 """
 
 import importlib.util
+import json
 import sys
 from contextlib import contextmanager
 from pathlib import Path
@@ -906,28 +907,36 @@ def test_summarize_episode_splits_are_disjoint_and_complete():
 def test_oracle_beats_the_naive_baseline_by_the_recorded_margin():
     """The reference policies, on the real env, at the recorded values.
 
-    domain_mds/oddeven.md records the oracle's steady state at -0.329 and
-    play-the-previous-observation at -9.750 for oe50: a margin of about 9.4
-    reward per step, which is the value of accumulating evidence and so the
-    effect an encoder comparison has to resolve. If this margin ever
-    collapses, the domain has stopped testing what it was chosen to test.
+    Under the 0/1 exact-match reward (2026-09-03) domain_mds/oddeven.md
+    records, on oe50_short, the Bayes oracle (posterior MODE) at 0.881
+    reward/step in the steady state and 0.638 in the transient, and
+    play-the-previous-observation at about 0.256 throughout. Reward per step
+    IS the exact-match rate now. The oracle-minus-naive margin is the value
+    of accumulating evidence and so the effect an encoder comparison has to
+    resolve; if it ever collapses, the domain has stopped testing what it was
+    chosen to test.
 
     Loose tolerances on purpose -- this pins the SIZE of the effect, not a
-    Monte-Carlo digit. 40 episodes keeps it fast.
+    Monte-Carlo digit. 40 episodes keeps it fast. (The previous version of
+    this test pinned squared-error-era values and kept passing on the inline
+    arithmetic; see PITFALLS.md on hollow tests.)
     """
     module = _load("eval_true_reward_odd_even", _ODD_EVEN_DIR / "eval_scripts")
     references = module.run_reference_policies(
         VARIANT, n_episodes=40, seed=0, collapse_step=21)
     oracle = references["oracle"]["reward"]
     naive = references["prev_obs"]["reward"]
-    assert -1.0 < oracle["steady"] < 0.0, oracle["steady"]
-    assert -3.5 < oracle["transient"] < -1.0, oracle["transient"]
-    assert naive["steady"] < -6.0, naive["steady"]
-    assert oracle["steady"] - naive["steady"] > 5.0, (
+    assert 0.75 < oracle["steady"] <= 1.0, oracle["steady"]
+    assert 0.45 < oracle["transient"] < 0.85, oracle["transient"]
+    assert naive["steady"] < 0.45, naive["steady"]
+    assert oracle["steady"] - naive["steady"] > 0.4, (
         "the oracle's advantage over the naive baseline has collapsed")
-    # The oracle is the posterior MEAN, which beats the belief argmax. Its
-    # exact-match rate in the steady state should be high but not perfect:
-    # telling s* from s*+/-2 needs many observations.
+    # Reward and exact match are the same measurement under 0/1.
+    assert references["oracle"]["exact_match"]["steady"] == pytest.approx(
+        oracle["steady"])
+    # High but not perfect: telling s* from s*+/-2 needs many observations,
+    # and the posterior itself concentrates past 0.9 in only ~63% of
+    # episodes by step 30.
     assert 0.5 < references["oracle"]["exact_match"]["steady"] < 1.0
 
 
@@ -939,3 +948,66 @@ def test_eval_reads_num_particles_off_the_checkpoint():
     """
     module = _load("eval_true_reward_odd_even", _ODD_EVEN_DIR / "eval_scripts")
     assert module._checkpoint_num_particles("/nonexistent/model.zip") is None
+
+
+def test_collected_dataset_loads_in_the_rl_frame(belief_env_module, tmp_path):
+    """3_train_st.py must see the SAME inputs the RL extractor sees.
+
+    The collector stores raw states and records particle_centre and
+    particle_scale; get_dataset applies (x - centre) / scale. Until
+    2026-09-03 only the scale was applied, so an encoder was pretrained on
+    [0.04, 2.04] and then handed [-1, 1] under PPO -- every pretrained-ST
+    Odd-Even number was measured on an out-of-distribution encoder.
+    test_particles_are_centred_on_the_state_range covers the RL half; this
+    covers the dataset half and pins the two to each other.
+    """
+    from set_transformer.data.dataset import get_dataset
+
+    collector = _load("2_collect_pf_dataset", _ODD_EVEN_DIR)
+    particles, weights, metadata = collector.collect_dataset_for_test(
+        ns=NS, num_episodes=2, timesteps=10, num_particles=NS, seed=0)
+    path = tmp_path / "dataset.npz"
+    np.savez(path, particles=particles, weights=weights,
+             particle_scale=np.float32(metadata["particle_scale"]),
+             particle_centre=np.float32(metadata["particle_centre"]),
+             metadata=json.dumps(metadata, default=str))
+
+    dataset = get_dataset(str(path))
+    coords = dataset.data.numpy().ravel()
+    assert coords.min() == pytest.approx(-1.0, abs=1e-4)
+    assert coords.max() == pytest.approx(1.0, abs=1e-4)
+
+    env = belief_env_module.make_odd_even_belief_env(
+        num_particles=NS, variant=VARIANT, seed=0)()
+    obs, _info = env.reset(seed=1)
+    env.close()
+    rl_frame = np.sort(np.asarray(obs["particles"], dtype=np.float64).ravel()
+                       / metadata["particle_scale"])
+    # Exact-support particles are the same 50 states in every snapshot, so
+    # any dataset row must equal any RL observation once both are sorted.
+    np.testing.assert_allclose(
+        np.sort(dataset.data[0].numpy().ravel()), rl_frame, atol=1e-4)
+
+
+def test_rebalance_never_duplicates_rows():
+    """Upsampling with replacement put identical snapshots on both sides of
+    3_train_st.py's train/val split (5.84x duplication on oe50_short).
+    Rebalancing now downsamples to the tightest bucket instead."""
+    collector = _load("2_collect_pf_dataset", _ODD_EVEN_DIR)
+    # 5 early (<3), 50 mid (3..20), 100 late (>=21): far from 40/35/25.
+    steps = np.concatenate([np.zeros(5), np.full(50, 10), np.full(100, 25)]).astype(int)
+    n = len(steps)
+    row_id = np.arange(n, dtype=np.float32).reshape(n, 1, 1)
+    particles = np.repeat(row_id, NS, axis=1)          # row id in every particle
+    weights = np.full((n, NS), 1.0 / NS, dtype=np.float32)
+
+    out_p, out_w, out_s = collector._rebalance(
+        particles, weights, steps, by="step", seed=0)
+    ids = out_p[:, 0, 0]
+    assert len(np.unique(ids)) == len(ids), "rebalance duplicated rows"
+    # min(5/0.40, 50/0.35, 100/0.25) = 12 rows -> 5 / 4 / 3.
+    assert len(ids) == 12
+    assert int((out_s < 3).sum()) == 5
+    assert int(((out_s >= 3) & (out_s < 21)).sum()) == 4
+    assert int((out_s >= 21).sum()) == 3
+    assert out_w.shape == (12, NS)

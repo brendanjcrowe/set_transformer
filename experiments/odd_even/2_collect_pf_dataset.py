@@ -153,15 +153,17 @@ def _rebalance(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Rebalance the snapshot mix across the belief's own sharpening axis.
 
-    Three buckets, downsampled or upsampled (with replacement) to the target
-    fractions. `by="step"` splits on the step index, which is the axis the
+    Three buckets, downsampled (never upsampled -- no row appears twice) to
+    the target fractions. `by="step"` splits on the step index, which is the axis the
     belief sharpens along and needs no coordinate units. `by="ess"` splits on
     effective sample size, which measures the sharpening directly and so is
     the better choice when episodes are ragged.
 
     An empty bucket cannot be sampled from; its quota is redistributed over
     the buckets that do have data, in proportion to their own quotas, so the
-    output keeps its size rather than silently shrinking.
+    target fractions still describe the output. The output is smaller than
+    the input whenever the buckets are not already in the target ratio, and
+    says so.
     """
     if by == "step":
         early = np.where(steps < early_step)[0]
@@ -194,21 +196,29 @@ def _rebalance(
     empty = [name for name, idx, _ in buckets if len(idx) == 0]
     if empty:
         print(f"  WARNING: no samples in bucket(s) {empty}; their share is "
-              "redistributed over the remaining buckets to preserve the "
-              "dataset size. Consider a longer --timesteps or different "
-              "--early_step / --collapse_step.")
+              "redistributed over the remaining buckets. Consider a longer "
+              "--timesteps or different --early_step / --collapse_step.")
 
     rng = np.random.default_rng(seed)
     live_frac_total = sum(frac for _, _, frac in live)
+    shares = [(frac / live_frac_total if live_frac_total > 0
+               else 1.0 / len(live)) for _, _, frac in live]
+    # Never upsample. Sampling WITH replacement used to fill the early
+    # bucket's quota with copies (measured 5.84x duplication on oe50_short);
+    # 3_train_st.py then random-splits the rows, so identical snapshots
+    # landed on both sides and made best_val_loss optimistic. Instead the
+    # output size is set by the tightest bucket, so every target fraction is
+    # met exactly with distinct rows. Collect more episodes for more data.
+    n_out = int(min(len(idx) / share for (_n, idx, _f), share in zip(live, shares)))
     sampled = []
-    for _name, idx, frac in live:
-        share = (frac / live_frac_total if live_frac_total > 0
-                 else 1.0 / len(live))
-        n_target = int(round(n_total * share))
-        sampled.append(rng.choice(idx, size=n_target,
-                                  replace=len(idx) < n_target))
+    for (_name, idx, _frac), share in zip(live, shares):
+        n_target = min(len(idx), int(round(n_out * share)))
+        sampled.append(rng.choice(idx, size=n_target, replace=False))
     all_idx = np.concatenate(sampled)
     rng.shuffle(all_idx)
+    if len(all_idx) < n_total:
+        print(f"  Rebalance keeps {len(all_idx)} of {n_total} snapshots "
+              "(downsampled to the target fractions without duplication)")
     return particles[all_idx], weights[all_idx], steps[all_idx]
 
 
@@ -246,10 +256,12 @@ def collect_dataset(
     all_steps: list[int] = []
 
     def _record(obs_dict, step_index):
-        # Stored RAW, undoing the env's centring. 3_train_st.py applies the
-        # recorded particle_scale itself, and the RL extractors divide by the
-        # same number, so the encoder is pretrained on exactly the inputs it
-        # will later be handed (PITFALLS.md section 4).
+        # Stored RAW, undoing the env's centring. The file records BOTH
+        # halves of the RL-side mapping -- particle_centre and particle_scale
+        # -- and dataset.py applies (x - centre) / scale at load, so the
+        # encoder is pretrained on exactly the inputs it will later be handed
+        # (PITFALLS.md section 4). Until 2026-09-03 only the scale was
+        # applied, and pretraining ran one whole normalized unit off.
         all_particles.append(
             np.asarray(obs_dict["particles"], dtype=np.float32) + np.float32(centre))
         all_weights.append(np.asarray(obs_dict["weights"], dtype=np.float32))
@@ -488,6 +500,12 @@ def main() -> None:
         particles=particles,
         weights=weights,
         particle_scale=np.float32(metadata["particle_scale"]),
+        # Top-level so get_dataset() reads it without parsing the metadata.
+        # dataset.py applies (x - centre) / scale, matching the RL wrapper.
+        particle_centre=np.float32(metadata["particle_centre"]),
+        # Per-row step index, so the transient/steady mix can be checked or
+        # re-split downstream (only min/max used to be recorded).
+        steps=steps.astype(np.int32),
         metadata=json.dumps(metadata, default=str),
     )
     print(f"Saved to {output}")

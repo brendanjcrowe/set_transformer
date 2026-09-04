@@ -63,7 +63,10 @@ class TrainingConfig:
     # accepts weighted measures, and unlike Chamfer it is an actual metric
     # between point distributions. ("hausdorff" was the old default and is
     # broken upstream in geomloss, which needs a kernel name it is never given.)
-    loss_type: str = "sinkhorn"  # ["sinkhorn", "chamfer", "emd", "hausdorff"]
+    # Trainable choices: "sinkhorn" (weighted or not), "chamfer" (unweighted
+    # only). "emd" is the eval metric and has no gradient; "hausdorff" is
+    # broken upstream. Trainer._setup_loss refuses both.
+    loss_type: str = "sinkhorn"  # ["sinkhorn", "chamfer"]
     # Blur is in COORDINATE UNITS: the length scale below which the loss stops
     # telling points apart. Set it well under the smallest belief structure you
     # need resolved (e.g. a den of radius 0.4 needs blur << 0.4).
@@ -73,6 +76,12 @@ class TrainingConfig:
     # Hardware
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     num_workers: int = 4
+
+    # Reproducibility. None keeps the process's global RNG state (legacy).
+    # Trainer seeds torch/numpy from this before building the model; the
+    # train/val split is seeded separately by get_data_loader(seed=...).
+    # Stored in every checkpoint via the pickled config.
+    seed: Optional[int] = None
 
     # Logging and checkpointing
     log_freq: int = 100  # Steps between logging
@@ -149,9 +158,8 @@ def get_default_training_configs() -> List[TrainingConfig]:
     """
     configs = []
 
-    # EMD Loss configuration
-    emd_config = TrainingConfig(loss_type="emd", batch_size=32, learning_rate=1e-3)
-    configs.append(emd_config)
+    # (No EMD configuration: EMD is the evaluation metric and is not
+    # differentiable, so a Trainer built on it raises at _setup_loss.)
 
     # Chamfer Loss configuration
     chamfer_config = TrainingConfig(

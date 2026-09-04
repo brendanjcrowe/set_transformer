@@ -90,7 +90,10 @@ def main() -> None:
     # Loss
     parser.add_argument(
         "--loss_type", type=str, default="sinkhorn",
-        choices=["emd", "chamfer", "sinkhorn", "hausdorff"],
+        choices=["chamfer", "sinkhorn"],
+        help="Training objective. sinkhorn is the only one that accepts "
+             "weighted sets; chamfer is unweighted only. (emd is the eval "
+             "metric and has no gradient; hausdorff is broken upstream.)",
     )
     parser.add_argument(
         "--sinkhorn_blur", type=float, default=0.05,
@@ -139,8 +142,20 @@ def main() -> None:
     # Data loading
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--train_split", type=float, default=0.8)
+    parser.add_argument(
+        "--seed", type=int, default=0,
+        help="Seeds model init, the shuffle order and the train/val split. "
+             "Without it every invocation gets a different val set, so "
+             "best_val_loss is not comparable across runs.",
+    )
 
     args = parser.parse_args()
+
+    # Seed before anything that draws: the split (via get_data_loader's
+    # generator), the model init and the batch shuffle. Recorded in the
+    # checkpoint through TrainingConfig.seed.
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
 
     # CUDA multiprocessing
     if mp.get_start_method(allow_none=True) != "spawn":
@@ -166,6 +181,10 @@ def main() -> None:
         print("NOTE: --ignore_weights given but the dataset has no weights.")
 
     particle_scale = 1.0 if args.no_particle_scaling else args.particle_scale
+    # The centre is the other half of the RL-side (x - centre) / scale
+    # mapping (Odd-Even centres its state range on 0; Ant-Tag's centre is
+    # 0 already). None = the value recorded in the dataset, 0.0 if none.
+    particle_centre = 0.0 if args.no_particle_scaling else None
 
     # Load data
     train_loader, val_loader, train_size, val_size = get_data_loader(
@@ -176,6 +195,8 @@ def main() -> None:
         num_workers=args.num_workers,
         load_weights=weighted,
         particle_scale=particle_scale,
+        particle_centre=particle_centre,
+        seed=args.seed,
     )
     print(f"Dataset: {train_size} train / {val_size} val samples "
           f"({'weighted' if weighted else 'unweighted'} particle sets)")
@@ -219,6 +240,7 @@ def main() -> None:
         sinkhorn_scaling=args.sinkhorn_scaling,
         device=device,
         num_workers=args.num_workers,
+        seed=args.seed,
         log_freq=args.log_freq,
         eval_freq=args.eval_freq,
         save_freq=args.save_freq,
@@ -243,7 +265,9 @@ def main() -> None:
     # Blur is a length in the TRAINING coordinate system. With scaling applied
     # it is measured in normalized units, so print what that is in env units —
     # the number to compare against the belief structure you want resolved.
-    print(f"Coordinates divided by particle_scale={applied_scale}; "
+    applied_centre = base_dataset.particle_centre
+    print(f"Coordinates mapped as (x - {applied_centre}) / {applied_scale} "
+          f"[particle_centre / particle_scale]; seed={args.seed}; "
           f"sinkhorn_blur={args.sinkhorn_blur} "
           f"(= {args.sinkhorn_blur * applied_scale:.4f} env units)")
 

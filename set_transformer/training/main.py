@@ -15,8 +15,14 @@ from .experiment import run_training_experiments
 
 
 def get_loss_choices() -> List[str]:
-    """Get available loss function choices."""
-    return ["emd", "chamfer", "sinkhorn", "hausdorff"]
+    """Trainable loss functions.
+
+    "emd" (the eval metric, no gradient) and "hausdorff" (broken upstream in
+    geomloss) used to be listed here, and "emd" was the default: every run
+    crashed on its first backward() and the runner still printed "All
+    experiments completed!".
+    """
+    return ["chamfer", "sinkhorn"]
 
 
 def create_experiment_name(base_name: str, loss_type: str) -> str:
@@ -89,12 +95,19 @@ def main() -> None:
         "--clip_grad_norm", type=float, default=1.0, help="Gradient clipping norm"
     )
 
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="Seeds model init, batch order and the train/val split.",
+    )
+
     # Loss function settings
     parser.add_argument(
         "--loss_type",
         type=str,
         choices=get_loss_choices(),
-        default="emd",
+        default="sinkhorn",
         help="Type of loss function to use",
     )
     parser.add_argument(
@@ -226,6 +239,7 @@ def main() -> None:
         data_path=args.data_path,
         device="cuda" if torch.cuda.is_available() else "cpu",
         num_workers=args.num_workers,
+        seed=args.seed,
     )
 
     # Create a single config from command line arguments
@@ -259,6 +273,7 @@ def main() -> None:
         loss_type=args.loss_type,
         sinkhorn_blur=args.sinkhorn_blur,
         sinkhorn_scaling=args.sinkhorn_scaling,
+        seed=args.seed,
         # Logging parameters
         log_freq=args.log_freq,
         eval_freq=args.eval_freq,

@@ -4,6 +4,7 @@ This module provides dataset classes and utility functions for loading and
 processing POMDP (Partially Observable Markov Decision Process) data.
 """
 
+import json
 from typing import List, Optional, Tuple, Union
 
 import numpy as np
@@ -21,6 +22,7 @@ class POMDPDataset(Dataset):
         weights: Optional[Union[np.ndarray, torch.Tensor]] = None,
         device: str = "cpu",
         particle_scale: float = 1.0,
+        particle_centre: float = 0.0,
     ) -> None:
         """Initialize dataset.
 
@@ -37,6 +39,13 @@ class POMDPDataset(Dataset):
                 once, at construction. Defaults to 1.0 (raw coordinates). Use
                 it to match whatever normalization the downstream consumer of
                 the encoder applies.
+            particle_centre (float, optional): Subtract this from every
+                coordinate BEFORE dividing by particle_scale, i.e. the stored
+                mapping is (x - centre) / scale. Defaults to 0.0. Odd-Even's
+                RL wrapper centres the state range on 0 before the extractor
+                divides, so a dataset of raw states must be centred the same
+                way or the encoder is pretrained one whole unit off the
+                inputs it later receives.
 
         Raises:
             ValueError: If data is empty, has wrong shape, the weights do not
@@ -88,9 +97,15 @@ class POMDPDataset(Dataset):
                 )
 
         particle_scale = float(particle_scale)
+        particle_centre = float(particle_centre)
         if not particle_scale > 0.0:
             raise ValueError(
                 f"particle_scale must be positive, got {particle_scale}")
+        if not np.isfinite(particle_centre):
+            raise ValueError(
+                f"particle_centre must be finite, got {particle_centre}")
+        if particle_centre != 0.0:
+            data = data - particle_centre
         if particle_scale != 1.0:
             data = data / particle_scale
 
@@ -98,6 +113,7 @@ class POMDPDataset(Dataset):
         self.weights = weights
         self.device = device
         self.particle_scale = particle_scale
+        self.particle_centre = particle_centre
 
     @property
     def is_weighted(self) -> bool:
@@ -140,11 +156,33 @@ class POMDPDataset(Dataset):
         return particles, self.weights[idx].to(self.device)
 
 
+def _stored_particle_centre(loaded) -> float:
+    """The centre an .npz records, or 0.0.
+
+    Collectors write it as a top-level ``particle_centre`` array; older
+    Odd-Even datasets carry it only inside the ``metadata`` JSON. Either is
+    honoured, so the datasets already on disk load in the RL frame without
+    being recollected.
+    """
+    if "particle_centre" in loaded:
+        return float(np.asarray(loaded["particle_centre"]).reshape(-1)[0])
+    if "metadata" in loaded:
+        try:
+            meta = json.loads(str(loaded["metadata"]))
+        except (TypeError, ValueError):
+            return 0.0
+        value = meta.get("particle_centre") if isinstance(meta, dict) else None
+        if value is not None:
+            return float(value)
+    return 0.0
+
+
 def get_dataset(
     data_path: str,
     device: str = "cpu",
     load_weights: bool = True,
     particle_scale: Optional[float] = None,
+    particle_centre: Optional[float] = None,
 ) -> POMDPDataset:
     """Load dataset from file.
 
@@ -173,6 +211,9 @@ def get_dataset(
             train the encoder on inputs several times larger than the ones it
             is later handed — the pretrained weights would then be operating
             far outside their trained range. Pass 1.0 to opt out explicitly.
+        particle_centre (float, optional): Subtract this before dividing.
+            None (the default) means "use the centre recorded in the file"
+            (top-level array or metadata JSON), falling back to 0.0.
 
     Returns:
         POMDPDataset: Dataset object.
@@ -180,7 +221,9 @@ def get_dataset(
     loaded = np.load(data_path)
     if isinstance(loaded, np.ndarray):
         scale = 1.0 if particle_scale is None else float(particle_scale)
-        return POMDPDataset(loaded, None, device, particle_scale=scale)
+        centre = 0.0 if particle_centre is None else float(particle_centre)
+        return POMDPDataset(loaded, None, device, particle_scale=scale,
+                            particle_centre=centre)
 
     # NpzFile
     if "particles" in loaded:
@@ -198,7 +241,10 @@ def get_dataset(
         scale = 1.0 if stored is None else float(np.asarray(stored).reshape(-1)[0])
     else:
         scale = float(particle_scale)
-    return POMDPDataset(particles, weights, device, particle_scale=scale)
+    centre = (_stored_particle_centre(loaded) if particle_centre is None
+              else float(particle_centre))
+    return POMDPDataset(particles, weights, device, particle_scale=scale,
+                        particle_centre=centre)
 
 
 def get_data_loader(
@@ -209,6 +255,8 @@ def get_data_loader(
     num_workers: int = 0,
     load_weights: bool = True,
     particle_scale: Optional[float] = None,
+    particle_centre: Optional[float] = None,
+    seed: Optional[int] = None,
 ) -> Tuple[DataLoader, DataLoader, int, int]:
     """Create data loaders for training and evaluation.
 
@@ -242,12 +290,20 @@ def get_data_loader(
     dataset_device = "cpu" if num_workers > 0 else device
     dataset = get_dataset(
         data_path, dataset_device, load_weights=load_weights,
-        particle_scale=particle_scale,
+        particle_scale=particle_scale, particle_centre=particle_centre,
     )
     train_size = int(train_split * len(dataset))
     eval_size = len(dataset) - train_size
 
-    train_dataset, eval_dataset = random_split(dataset, [train_size, eval_size])
+    # An unseeded split gives a different val set on every invocation, so
+    # best_val_loss is not comparable across runs and a resumed run trains on
+    # former val samples. The alignment loss (Phase 2) additionally indexes a
+    # precomputed pairwise-EMD matrix by dataset row, which only works if the
+    # split is reproducible. None keeps torch's global RNG (legacy behaviour).
+    generator = (torch.Generator().manual_seed(int(seed))
+                 if seed is not None else None)
+    train_dataset, eval_dataset = random_split(
+        dataset, [train_size, eval_size], generator=generator)
 
     train_loader = DataLoader(
         train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers
