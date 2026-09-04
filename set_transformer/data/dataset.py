@@ -16,17 +16,31 @@ class POMDPDataset(Dataset):
     """Dataset class for POMDP data."""
 
     def __init__(
-        self, data: Union[np.ndarray, torch.Tensor], device: str = "cpu"
+        self,
+        data: Union[np.ndarray, torch.Tensor],
+        weights: Optional[Union[np.ndarray, torch.Tensor]] = None,
+        device: str = "cpu",
+        particle_scale: float = 1.0,
     ) -> None:
         """Initialize dataset.
 
         Args:
             data (Union[np.ndarray, torch.Tensor]): Data array of shape
                 (num_samples, num_particles, particle_dim).
+            weights (optional): Per-particle mass of shape
+                (num_samples, num_particles), e.g. particle-filter weights.
+                None (the default) means the sets are uniform and each sample
+                is returned as a bare tensor, exactly as before. When given,
+                each sample is returned as a (particles, weights) tuple.
             device (str, optional): Device to store data on. Defaults to "cpu".
+            particle_scale (float, optional): Divide every coordinate by this
+                once, at construction. Defaults to 1.0 (raw coordinates). Use
+                it to match whatever normalization the downstream consumer of
+                the encoder applies.
 
         Raises:
-            ValueError: If data is empty or has wrong shape.
+            ValueError: If data is empty, has wrong shape, the weights do not
+                line up with the particles, or particle_scale is not positive.
         """
         if isinstance(data, np.ndarray):
             data = torch.from_numpy(data).float()
@@ -38,8 +52,67 @@ class POMDPDataset(Dataset):
         if data.size(0) == 0:
             raise ValueError("Data cannot be empty")
 
+        if weights is not None:
+            if isinstance(weights, np.ndarray):
+                weights = torch.from_numpy(weights).float()
+            elif not isinstance(weights, torch.Tensor):
+                raise TypeError("Weights must be numpy array or torch tensor")
+            if weights.dim() != 2:
+                raise ValueError(
+                    f"Weights must have 2 dimensions, got {weights.dim()}"
+                )
+            if weights.shape != data.shape[:2]:
+                raise ValueError(
+                    "Weights must have shape (num_samples, num_particles) "
+                    f"matching the particles {tuple(data.shape[:2])}, got "
+                    f"{tuple(weights.shape)}"
+                )
+            if bool((weights < 0).any()):
+                raise ValueError("Weights must be non-negative")
+            # Caught here, at load, rather than thousands of steps into an
+            # epoch: an optimal-transport loss needs every set to carry
+            # positive, finite mass. A float32 round trip of float64 particle
+            # weights is the realistic way this breaks.
+            if not bool(torch.isfinite(weights).all()):
+                bad = torch.nonzero(~torch.isfinite(weights).all(dim=1))[:5]
+                raise ValueError(
+                    "Weights contain NaN or inf; first offending sample "
+                    f"indices: {bad.flatten().tolist()}"
+                )
+            totals = weights.sum(dim=1)
+            if bool((totals <= 0).any()):
+                bad = torch.nonzero(totals <= 0)[:5]
+                raise ValueError(
+                    "Every particle set must carry positive total weight; "
+                    f"first offending sample indices: {bad.flatten().tolist()}"
+                )
+
+        particle_scale = float(particle_scale)
+        if not particle_scale > 0.0:
+            raise ValueError(
+                f"particle_scale must be positive, got {particle_scale}")
+        if particle_scale != 1.0:
+            data = data / particle_scale
+
         self.data = data
+        self.weights = weights
         self.device = device
+        self.particle_scale = particle_scale
+
+    @property
+    def is_weighted(self) -> bool:
+        """Whether samples carry per-particle mass."""
+        return self.weights is not None
+
+    @property
+    def particle_dim(self) -> int:
+        """Coordinate dimension of a single particle."""
+        return int(self.data.shape[-1])
+
+    @property
+    def num_particles(self) -> int:
+        """Number of particles per set."""
+        return int(self.data.shape[1])
 
     def __len__(self) -> int:
         """Get the total number of samples in the dataset.
@@ -49,30 +122,83 @@ class POMDPDataset(Dataset):
         """
         return len(self.data)
 
-    def __getitem__(self, idx: int) -> torch.Tensor:
+    def __getitem__(
+        self, idx: int
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """Get a sample from the dataset.
 
         Args:
             idx (int): Index of sample to get.
 
         Returns:
-            torch.Tensor: Sample at index idx.
+            The particle set at index idx, or a (particles, weights) tuple
+            when the dataset is weighted.
         """
-        return self.data[idx].to(self.device)
+        particles = self.data[idx].to(self.device)
+        if self.weights is None:
+            return particles
+        return particles, self.weights[idx].to(self.device)
 
 
-def get_dataset(data_path: str, device: str = "cpu") -> POMDPDataset:
+def get_dataset(
+    data_path: str,
+    device: str = "cpu",
+    load_weights: bool = True,
+    particle_scale: Optional[float] = None,
+) -> POMDPDataset:
     """Load dataset from file.
+
+    Two on-disk formats are understood:
+
+    * ``.npy`` — a bare array of shape (num_samples, num_particles, dim).
+      Uniform (unweighted) sets. This is the legacy format.
+    * ``.npz`` — an archive with a ``particles`` array of that same shape and,
+      optionally, a ``weights`` array of shape (num_samples, num_particles).
+      Any other arrays (collection metadata) are ignored here. An unnamed
+      single-array archive is read as particles, for tolerance.
 
     Args:
         data_path (str): Path to data file.
         device (str, optional): Device to store data on. Defaults to "cpu".
+        load_weights (bool, optional): Read the weights when the file has
+            them. Set False to deliberately train on the unweighted set — the
+            ablation, not the default.
+        particle_scale (float, optional): Divide every coordinate by this
+            before training. None (the default) means "use the scale recorded
+            in the file", falling back to 1.0 when there is none.
+
+            This exists because the RL feature extractor normalizes particles
+            by the arena half-width before the encoder sees them. A dataset
+            stores RAW env coordinates, so pretraining on it unscaled would
+            train the encoder on inputs several times larger than the ones it
+            is later handed — the pretrained weights would then be operating
+            far outside their trained range. Pass 1.0 to opt out explicitly.
 
     Returns:
         POMDPDataset: Dataset object.
     """
-    data = np.load(data_path)
-    return POMDPDataset(data, device)
+    loaded = np.load(data_path)
+    if isinstance(loaded, np.ndarray):
+        scale = 1.0 if particle_scale is None else float(particle_scale)
+        return POMDPDataset(loaded, None, device, particle_scale=scale)
+
+    # NpzFile
+    if "particles" in loaded:
+        particles = loaded["particles"]
+    elif len(loaded.files) == 1:
+        particles = loaded[loaded.files[0]]
+    else:
+        raise KeyError(
+            f"{data_path} has no 'particles' array; found {loaded.files}"
+        )
+    weights = loaded["weights"] if (load_weights and "weights" in loaded) else None
+
+    if particle_scale is None:
+        stored = loaded["particle_scale"] if "particle_scale" in loaded else None
+        scale = 1.0 if stored is None else float(np.asarray(stored).reshape(-1)[0])
+    else:
+        scale = float(particle_scale)
+    return POMDPDataset(particles, weights, device, particle_scale=scale)
 
 
 def get_data_loader(
@@ -81,6 +207,8 @@ def get_data_loader(
     device: str,
     train_split: float = 0.8,
     num_workers: int = 0,
+    load_weights: bool = True,
+    particle_scale: Optional[float] = None,
 ) -> Tuple[DataLoader, DataLoader, int, int]:
     """Create data loaders for training and evaluation.
 
@@ -106,7 +234,16 @@ def get_data_loader(
     if not 0 < train_split < 1:
         raise ValueError("Train split must be between 0 and 1")
 
-    dataset = get_dataset(data_path, device)
+    # POMDPDataset moves each sample to `device` in __getitem__, which happens
+    # inside the worker process. With CUDA and forked workers that raises
+    # "Cannot re-initialize CUDA in forked subprocess" as soon as the parent
+    # has touched CUDA. Workers therefore build CPU samples; the training loop
+    # moves each batch to the device anyway, so nothing downstream changes.
+    dataset_device = "cpu" if num_workers > 0 else device
+    dataset = get_dataset(
+        data_path, dataset_device, load_weights=load_weights,
+        particle_scale=particle_scale,
+    )
     train_size = int(train_split * len(dataset))
     eval_size = len(dataset) - train_size
 

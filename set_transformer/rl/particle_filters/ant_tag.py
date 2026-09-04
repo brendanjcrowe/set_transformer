@@ -1,5 +1,4 @@
 import numpy as np
-from filterpy.monte_carlo import systematic_resample
 
 from .base import BaseParticleFilter  # Use relative import
 
@@ -17,6 +16,7 @@ class AntTagParticleFilter(BaseParticleFilter):
                  target_step: float = 0.5,
                  visibility_radius: float = 3.0,
                  min_initial_distance: float = 5.0,
+                 rng_seed: int | None = None,
                  **kwargs # To accommodate other BaseParticleFilter args
                  ):
         """
@@ -29,7 +29,16 @@ class AntTagParticleFilter(BaseParticleFilter):
             target_step: Step size of target movement (matches env's target_step).
             visibility_radius: Radius within which the target is considered visible.
             min_initial_distance: Minimum initial ant-target distance from env reset.
+            rng_seed: Optional seed for a filter-owned random stream. When
+                omitted, retain the historical process-global ``np.random``
+                behavior for backwards compatibility. Training wrappers pass
+                an explicit per-worker/per-episode seed.
         """
+        self.rng_seed = None if rng_seed is None else int(rng_seed)
+        self._rng = (
+            np.random if self.rng_seed is None
+            else np.random.RandomState(self.rng_seed)
+        )
         self.arena_min, self.arena_max = arena_limits
         self.obs_noise_std = obs_noise_std
         self.target_step = target_step
@@ -53,7 +62,7 @@ class AntTagParticleFilter(BaseParticleFilter):
 
         while filled < self.num_particles:
             batch_size = max(2 * (self.num_particles - filled), self.num_particles)
-            candidates = np.random.uniform(
+            candidates = self._rng.uniform(
                 self.arena_min,
                 self.arena_max,
                 (batch_size, self.particle_dim),
@@ -95,7 +104,7 @@ class AntTagParticleFilter(BaseParticleFilter):
         stay = np.zeros_like(target2ant)
 
         # Randomly choose one of the 4 options per particle (uniform 25% each)
-        choices = np.random.randint(0, 4, size=n)
+        choices = self._rng.randint(0, 4, size=n)
 
         directions = np.where(
             (choices == 0)[:, None], perp_left,
@@ -173,7 +182,15 @@ class AntTagParticleFilter(BaseParticleFilter):
             return
         if alive.sum() == 0:
             # Degenerate case: all particles are dead — fall back to full resample
-            indices = systematic_resample(self._weights)
+            # Local-RNG version of FilterPy's systematic_resample. Using the
+            # library helper here would silently consume process-global random
+            # state and break per-worker reproducibility in this rare branch.
+            positions = (
+                self._rng.random_sample() + np.arange(self.num_particles)
+            ) / self.num_particles
+            indices = np.searchsorted(
+                np.cumsum(self._weights), positions, side="left")
+            indices = np.minimum(indices, self.num_particles - 1)
             self._particles = self._particles[indices]
             self._weights = np.ones(self.num_particles) / self.num_particles
             return
@@ -181,12 +198,13 @@ class AntTagParticleFilter(BaseParticleFilter):
         # Draw donors from alive particles proportional to their weights
         alive_weights = self._weights[alive]
         alive_probs = alive_weights / alive_weights.sum()
-        donor_idx = np.random.choice(
+        donor_idx = self._rng.choice(
             np.where(alive)[0], size=n_dead, p=alive_probs
         )
 
         # Replace dead particles with noisy copies of donors
-        noise = np.random.normal(0, self.target_step * 0.5, (n_dead, self._particle_dim))
+        noise = self._rng.normal(
+            0, self.target_step * 0.5, (n_dead, self._particle_dim))
         self._particles[dead] = self._particles[donor_idx] + noise
         self._particles = np.clip(self._particles, self.arena_min, self.arena_max)
 
@@ -266,7 +284,7 @@ class SmartAntTagParticleFilter(AntTagParticleFilter):
         p_side = (1.0 - p_flee - p_stay) / 2.0
         cum_probs = np.stack([p_side, 2 * p_side, 2 * p_side + p_flee, np.ones_like(p_flee)], axis=1)
 
-        u = np.random.rand(self.num_particles, 1)
+        u = self._rng.rand(self.num_particles, 1)
         choices = (u > cum_probs).sum(axis=1)
 
         directions = np.where(
@@ -350,7 +368,8 @@ class GhostAntTagParticleFilter(SmartAntTagParticleFilter):
             n_birth = self.N_BIRTH
             idx = np.argsort(self._weights)[:n_birth]
             self._particles[idx] = np.clip(
-                ghost_ping + np.random.normal(0.0, ping_sigma, (n_birth, self._particle_dim)),
+                ghost_ping + self._rng.normal(
+                    0.0, ping_sigma, (n_birth, self._particle_dim)),
                 self.arena_min, self.arena_max,
             )
             keep = np.ones(self.num_particles, dtype=bool)
@@ -430,7 +449,7 @@ class TwinDenAntTagParticleFilter(SmartAntTagParticleFilter):
         cum_probs = np.stack(
             [p_side, 2 * p_side, 2 * p_side + p_flee, np.ones_like(p_flee)],
             axis=1)
-        u = np.random.rand(n, 1)
+        u = self._rng.rand(n, 1)
         choices = (u > cum_probs).sum(axis=1)
         directions = np.where(
             (choices == 0)[:, None], perp_left,
@@ -501,8 +520,8 @@ class CounterweightedDenAntTagParticleFilter(SmartAntTagParticleFilter):
     def _sample_in_disc(self, centers: np.ndarray) -> np.ndarray:
         """One uniform-in-disc(radius cden_r) draw per row of `centers`."""
         n = centers.shape[0]
-        rr = self.cden_r * np.sqrt(np.random.rand(n))
-        th = np.random.uniform(0.0, 2.0 * np.pi, n)
+        rr = self.cden_r * np.sqrt(self._rng.rand(n))
+        th = self._rng.uniform(0.0, 2.0 * np.pi, n)
         return centers + rr[:, None] * np.stack([np.cos(th), np.sin(th)],
                                                 axis=1)
 
@@ -515,7 +534,7 @@ class CounterweightedDenAntTagParticleFilter(SmartAntTagParticleFilter):
         Marginalizing over the (uniform) mirror bit is exactly this."""
         w = self.cden_w_heavy
         probs = np.array([w / 2.0, w / 2.0, (1 - w) / 2.0, (1 - w) / 2.0])
-        pick = np.random.choice(4, size=self.num_particles, p=probs)
+        pick = self._rng.choice(4, size=self.num_particles, p=probs)
         self._particles = self._sample_in_disc(self.cden_candidates[pick])
         self._weights = np.ones(self.num_particles) / self.num_particles
         self._needs_prior_init = True
@@ -524,7 +543,7 @@ class CounterweightedDenAntTagParticleFilter(SmartAntTagParticleFilter):
     def _condition_on_mirror_bit(self, heavy_pos, light_pos, w_heavy):
         """First-predict stage 2: collapse the four-candidate marginal prior
         onto the two ACTUAL discs, heavy with probability w_heavy."""
-        take_heavy = np.random.rand(self.num_particles) < float(w_heavy)
+        take_heavy = self._rng.rand(self.num_particles) < float(w_heavy)
         centers = np.where(take_heavy[:, None], heavy_pos[None, :],
                            light_pos[None, :])
         self._particles = self._sample_in_disc(centers)
@@ -629,7 +648,7 @@ class CounterweightedDenAntTagParticleFilter(SmartAntTagParticleFilter):
             [p_side, 2 * p_side, 2 * p_side + p_flee,
              2 * p_side + p_flee + p_toward, np.ones_like(p_flee)],
             axis=1)
-        u = np.random.rand(n, 1)
+        u = self._rng.rand(n, 1)
         choices = (u > cum_probs).sum(axis=1)
         directions = np.where(
             (choices == 0)[:, None], perp_left,

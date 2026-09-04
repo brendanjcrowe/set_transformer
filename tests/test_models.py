@@ -397,3 +397,33 @@ def test_deep_set_vqvae_shapes_and_grad(
     enc_param = next(model.encoder.parameters())
     assert enc_param.grad is not None
     assert enc_param.grad.abs().sum().item() > 0
+
+
+def test_pf_set_transformer_asymmetric_output_dim():
+    """Encoder may read a mass channel the decoder does not reconstruct.
+
+    Weighted pretraining feeds D coordinates plus a mass channel and asks for
+    D coordinates back; the mass belongs to the loss's target measure, not to
+    the reconstructed points.
+    """
+    model = PFSetTransformer(
+        num_particles=32,
+        dim_particles=3,
+        num_encodings=8,
+        dim_encoder=8,
+        dim_output_particles=2,
+    )
+    out = model(torch.randn(4, 32, 3))
+
+    assert out.shape == torch.Size([4, 32, 2])
+    assert model.dim_particles == 3
+    assert model.dim_output_particles == 2
+
+
+def test_pf_set_transformer_defaults_to_symmetric():
+    """Omitting dim_output_particles keeps the original autoencoder shape."""
+    model = PFSetTransformer(
+        num_particles=32, dim_particles=4, num_encodings=8, dim_encoder=2
+    )
+    assert model(torch.randn(2, 32, 4)).shape == torch.Size([2, 32, 4])
+

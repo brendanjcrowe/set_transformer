@@ -100,7 +100,7 @@ def main() -> None:
     parser.add_argument(
         "--sinkhorn_blur",
         type=float,
-        default=0.5,
+        default=0.05,
         help="Blur parameter for Sinkhorn loss",
     )
     parser.add_argument(

@@ -57,8 +57,9 @@ class DenseRewardWrapper(gym.Wrapper):
         # Dense reward: positive when getting closer
         dense_reward = self._prev_distance - curr_distance
 
-        # Bonus for tagging (original env sets terminated=True on tag)
-        if terminated:
+        # Bonus for tagging.  Legacy envs only terminate on a tag; newer
+        # commitment variants publish is_success=False for terminal hazards.
+        if info.get("is_success", terminated):
             dense_reward += 10.0
 
         self._prev_distance = curr_distance

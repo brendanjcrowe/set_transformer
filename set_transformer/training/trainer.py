@@ -132,6 +132,17 @@ class Trainer:
             num_heads=self.config.num_heads,
             ln=self.config.use_layer_norm,
         )
+        if self.config.weighted_particles:
+            if self.config.model_type != "pf_st":
+                raise ValueError(
+                    "weighted_particles=True is implemented for "
+                    "model_type='pf_st' only; the other architectures tie the "
+                    f"decoder output dim to the encoder input dim (got "
+                    f"model_type={self.config.model_type!r})"
+                )
+            # Encoder reads [coords..., mass]; decoder still emits coords only.
+            common["dim_particles"] = self.config.dim_particles + 1
+            common["dim_output_particles"] = self.config.dim_particles
         if self.config.model_type == "pf_st":
             model = PFSetTransformer(**common)
         elif self.config.model_type == "set_vae":
@@ -195,11 +206,15 @@ class Trainer:
         elif self.config.loss_type == "chamfer":
             return ChamferDistanceLoss()
         elif self.config.loss_type == "sinkhorn":
+            # sinkhorn_scaling used to be collected on two CLIs, stored in the
+            # config and written into every checkpoint without ever reaching
+            # geomloss. It is forwarded now.
             return SinkhornLoss(
                 blur=self.config.sinkhorn_blur,
+                scaling=self.config.sinkhorn_scaling,
             )
         elif self.config.loss_type == "hausdorff":
-            return HausdorffLoss()
+            return HausdorffLoss(blur=self.config.sinkhorn_blur)
         else:
             raise ValueError(f"Unknown loss type: {self.config.loss_type}")
 
@@ -280,6 +295,38 @@ class Trainer:
             self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
         self.best_val_loss = checkpoint["best_val_loss"]
 
+    def _split_batch(self, batch):
+        """Return (particles, weights) on the training device.
+
+        A weighted dataset yields (particles, weights) pairs; an unweighted one
+        yields a bare tensor and weights is None.
+        """
+        if isinstance(batch, (tuple, list)):
+            particles, weights = batch
+            return (particles.to(self.config.device),
+                    weights.to(self.config.device))
+        return batch.to(self.config.device), None
+
+    def _model_input(self, particles, weights):
+        """Build the encoder input.
+
+        In weighted mode the mass is appended as one extra input channel,
+        scaled by the particle count so a uniform belief feeds 1.0 rather than
+        1/N. That keeps the channel on the same order as normalized
+        coordinates. The mass is an INPUT to the encoder only; it never appears
+        in the reconstruction target, where it acts as the measure's weights.
+        """
+        if weights is None or not self.config.weighted_particles:
+            return particles
+        # Sanitize exactly as the RL feature extractor does, so the encoder
+        # sees the same channel at pretraining time and at RL time.
+        clean = torch.clamp(
+            torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0), min=0.0
+        )
+        clean = clean / (clean.sum(dim=-1, keepdim=True) + 1e-8)
+        scaled = (clean * clean.shape[-1]).unsqueeze(-1)
+        return torch.cat([particles, scaled], dim=-1)
+
     def _split_output(self, output):
         """Return (recon, aux_dict) regardless of whether the model returned a
         plain tensor or a dict of components."""
@@ -290,13 +337,24 @@ class Trainer:
             recon, aux = output, {}
         return recon, aux
 
-    def _compose_loss(self, recon, target, aux):
+    def _compose_loss(self, recon, target, aux, target_weights=None):
         """Compose total loss from reconstruction + weighted auxiliary terms.
+
+        `target_weights` turns the reconstruction term into a comparison of
+        MEASURES: the weighted empirical belief sum_i w_i delta(x_i) against
+        the uniform reconstruction. It is passed straight through to the loss,
+        so a loss with no weighted formulation (Chamfer) raises rather than
+        quietly optimizing something else.
 
         Returns (total_loss, components_dict) where components is per-term
         scalar floats for logging.
         """
-        recon_loss = self.train_loss(recon, target)
+        if target_weights is None:
+            recon_loss = self.train_loss(recon, target)
+        else:
+            recon_loss = self.train_loss(
+                recon, target, None, target_weights
+            )
         total = recon_loss
         components = {"recon": recon_loss.item()}
         if "kl" in aux:
@@ -320,13 +378,15 @@ class Trainer:
         num_batches = 0
 
         for batch in self.train_loader:
-            batch = batch.to(self.config.device)
+            particles, weights = self._split_batch(batch)
 
             # Forward pass
             self.optimizer.zero_grad()
-            output = self.model(batch)
+            output = self.model(self._model_input(particles, weights))
             recon, aux = self._split_output(output)
-            loss, components = self._compose_loss(recon, batch, aux)
+            loss, components = self._compose_loss(
+                recon, particles, aux, target_weights=weights
+            )
 
             # Backward pass
             loss.backward()
@@ -384,7 +444,9 @@ class Trainer:
                 )
 
                 # Save visualization
-                self._save_visualization(batch, recon)
+                # Coordinates only: the plot compares reconstructed
+                # points against the input points, not their mass.
+                self._save_visualization(particles, recon)
 
                 # Save checkpoint if best
                 if val_loss < self.best_val_loss:
@@ -415,16 +477,20 @@ class Trainer:
 
         with torch.no_grad():
             for batch in self.val_loader:
-                batch = batch.to(self.config.device)
-                output = self.model(batch)
+                particles, weights = self._split_batch(batch)
+                output = self.model(self._model_input(particles, weights))
                 recon, aux = self._split_output(output)
 
                 # Calculate validation loss (using training loss)
-                loss, _ = self._compose_loss(recon, batch, aux)
+                loss, _ = self._compose_loss(
+                    recon, particles, aux, target_weights=weights
+                )
                 total_loss += loss.item()
 
-                # Calculate Earth Mover Distance on reconstruction (always)
-                emd = self.eval_loss(recon, batch)
+                # Calculate Earth Mover Distance on reconstruction (always).
+                # EMD is weight-aware, so the metric stays comparable with the
+                # training objective in weighted mode.
+                emd = self.eval_loss(recon, particles, None, weights)
                 total_emd += emd.item()
 
                 num_batches += 1
@@ -516,6 +582,15 @@ class Trainer:
                 },
                 step=self.global_step,
             )
+
+        # Always leave a checkpoint behind. Checkpoints are otherwise written
+        # only at save_freq / eval_freq boundaries, so a run with fewer total
+        # steps than save_freq (the default is 5000) reported "Training
+        # completed!" and exited having saved NOTHING -- and the next pipeline
+        # stage takes a checkpoint path as input.
+        self.save_checkpoint()
+        self.logger.info(
+            f"Final checkpoint saved to {self.exp_config.checkpoint_dir}")
 
         self.logger.info("Training completed!")
         wandb.finish()

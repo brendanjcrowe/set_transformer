@@ -46,7 +46,10 @@ class FullyObservableWrapper(gym.Wrapper):
 
         # Dense reward: positive when getting closer
         dense_reward = self._prev_distance - curr_distance
-        if terminated:
+        # Legacy AntTag variants only terminate on a tag.  Commitment-task
+        # variants can also terminate on a phantom-den failure and publish an
+        # explicit success bit so that failure never receives the tag bonus.
+        if info.get("is_success", terminated):
             dense_reward += 10.0
 
         self._prev_distance = curr_distance

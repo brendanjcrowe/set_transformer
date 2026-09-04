@@ -12,8 +12,18 @@ Usage:
         --algorithm PPO --total_timesteps 2000000 --n_envs 4
 """
 
+import sys
 import argparse
 import os
+from pathlib import Path
+
+# Same bootstrap as the rest of this directory: put the package root on
+# sys.path so `set_transformer` resolves to the package, not the submodule
+# directory of the same name.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
 
 import gymnasium as gym
 import matplotlib
@@ -197,7 +207,12 @@ class PFRewardShapingWrapper(gym.Wrapper):
 
         distance_reward = self.distance_coeff * (-dist_to_mean)
         entropy_reward = self.entropy_coeff * (-entropy)
-        tag_bonus = self.tag_bonus_coeff if terminated else 0.0
+        # Historically every base AntTag termination was a successful tag.
+        # New variants may also terminate on an explicit failure state, in
+        # which case the environment publishes is_success=False.  The fallback
+        # preserves behavior for every legacy environment.
+        is_success = bool(info.get("is_success", terminated))
+        tag_bonus = self.tag_bonus_coeff if is_success else 0.0
 
         shaped_reward = reward + distance_reward + entropy_reward + tag_bonus
         info["distance_reward"] = distance_reward

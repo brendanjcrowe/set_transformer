@@ -29,6 +29,15 @@ class TrainingConfig:
     num_heads: int = 4
     use_layer_norm: bool = True
 
+    # Weighted particle sets (option B: mass in the measure, not the metric).
+    # `dim_particles` always means the COORDINATE dimension D of a particle.
+    # With weighted_particles=True the encoder additionally reads a mass
+    # channel, so its input is D+1 while the decoder still reconstructs D
+    # coordinates, and the reconstruction loss compares the weighted target
+    # measure against the uniform reconstruction. Requires model_type "pf_st"
+    # and a loss that accepts weights (sinkhorn / hausdorff / emd).
+    weighted_particles: bool = False
+
     # VAE-specific (ignored unless model_type == "set_vae")
     kl_weight: float = 1.0
 
@@ -49,9 +58,16 @@ class TrainingConfig:
     warmup_epochs: int = 10
     min_lr: float = 1e-6
 
-    # Loss parameters
-    loss_type: str = "hausdorff"  # ["hausdorff", "chamfer", "sinkhorn"]
-    sinkhorn_blur: float = 0.5
+    # Loss parameters.
+    # Sinkhorn is the default: it is the only differentiable loss here that
+    # accepts weighted measures, and unlike Chamfer it is an actual metric
+    # between point distributions. ("hausdorff" was the old default and is
+    # broken upstream in geomloss, which needs a kernel name it is never given.)
+    loss_type: str = "sinkhorn"  # ["sinkhorn", "chamfer", "emd", "hausdorff"]
+    # Blur is in COORDINATE UNITS: the length scale below which the loss stops
+    # telling points apart. Set it well under the smallest belief structure you
+    # need resolved (e.g. a den of radius 0.4 needs blur << 0.4).
+    sinkhorn_blur: float = 0.05
     sinkhorn_scaling: float = 0.5
 
     # Hardware
@@ -148,7 +164,7 @@ def get_default_training_configs() -> List[TrainingConfig]:
         loss_type="sinkhorn",
         batch_size=32,
         learning_rate=1e-3,
-        sinkhorn_blur=0.5,
+        sinkhorn_blur=0.05,
         sinkhorn_scaling=0.5,
     )
     configs.append(sinkhorn_config)

@@ -50,6 +50,7 @@ Usage:
 
 import argparse
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -150,6 +151,107 @@ def _nearest_candidate(x, cands=CDEN_CANDIDATES):
     """x: [B, N, 2] -> (candidate_idx [B, N], dist [B, N])."""
     d = np.linalg.norm(x[:, :, None, :] - cands[None, None, :, :], axis=3)
     return np.argmin(d, axis=2), np.min(d, axis=2)
+
+
+def feats_st(x, w, checkpoint, source="pretrain", weight_channel=True,
+              num_heads=4, batch=4096):
+    """Run a REAL Set Transformer encoder over the beliefs and return its
+    features, so the probe measures the ST arm's actual capacity.
+
+    Unlike the numpy mirrors above, this loads trained weights. Two sources:
+
+      "pretrain"  a 3_train_st.py checkpoint (PFSetTransformer state_dict).
+                  Answers "can a linear readout of the PRETRAINED encoding
+                  recover the bit?" -- i.e. is a frozen/finetuned RL arm
+                  being handed a representation that contains the bit at all?
+      "policy"    an SB3 .zip from 4_train_rl_st.py. Pulls the encoder out of
+                  the saved policy, so a collapsed encoder can be MEASURED
+                  rather than inferred from feat_std_mean.
+
+    `x` must already be normalized the way the RL extractor normalizes
+    (particles / arena_scale), because that is the input range the encoder
+    was trained on.
+    """
+    import torch
+    from set_transformer.models.pf_set_transformer import PFSetTransformer
+
+    if source == "pretrain":
+        ck = torch.load(checkpoint, map_location="cpu", weights_only=False)
+        cfg = ck["config"]
+        model = PFSetTransformer(
+            num_particles=cfg.num_particles,
+            dim_particles=cfg.dim_particles + (1 if cfg.weighted_particles else 0),
+            num_encodings=cfg.num_encodings, dim_encoder=cfg.dim_encoder,
+            num_inds=cfg.num_inds, dim_hidden=cfg.dim_hidden,
+            num_heads=cfg.num_heads, ln=cfg.use_layer_norm,
+            dim_output_particles=cfg.dim_particles)
+        model.load_state_dict(ck["model_state_dict"])
+        encoder = model.set_transformer
+        weight_channel = bool(cfg.weighted_particles)
+    elif source == "policy":
+        from stable_baselines3.common.save_util import load_from_zip_file
+        _, params, _ = load_from_zip_file(checkpoint, load_data=False,
+                                          device="cpu")
+        sd = params["policy"]
+        # SetTransformerFeaturesExtractor holds the encoder as `self.encoder`;
+        # 3_train_st.py's PFSetTransformer calls the same module
+        # `set_transformer`. Accept either so both sources work.
+        for prefix in ("features_extractor.encoder.",
+                       "features_extractor.set_transformer."):
+            enc_sd = {k[len(prefix):]: v for k, v in sd.items()
+                      if k.startswith(prefix)}
+            if enc_sd:
+                break
+        if not enc_sd:
+            raise SystemExit(f"No encoder keys in {checkpoint}; is this an "
+                             "ST-arm policy?")
+        # Shapes recover the geometry, so no config file is needed.
+        # ISAB's mab0 attends inducing points (queries) over the input set
+        # (keys/values), so fc_q maps hidden->hidden and only fc_k/fc_v carry
+        # the true per-particle input dim. Reading fc_q here yields dim_hidden
+        # and silently builds the wrong encoder.
+        dim_in = enc_sd["enc.0.mab0.fc_k.weight"].shape[1]
+        from set_transformer.models.set_transformer import SetTransformer
+        # The final decoder Linear index differs between builds (the RL arm's
+        # SetTransformer has one fewer SAB than 3_train_st.py's), so find it
+        # rather than hardcoding dec.N.
+        dec_linears = sorted(
+            int(k.split(".")[1]) for k in enc_sd
+            if re.fullmatch(r"dec\.\d+\.weight", k))
+        if not dec_linears:
+            raise SystemExit(f"No dec.N.weight in {checkpoint}")
+        n_out = enc_sd["dec.0.S"].shape[1]
+        dim_out = enc_sd[f"dec.{dec_linears[-1]}.weight"].shape[0]
+        num_heads_hint = num_heads
+        dim_hidden = enc_sd["enc.0.mab0.fc_q.weight"].shape[0]
+        num_inds = enc_sd["enc.0.I"].shape[1]
+        # num_heads is not recoverable from shapes (MAB splits dim_hidden
+        # across heads), so take it from the RL arm's default. A wrong value
+        # would change the attention split silently, so assert the load is
+        # strict below rather than tolerating a mismatch.
+        encoder = SetTransformer(dim_in, num_outputs=n_out, dim_output=dim_out,
+                                 num_inds=num_inds, dim_hidden=dim_hidden,
+                                 num_heads=num_heads_hint, ln=True)
+        encoder.load_state_dict(enc_sd)
+        weight_channel = dim_in > x.shape[2]
+    else:
+        raise ValueError(source)
+
+    encoder.eval()
+    xs = torch.from_numpy(np.asarray(x, dtype=np.float32))
+    if weight_channel:
+        # Identical sanitization to SetTransformerFeaturesExtractor.forward
+        # and Trainer._model_input: clamp, renormalize, scale by N.
+        wt = torch.from_numpy(np.asarray(w, dtype=np.float32))
+        wt = torch.clamp(torch.nan_to_num(wt), min=0.0)
+        wt = wt / (wt.sum(dim=1, keepdim=True) + 1e-8)
+        xs = torch.cat([xs, (wt * wt.shape[1]).unsqueeze(-1)], dim=-1)
+
+    out = []
+    with torch.no_grad():
+        for i in range(0, len(xs), batch):
+            out.append(encoder(xs[i:i + batch]).flatten(1).numpy())
+    return np.concatenate(out, axis=0)
 
 
 def feats_oracle3(x, w, slack=0.3):
@@ -677,6 +779,10 @@ def probe(args):
         "CGF_SPREAD64": _cgf(xs, weights, t_sp),
         "ORACLE3": feats_oracle3(particles, weights),
     }
+    if args.st_checkpoint:
+        feature_sets["ST64"] = feats_st(
+            xs, weights, args.st_checkpoint, source=args.st_source)
+        print(f"  ST64 from {args.st_source}: {args.st_checkpoint}")
     # NOTE (differs from the Twin-Den probe, deliberately): ant_pos is NOT
     # concatenated by default here.
     #
@@ -843,6 +949,18 @@ def build_parser():
     q.add_argument("--den_margin", type=float, default=0.3,
                    help="Ant must be farther than spook_radius + this from "
                         "BOTH actual den centers.")
+    q.add_argument("--st_checkpoint", type=str, default=None,
+                   help="Add an ST64 feature set by running a REAL Set "
+                        "Transformer encoder over the beliefs. Either a "
+                        "3_train_st.py checkpoint or an SB3 policy .zip; see "
+                        "--st_source.")
+    q.add_argument("--st_source", choices=["pretrain", "policy"],
+                   default="pretrain",
+                   help="'pretrain': --st_checkpoint is a 3_train_st.py "
+                        "checkpoint. 'policy': it is a 4_train_rl_st.py SB3 "
+                        ".zip and the encoder is pulled out of the policy, "
+                        "which is how a collapsed encoder gets measured "
+                        "instead of inferred.")
     q.set_defaults(func=probe)
 
     return p

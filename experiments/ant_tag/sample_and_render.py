@@ -15,6 +15,16 @@ Usage:
         --n_episodes 2 \
         --output_dir trajectory_renders/v2_final
 """
+
+import sys
+from pathlib import Path
+
+# Same bootstrap as the rest of this directory: put the package root on
+# sys.path so `set_transformer` resolves to the package, not the submodule
+# directory of the same name.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 import argparse
 import importlib
 import os

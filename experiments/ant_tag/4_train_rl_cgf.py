@@ -11,10 +11,12 @@ where x_i is the target-position particle and w_i is its particle-filter weight.
 """
 
 import argparse
+import hashlib
 import importlib
 import json
 import os
 import re
+import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -39,8 +41,25 @@ from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize
 
 import pdomains  # noqa: F401 - registers pdomains-ant-tag-v0
+import variants  # noqa: E402 - env/filter/subdir registry
 from set_transformer.rl.particle_filters.ant_tag import AntTagParticleFilter
 from set_transformer.rl.wrappers.particle_filter import _call_pf_interaction_mapper
+
+# The belief-encoder pieces below now live in the shared package so a second
+# domain can use them without importing an Ant-Tag script. They are re-exported
+# here, unchanged and as the SAME objects, because SB3 pickles a policy's
+# features-extractor CLASS into the saved zip by module path: loading an
+# existing checkpoint runs
+# getattr(import_module("4_train_rl_cgf"), "WeightedCGFFeaturesExtractor").
+# 4_train_rl_st.py and 4_train_rl_gaussian.py also read all three off this
+# module by name.
+from set_transformer.rl.feature_extractors.cgf import (  # noqa: E402
+    TNormLoggingCallback,
+    WeightedCGFFeaturesExtractor,
+)
+from set_transformer.rl.wrappers.particle_filter import (  # noqa: E402
+    PFDictWithWeightsObservationWrapper,
+)
 
 
 # Reuse the existing AntTag curriculum/PF utilities without touching ST code.
@@ -90,235 +109,6 @@ def get_env_visible_radius(env_id: str = "pdomains-ant-tag-v0") -> float:
         return float(env.unwrapped.visible_radius)
     finally:
         env.close()
-
-
-class PFDictWithWeightsObservationWrapper(gym.Wrapper):
-    """Dict observation wrapper exposing PF particles and PF weights."""
-
-    def __init__(
-        self,
-        env: gym.Env,
-        particle_filter_class,
-        particle_filter_kwargs: dict,
-        num_particles: int,
-        pf_interaction_mapper=None,
-        obs_mask_indices: list[int] | None = None,
-    ):
-        super().__init__(env)
-        self.particle_filter_class = particle_filter_class
-        self.particle_filter_kwargs = particle_filter_kwargs
-        self.num_particles = num_particles
-        self.pf_interaction_mapper = pf_interaction_mapper
-        self.obs_mask_indices = obs_mask_indices
-        self.particle_filter = None
-        self._last_base_env_obs_float = None
-
-        temp_obs, _ = self.env.reset()
-        temp_pf_kwargs = particle_filter_kwargs.copy()
-        temp_pf_kwargs["initial_env_obs"] = temp_obs
-        temp_pf = particle_filter_class(num_particles=num_particles, **temp_pf_kwargs)
-        self.particle_dim = temp_pf.particle_dim
-        del temp_pf
-        self.env.reset()
-
-        self.observation_space = gym.spaces.Dict({
-            "obs": self.env.observation_space,
-            "particles": gym.spaces.Box(
-                low=-np.inf,
-                high=np.inf,
-                shape=(self.num_particles, self.particle_dim),
-                dtype=np.float32,
-            ),
-            "weights": gym.spaces.Box(
-                low=0.0,
-                high=1.0,
-                shape=(self.num_particles,),
-                dtype=np.float32,
-            ),
-        })
-
-    def reset(self, **kwargs):
-        base_env_obs, info = self.env.reset(**kwargs)
-        base_env_obs_float = base_env_obs.astype(np.float32)
-
-        pf_init_kwargs = self.particle_filter_kwargs.copy()
-        pf_init_kwargs["initial_env_obs"] = base_env_obs_float
-        self.particle_filter = self.particle_filter_class(
-            num_particles=self.num_particles,
-            **pf_init_kwargs,
-        )
-        self._last_base_env_obs_float = base_env_obs_float.copy()
-        return self._get_dict_obs(base_env_obs_float), info
-
-    def step(self, action):
-        previous_base_env_obs = self._last_base_env_obs_float
-        base_env_obs, reward, terminated, truncated, info = self.env.step(action)
-        base_env_obs_float = base_env_obs.astype(np.float32)
-
-        predict_call_kwargs = {}
-        update_call_kwargs = {}
-        if self.pf_interaction_mapper is not None:
-            mapped_args = _call_pf_interaction_mapper(
-                self.pf_interaction_mapper,
-                base_env_obs=base_env_obs_float,
-                base_env_info=info,
-                base_env_action=action,
-                unwrapped_env=self.env.unwrapped,
-                previous_base_env_obs=previous_base_env_obs,
-            )
-            predict_call_kwargs = mapped_args.get("predict_args", {})
-            update_call_kwargs = mapped_args.get("update_args", {})
-
-        self.particle_filter.predict(action, **predict_call_kwargs)
-        if self.pf_interaction_mapper is not None:
-            self.particle_filter.update(**update_call_kwargs)
-        else:
-            self.particle_filter.update(base_env_obs_float)
-
-        self._last_base_env_obs_float = base_env_obs_float.copy()
-        return self._get_dict_obs(base_env_obs_float), reward, terminated, truncated, info
-
-    def _get_dict_obs(self, base_env_obs: np.ndarray) -> dict:
-        agent_obs = base_env_obs
-        if self.obs_mask_indices is not None:
-            agent_obs = base_env_obs.copy()
-            agent_obs[self.obs_mask_indices] = 0.0
-        return {
-            "obs": agent_obs.astype(np.float32),
-            "particles": self.particle_filter.particles.astype(np.float32),
-            "weights": self.particle_filter.weights.astype(np.float32),
-        }
-
-
-class TNormLoggingCallback(BaseCallback):
-    """Log the distribution of ||t_j|| every rollout.
-
-    The Twin-Den probe found CGF's advantage needs ||t_j|| ~ 10x the 0.1
-    legacy init scale, so whether PPO actually grows t is a first-class
-    experimental question. Quantiles land in TensorBoard as
-    cgf/t_norm_q{0,25,50,75,90,100}. No-op (and free) for encoders without
-    t_values, e.g. the Gaussian arm; a FLAT line is the expected, built-in
-    sanity check for the frozen arm.
-    """
-
-    def _on_step(self) -> bool:  # required abstract method
-        return True
-
-    def _on_rollout_end(self) -> None:
-        extractor = getattr(self.model.policy, "features_extractor", None)
-        t = getattr(extractor, "t_values", None)
-        if t is None:
-            return
-        with torch.no_grad():
-            norms = torch.linalg.norm(t.detach(), dim=1).cpu().numpy()
-        for q in (0, 25, 50, 75, 90, 100):
-            self.logger.record(f"cgf/t_norm_q{q}",
-                               float(np.percentile(norms, q)))
-
-
-class WeightedCGFFeaturesExtractor(BaseFeaturesExtractor):
-    """SB3 feature extractor for weighted empirical CGF particle features."""
-
-    def __init__(
-        self,
-        observation_space: gym.spaces.Dict,
-        num_cgf_features: int = 64,
-        arena_scale: float = 4.5,
-        t_init_mode: str = "linspace_first_dim",
-        t_init_scale: float = 0.1,
-        t_clamp: float = 2.0,
-        exp_arg_clamp: float = 20.0,
-        t_frozen: bool = False,
-    ):
-        obs_dim = observation_space["obs"].shape[0]
-        particle_dim = observation_space["particles"].shape[1]
-        super().__init__(observation_space, features_dim=obs_dim + num_cgf_features)
-
-        self.num_cgf_features = num_cgf_features
-        self.particle_dim = particle_dim
-        self.arena_scale = arena_scale
-        self.t_clamp = t_clamp
-        self.exp_arg_clamp = exp_arg_clamp
-
-        if t_init_mode == "linspace_all_dims":
-            # Round-robin the linspace directions across every particle
-            # dimension so each coordinate (not just dim 0) gets a nontrivial
-            # initial CGF sensitivity.
-            t_values = torch.zeros(num_cgf_features, particle_dim)
-            linspace_vals = torch.linspace(-t_init_scale, t_init_scale, num_cgf_features)
-            dim_assignment = torch.arange(num_cgf_features) % particle_dim
-            for d in range(particle_dim):
-                mask = dim_assignment == d
-                t_values[mask, d] = linspace_vals[mask]
-        elif t_init_mode == "linspace_first_dim":
-            t_values = torch.zeros(num_cgf_features, particle_dim)
-            t_values[:, 0] = torch.linspace(
-                -t_init_scale,
-                t_init_scale,
-                num_cgf_features,
-            )
-            if particle_dim > 1:
-                t_values[:, 1:] = 0.01 * torch.randn(
-                    num_cgf_features,
-                    particle_dim - 1,
-                )
-        elif t_init_mode == "spread":
-            # 8 directions x (num//8) log-spaced norms, matching the probe's
-            # CGF_SPREAD64 feature geometry. rho_hi=2.8 ~ the max norm
-            # reachable under the elementwise t_clamp=2.0 (diagonal norm
-            # 2*sqrt(2)). The den diagonal (45 deg) is one of the 8
-            # directions exactly. Unlike the legacy 0.1-scale linspace init,
-            # this starts where the signal actually is, so no ~10x growth of
-            # ||t_j|| is required for the encoder to see it.
-            if particle_dim != 2:
-                raise ValueError("t_init_mode='spread' assumes 2D particles")
-            num_dirs = 8
-            if num_cgf_features % num_dirs != 0:
-                raise ValueError(
-                    "num_cgf_features must be divisible by 8 for 'spread'")
-            num_norms = num_cgf_features // num_dirs
-            angles = torch.arange(num_dirs, dtype=torch.float32) * (
-                2 * torch.pi / num_dirs)
-            dirs = torch.stack([torch.cos(angles), torch.sin(angles)], dim=1)
-            norms = torch.tensor(np.geomspace(0.25, 2.8, num_norms),
-                                 dtype=torch.float32)
-            t_values = (norms[None, :, None] * dirs[:, None, :]).reshape(
-                -1, particle_dim)
-        elif t_init_mode == "random":
-            t_values = t_init_scale * torch.randn(num_cgf_features, particle_dim)
-        else:
-            raise ValueError(f"Unknown t_init_mode: {t_init_mode}")
-
-        self.t_frozen = bool(t_frozen)
-        if self.t_frozen:
-            # A buffer gets no gradient (so PPO cannot move it) while still
-            # saving/loading and moving across devices exactly like the
-            # Parameter. forward() is untouched: on the spread init the
-            # elementwise clamp is a no-op by construction.
-            self.register_buffer("t_values", t_values)
-        else:
-            self.t_values = nn.Parameter(t_values)
-
-    def forward(self, obs_dict: dict[str, torch.Tensor]) -> torch.Tensor:
-        base_obs = obs_dict["obs"]
-        particles = obs_dict["particles"] / self.arena_scale
-        weights = obs_dict["weights"]
-
-        particles = torch.nan_to_num(particles, nan=0.0, posinf=1.0, neginf=-1.0)
-        weights = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
-        weights = torch.clamp(weights, min=0.0)
-        weights = weights / (weights.sum(dim=1, keepdim=True) + 1e-8)
-
-        t = torch.clamp(self.t_values, -self.t_clamp, self.t_clamp)
-        exp_arg = torch.matmul(particles, t.transpose(0, 1))
-        exp_arg = torch.clamp(exp_arg, -self.exp_arg_clamp, self.exp_arg_clamp)
-
-        weighted_mgf = torch.sum(
-            weights.unsqueeze(-1) * torch.exp(exp_arg),
-            dim=1,
-        )
-        cgf = torch.log(torch.clamp(weighted_mgf, min=1e-8))
-        return torch.cat([base_obs, cgf], dim=-1)
 
 
 def _make_vec_normalize(vec_env, training: bool, norm_reward: bool):
@@ -426,6 +216,7 @@ def make_ant_tag_cgf_env(
             num_particles=num_particles,
             pf_interaction_mapper=ant_tag_pf_interaction_mapper,
             obs_mask_indices=obs_mask_indices,
+            particle_filter_seed=seed + rank,
         )
         if apply_reward_shaping:
             env = PFRewardShapingWrapper(
@@ -477,6 +268,59 @@ def _write_run_config(run_dir: str, **config) -> None:
     with open(path, "w") as f:
         json.dump(config, f, indent=2, default=str, sort_keys=True)
     print(f"Run config saved to {path}")
+
+
+def _git_provenance() -> dict:
+    """Record WHICH CODE produced this run, for run_config.json.
+
+    run_config.json pins every hyperparameter but not the source that read
+    them, and that gap has already bitten this project: the
+    ant_tag_cgf_cdens_terminal runs of 2026-08-26 finished at 17:30, and
+    4_train_rl_cgf.py gained deterministic per-episode PF seeding at 18:39.
+    Their run_config.json is byte-identical either side of that change, so
+    nothing on disk says which behavior those checkpoints were trained with.
+
+    HEAD alone would not close it — both submodules are routinely dirty — so
+    the SHA-256 of `git diff HEAD` gives an uncommitted working tree a stable
+    identity. Equal (head, diff_sha256) means the same code; a different
+    diff_sha256 means something moved between two runs, even when both say
+    "dirty". The porcelain status lines are kept as a human-readable hint of
+    WHICH files were dirty.
+
+    Never raises: a missing git, a detached worktree or a stripped checkout
+    records an "error" string rather than killing a multi-hour training run.
+    """
+    repos = {
+        "set_transformer": Path(__file__).resolve().parents[2],
+        "pomdp-domains": Path(__file__).resolve().parents[3] / "pomdp-domains",
+    }
+
+    def _git(repo: Path, *args: str) -> str:
+        return subprocess.run(
+            ("git", "-C", str(repo)) + args,
+            capture_output=True, text=True, check=True, timeout=15,
+        ).stdout
+
+    provenance = {}
+    for name, repo in repos.items():
+        try:
+            head = _git(repo, "rev-parse", "HEAD").strip()
+            status = [line for line in
+                      _git(repo, "status", "--porcelain").splitlines() if line]
+            diff = _git(repo, "diff", "HEAD")
+            provenance[name] = {
+                "path": str(repo),
+                "head": head,
+                "dirty": bool(status),
+                # Tracked-file modifications only; untracked content is not in
+                # `git diff HEAD`, which is why the status lines are kept too.
+                "diff_sha256": (hashlib.sha256(diff.encode()).hexdigest()
+                                if diff else None),
+                "status": status,
+            }
+        except Exception as exc:  # noqa: BLE001 - provenance must never abort a run
+            provenance[name] = {"path": str(repo), "error": f"{type(exc).__name__}: {exc}"}
+    return provenance
 
 
 def train_ant_tag_cgf(
@@ -726,13 +570,20 @@ def _tee_stdout_stderr(log_path: str) -> None:
     sys.stderr = _TeeStream(sys.stderr, log_file)
 
 
-def main(
-    env_id: str = "pdomains-ant-tag-v0",
-    particle_filter_class: type = AntTagParticleFilter,
-    run_subdir: str = "ant_tag_cgf",
-):
+def main(encoder: str = "cgf"):
+    """Entry point. --variant selects env id, particle filter and run subdir
+    together from variants.py, so the three cannot disagree."""
     parser = argparse.ArgumentParser(
-        description=f"RL with weighted CGF particle-belief features on AntTag (env_id={env_id})"
+        description="RL with weighted CGF particle-belief features on AntTag. "
+                    "Use --variant to pick the env; --list_variants to see them."
+    )
+    variants.add_variant_argument(parser)
+    parser.add_argument(
+        "--run_subdir", type=str, default=None,
+        help="Override the derived runs/ant_tag_cgf[_<variant>] "
+             "directory. For a sweep that needs its own tree "
+             "(e.g. ant_tag_cgf_cdens_hard_dist0), which the "
+             "derived name cannot express.",
     )
     parser.add_argument("--algorithm", type=str, default="PPO", choices=["PPO", "SAC"])
     parser.add_argument("--total_timesteps", type=int, default=3_000_000)
@@ -792,13 +643,13 @@ def main(
         "--log_dir",
         type=str,
         default=None,
-        help=f"Defaults to runs/{run_subdir}/<timestamp>_seed<seed>/logs/",
+        help="Defaults to runs/ant_tag_cgf[_<variant>]/<timestamp>_seed<seed>/logs/",
     )
     parser.add_argument(
         "--model_save_path",
         type=str,
         default=None,
-        help=f"Defaults to runs/{run_subdir}/<timestamp>_seed<seed>/models/cgf_agent.zip",
+        help="Defaults to runs/ant_tag_cgf[_<variant>]/<timestamp>_seed<seed>/models/cgf_agent.zip",
     )
     parser.add_argument("--eval_freq", type=int, default=20_000)
     parser.add_argument("--save_freq", type=int, default=100_000)
@@ -815,7 +666,9 @@ def main(
     parser.add_argument(
         "--curriculum",
         type=str,
-        default="0:100,0.3:100,0.7:3,1:3",
+        default=None,
+        help="Visibility curriculum 'frac:radius,...'. Defaults to the "
+             "variant's own curriculum, else the base schedule.",
     )
     parser.add_argument(
         "--reward_schedule",
@@ -878,6 +731,24 @@ def main(
     parser.add_argument("--n_eval_episodes", type=int, default=20)
 
     args = parser.parse_args()
+    if args.list_variants:
+        variants.print_variants()
+        return
+
+    variant = variants.resolve(args.variant)
+    env_id = variant.env_id
+    particle_filter_class = variant.particle_filter
+    run_subdir = args.run_subdir or variants.run_subdir(
+        encoder, args.variant)
+    args.curriculum = variants.resolve_schedule(
+        args.variant, args.curriculum, "default_curriculum",
+        "0:100,0.3:100,0.7:3,1:3")
+    variants.warn_if_not_evading(
+        args.variant, args.evasion_curriculum, args.target_speed_scale)
+    args.evasion_curriculum = variants.resolve_schedule(
+        args.variant, args.evasion_curriculum, "default_evasion_curriculum",
+        None)
+
     net_arch = [int(x) for x in args.net_arch.split(",")] if args.net_arch else None
     obs_mask = [-2, -1] if args.mask_target_obs else None
 
@@ -891,12 +762,21 @@ def main(
     print(f"Mirroring stdout/stderr to {stdout_log_path}")
 
     run_config = vars(args).copy()
+    # The resolved run_subdir is passed explicitly below; drop the raw flag so
+    # the two do not collide as duplicate keyword arguments. --list_variants
+    # already returned by this point and is not part of the run's identity.
+    run_config.pop("run_subdir", None)
+    run_config.pop("list_variants", None)
     run_config.update(log_dir=log_dir, model_save_path=model_save_path)
+    # env_id / particle_filter_class / run_subdir are derived from --variant,
+    # but they are still written out: run_config.json stays a complete record
+    # even if the registry entry is later edited.
     _write_run_config(
         run_dir,
         env_id=env_id,
         particle_filter_class=particle_filter_class.__name__,
         run_subdir=run_subdir,
+        git=_git_provenance(),
         **run_config,
     )
 

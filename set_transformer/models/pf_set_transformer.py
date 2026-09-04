@@ -21,6 +21,17 @@ class PFSetTransformer(nn.Module):
         dim_hidden (int, optional): Dimension of hidden layers. Defaults to 128.
         num_heads (int, optional): Number of attention heads. Defaults to 4.
         ln (bool, optional): Whether to use layer normalization. Defaults to False.
+        dim_output_particles (int, optional): Dimension of each RECONSTRUCTED
+            particle. Defaults to None, meaning `dim_particles` — input and
+            output shapes match, the ordinary autoencoder.
+
+            Set it smaller than `dim_particles` for weighted particle sets: the
+            encoder reads D coordinates plus a mass channel (dim_particles=D+1)
+            while the decoder emits D coordinates only (dim_output_particles=D).
+            The mass belongs in the reconstruction LOSS, as the target measure's
+            weights, not in the reconstructed points — asking the decoder to
+            regress a weight would put probability mass inside the geometric
+            ground metric and let it predict negative, unnormalized "weights".
     """
 
     def __init__(
@@ -33,8 +44,13 @@ class PFSetTransformer(nn.Module):
         dim_hidden: int = 128,
         num_heads: int = 4,
         ln: bool = False,
+        dim_output_particles: int | None = None,
     ) -> None:
         super(PFSetTransformer, self).__init__()
+        if dim_output_particles is None:
+            dim_output_particles = dim_particles
+        self.dim_particles = dim_particles
+        self.dim_output_particles = dim_output_particles
         self.set_transformer = SetTransformer(
             dim_particles,
             num_outputs=num_encodings,
@@ -44,7 +60,9 @@ class PFSetTransformer(nn.Module):
             num_heads=num_heads,
             ln=ln,
         )
-        self.decoder = PFDecoder(dim_encoder, dim_hidden, num_particles, dim_particles)
+        self.decoder = PFDecoder(
+            dim_encoder, dim_hidden, num_particles, dim_output_particles
+        )
 
     def forward(self, X: torch.Tensor) -> torch.Tensor:
         """Forward pass of the PFSetTransformer.
@@ -53,6 +71,7 @@ class PFSetTransformer(nn.Module):
             X (torch.Tensor): Input tensor of shape (batch_size, set_size, dim_particles)
 
         Returns:
-            torch.Tensor: Output tensor of shape (batch_size, num_particles, dim_particles)
+            torch.Tensor: Output tensor of shape
+                (batch_size, num_particles, dim_output_particles)
         """
         return self.decoder(self.set_transformer(X))

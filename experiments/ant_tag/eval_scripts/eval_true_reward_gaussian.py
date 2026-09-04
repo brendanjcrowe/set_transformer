@@ -35,6 +35,7 @@ from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import VecNormalize, DummyVecEnv
 
 import pdomains  # noqa: F401
+import variants  # noqa: E402 - env/filter/cap registry
 from set_transformer.rl.particle_filters.ant_tag import AntTagParticleFilter
 
 # Sibling module name starts with a digit, so importlib is required.
@@ -71,27 +72,81 @@ def make_eval_env(num_particles: int, obs_mask_indices, seed: int,
     return _init
 
 
-def main(env_id: str = "pdomains-ant-tag-v0",
-         particle_filter_class: type = AntTagParticleFilter):
-    p = argparse.ArgumentParser()
-    p.add_argument("--model_path", type=str, required=True)
+def _checkpoint_num_particles(model_path: str) -> int | None:
+    """Particle-set size recorded in a saved policy's observation space.
+
+    Returns None if it cannot be determined, in which case the caller's value
+    (or the env default) stands and SB3 will complain on its own.
+    """
+    try:
+        from stable_baselines3.common.save_util import load_from_zip_file
+        data, _, _ = load_from_zip_file(model_path, load_data=True,
+                                        device="cpu", print_system_info=False)
+        space = data["observation_space"]
+        return int(space["particles"].shape[0])
+    except Exception:  # noqa: BLE001 - a best-effort default, never fatal
+        return None
+
+
+def main():
+    """--variant selects env id, particle filter AND the episode cap together."""
+    p = argparse.ArgumentParser(
+        description="Evaluate a checkpoint on the true sparse tag reward.")
+    variants.add_variant_argument(p)
+    # Not argparse-required: --list_variants must work without it,
+    # and argparse enforces required= before any of our own code runs.
+    p.add_argument("--model_path", type=str, default=None)
     p.add_argument("--vecnormalize_path", type=str, default=None,
                    help="Path to vecnormalize.pkl saved during training")
     p.add_argument("--n_episodes", type=int, default=50)
-    p.add_argument("--num_particles", type=int, default=100)
+    p.add_argument(
+        "--num_particles", type=int, default=None,
+        help="Particle count for the eval env. Defaults to the "
+             "count baked into the checkpoint's observation space, "
+             "which is the only value that can work.",
+    )
     p.add_argument("--seed", type=int, default=42)
     p.add_argument(
-        "--max_steps", type=int, default=400,
-        help="Episode cap of the env under evaluation; an episode that\n             ends strictly before this many steps counts as a tag.\n             400 for the v0/smart/ghost AntTag variants, 200 for\n             pdomains-ant-tag-dens-v0.",
+        "--max_steps", type=int, default=None,
+        help="Episode cap of the env under evaluation; an episode ending "
+             "strictly before this many steps counts as a tag. Defaults to "
+             "the variant's registered max_episode_steps, which is the only "
+             "correct value — a larger one counts every timeout as a tag.",
     )
     p.add_argument("--no_mask", action="store_true")
     p.add_argument("--deterministic", action="store_true", default=True)
     p.add_argument("--stochastic", dest="deterministic", action="store_false")
     args = p.parse_args()
+    if args.list_variants:
+        variants.print_variants()
+        return
+
+    if args.model_path is None:
+        p.error("--model_path is required")
+
+    # The env's particle count must match the one the policy was trained with,
+    # or SB3 rejects the observation space. Read it off the checkpoint instead
+    # of defaulting to 100 and making the caller remember.
+    trained_particles = _checkpoint_num_particles(args.model_path)
+    if args.num_particles is None:
+        args.num_particles = trained_particles
+    elif trained_particles is not None and args.num_particles != trained_particles:
+        p.error(
+            f"--num_particles {args.num_particles} contradicts the checkpoint, "
+            f"which was trained with {trained_particles}. Omit the flag."
+        )
+
+    variant = variants.resolve(args.variant)
+    env_id = variant.env_id
+    particle_filter_class = variant.particle_filter
+    if args.max_steps is None:
+        args.max_steps = variants.episode_cap(args.variant)
 
     obs_mask = None if args.no_mask else [-2, -1]
 
-    print(f"Env: {env_id}, particle filter: {particle_filter_class.__name__}")
+    print(f"Variant: {args.variant} | env: {env_id} | "
+          f"filter: {particle_filter_class.__name__} | "
+          f"episode cap: {args.max_steps}")
     env_fn = make_eval_env(args.num_particles, obs_mask, args.seed,
                             env_id=env_id, particle_filter_class=particle_filter_class)
     env = DummyVecEnv([env_fn])
@@ -107,8 +162,20 @@ def main(env_id: str = "pdomains-ant-tag-v0",
     model = PPO.load(args.model_path, env=env)
     print(f"Loaded model from {args.model_path}")
 
+    # Re-apply --seed AFTER the load. PPO.load restores the TRAINING seed from
+    # the checkpoint and BaseAlgorithm.set_random_seed re-seeds the vec env
+    # with it, so every evaluation of a given checkpoint replayed the same
+    # episode set no matter what --seed said. Four "different" eval seeds
+    # returned byte-identical results, which looks like a robust policy and is
+    # actually one sample. Seeding here overrides that.
+    env.seed(args.seed)
+    env.action_space.seed(args.seed)
+    print(f"Eval episode seed: {args.seed} "
+          f"(overriding the checkpoint's training seed)")
+
     rewards = []
     lengths = []
+    successes = []
     tagged = 0
     for ep in range(args.n_episodes):
         obs = env.reset()
@@ -123,8 +190,10 @@ def main(env_id: str = "pdomains-ant-tag-v0",
             done = bool(dones[0])
         rewards.append(ep_r)
         lengths.append(ep_len)
-        # Tagged = episode ended before truncation.
-        if ep_len < args.max_steps:
+        # A terminal hazard can end before max_steps without being a tag.
+        success = bool(infos[0].get("is_success", ep_len < args.max_steps))
+        successes.append(success)
+        if success:
             tagged += 1
 
     rewards = np.array(rewards)
@@ -140,7 +209,7 @@ def main(env_id: str = "pdomains-ant-tag-v0",
     print(f"Best episode  : reward={rewards[best_idx]:.2f}, length={lengths[best_idx]}")
     # Distribution of tag times (only on tagged episodes)
     if tagged > 0:
-        tag_lens = lengths[lengths < args.max_steps]
+        tag_lens = lengths[np.asarray(successes, dtype=bool)]
         print(f"When tagged   : mean_len={tag_lens.mean():.1f}, median_len={np.median(tag_lens):.1f}")
 
 
