@@ -678,7 +678,11 @@ def main(encoder: str = "cgf"):
     )
     parser.add_argument("--t_init_scale", type=float, default=0.1)
     parser.add_argument("--t_clamp", type=float, default=2.0)
-    parser.add_argument("--exp_arg_clamp", type=float, default=20.0)
+    parser.add_argument(
+        "--exp_arg_clamp", type=float, default=20.0,
+        help="DEPRECATED, no longer applied: the CGF is computed with "
+             "logsumexp, which needs no clamp on the exponent. Accepted and "
+             "recorded in run_config.json for compatibility only.")
     parser.add_argument("--device", type=str, default="cuda:1")
 
     parser.add_argument(

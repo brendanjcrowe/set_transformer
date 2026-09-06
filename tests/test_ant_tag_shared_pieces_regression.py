@@ -1203,6 +1203,8 @@ def test_pf_dict_wrapper_seeding_is_deterministic(ant_tag):
 _VARIANT_TABLE = {
     "base": ("pdomains-ant-tag-v0", "AntTagParticleFilter", 400),
     "smart": ("pdomains-ant-tag-smart-v0", "SmartAntTagParticleFilter", 400),
+    "smart_hard": ("pdomains-ant-tag-smart-hard-v0",
+                   "SmartAntTagParticleFilter", 400),
     "ghost": ("pdomains-ant-tag-ghost-v0", "GhostAntTagParticleFilter", 400),
     "dens": ("pdomains-ant-tag-dens-v0", "TwinDenAntTagParticleFilter", 200),
     "cdens": ("pdomains-ant-tag-cdens-v0",
@@ -1217,7 +1219,7 @@ _VARIANT_TABLE = {
 
 #: Variants whose target evades; only these respond to --evasion_curriculum
 #: and --target_speed_scale.
-_EVADING = {"smart", "ghost", "dens", "cdens", "cdens_hard",
+_EVADING = {"smart", "smart_hard", "ghost", "dens", "cdens", "cdens_hard",
             "cdens_terminal", "cdens_nospook"}
 
 

@@ -73,6 +73,15 @@ VARIANTS: dict[str, Variant] = {
         particle_filter=SmartAntTagParticleFilter,
         notes="Unimodal; the target flees harder as the ant closes.",
     ),
+    "smart_hard": Variant(
+        env_id="pdomains-ant-tag-smart-hard-v0",
+        particle_filter=SmartAntTagParticleFilter,
+        notes=("SmartAntTag with the cdens_hard sensing/tagging geometry: "
+               "tag_radius 0.6, visible_radius 1.0 (base env 1.5 / 3.0). "
+               "Same 9x9 cage and 400-step cap as `smart`; unimodal belief."),
+        default_curriculum="0:100,0.2:100,0.5:1.0,1:1.0",
+        default_evasion_curriculum="0:0,0.2:0,0.5:1,1:1",
+    ),
     "ghost": Variant(
         env_id="pdomains-ant-tag-ghost-v0",
         particle_filter=GhostAntTagParticleFilter,
@@ -118,7 +127,7 @@ VARIANTS: dict[str, Variant] = {
 #: Variants whose target evades (SmartAntTagEnv and its subclasses). Only these
 #: respond to --evasion_curriculum and --target_speed_scale; set membership
 #: keyed on the registry, rather than a branch in every script.
-EVADING = {"smart", "ghost", "dens", "cdens", "cdens_hard",
+EVADING = {"smart", "smart_hard", "ghost", "dens", "cdens", "cdens_hard",
            "cdens_terminal", "cdens_nospook"}
 
 

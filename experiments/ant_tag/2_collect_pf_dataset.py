@@ -160,13 +160,22 @@ def _rebalance_by_spread(
     collapsed_threshold: float = 0.5,
     diffuse_threshold: float = 4.0,
     seed: int = 42,
+    upsample: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Rebalance so intermediate-spread beliefs are well represented.
 
-    Downsamples over-represented buckets and upsamples (with replacement)
-    under-represented ones. Thresholds are in ENV COORDINATE UNITS and so are
-    problem-specific; expose them on the CLI rather than assuming the Ant-Tag
-    arena.
+    Downsamples over-represented buckets. With ``upsample=True`` (the
+    historical behaviour) under-represented buckets are upsampled WITH
+    REPLACEMENT to their quota, so the output keeps its size -- at the cost of
+    duplicated rows, which then land on both sides of the train/val split and
+    make checkpoint selection optimistic (PITFALLS.md section 4; the
+    cdens_terminal dataset duplicated its intermediate bucket 11x this way).
+    With ``upsample=False`` an under-represented bucket keeps every row it has
+    and nothing is duplicated, so the dataset shrinks instead: collect more
+    raw snapshots (--max_snapshots) to compensate.
+
+    Thresholds are in ENV COORDINATE UNITS and so are problem-specific; expose
+    them on the CLI rather than assuming the Ant-Tag arena.
     """
     spreads = _weighted_spread(particles, weights)
 
@@ -211,6 +220,8 @@ def _rebalance_by_spread(
     for name, idx, frac in live:
         share = frac / live_frac_total if live_frac_total > 0 else 1.0 / len(live)
         n_target = int(round(n_total * share))
+        if not upsample:
+            n_target = min(n_target, len(idx))
         sampled.append(rng.choice(idx, size=n_target, replace=len(idx) < n_target))
     all_idx = np.concatenate(sampled)
     rng.shuffle(all_idx)
@@ -387,6 +398,12 @@ def main():
         help="Skip spread rebalancing and keep the raw visit distribution.",
     )
     parser.add_argument(
+        "--rebalance_no_upsample", action="store_true",
+        help="Rebalance by downsampling only: never duplicate rows to fill an "
+             "under-represented bucket (PITFALLS.md section 4). The dataset "
+             "shrinks instead; raise --max_snapshots to compensate.",
+    )
+    parser.add_argument(
         "--collapsed_threshold", type=float, default=0.5,
         help="Belief spread below this counts as collapsed. ENV UNITS.",
     )
@@ -450,6 +467,7 @@ def main():
             collapsed_threshold=args.collapsed_threshold,
             diffuse_threshold=args.diffuse_threshold,
             seed=args.seed,
+            upsample=not args.rebalance_no_upsample,
         )
 
     print(f"Dataset: particles {particles.shape}, weights {weights.shape}")
