@@ -304,7 +304,28 @@ class PFDictWithWeightsObservationWrapper(gym.Wrapper):
     module path and the Ant-Tag scripts import each other by flat name, so
     the re-export is what keeps existing checkpoints and sibling scripts
     working.
+
+    **Dead beliefs never reach the policy (PITFALLS.md section 8, item 8).**
+    A filter whose weights come back all zero, or containing NaN / inf, has
+    refuted every particle; it carries no information. The three encoders
+    disagree about what to make of such a row -- CGF in K mode emits a
+    sentinel, CGF in K' mode the tilted mean of a UNIFORM belief, and the
+    Gaussian extractor mean 0 / covariance 0, i.e. a delta at the arena
+    centre -- so in two of three modes a filter failure is indistinguishable
+    from a real belief and the policy acts on it. This wrapper is the one
+    place every domain's belief passes through, so the check lives here:
+    ``on_dead_belief="raise"`` (default) stops the run with the filter's
+    class name, and ``"uniform"`` substitutes uniform weights (the honest
+    no-information belief over the current particles), sets
+    ``info["pf_dead_belief"] = True`` and counts it in
+    ``dead_belief_count``. Neither existing filter family can trigger it
+    today -- the Odd-Even filters raise on zero mass themselves, and the
+    Ant-Tag filters add 1e-300 before normalising so total refutation
+    already comes out uniform -- which is why the default can afford to be
+    loud.
     """
+
+    ON_DEAD_BELIEF = ("raise", "uniform")
 
     def __init__(
         self,
@@ -315,8 +336,15 @@ class PFDictWithWeightsObservationWrapper(gym.Wrapper):
         pf_interaction_mapper=None,
         obs_mask_indices: list[int] | None = None,
         particle_filter_seed: int | None = None,
+        on_dead_belief: str = "raise",
     ):
         super().__init__(env)
+        if on_dead_belief not in self.ON_DEAD_BELIEF:
+            raise ValueError(
+                f"on_dead_belief must be one of {self.ON_DEAD_BELIEF}, got {on_dead_belief!r}")
+        self.on_dead_belief = on_dead_belief
+        self.dead_belief_count = 0
+        self._warned_dead_belief = False
         self.particle_filter_class = particle_filter_class
         self.particle_filter_kwargs = particle_filter_kwargs
         self.num_particles = num_particles
@@ -383,7 +411,7 @@ class PFDictWithWeightsObservationWrapper(gym.Wrapper):
             **pf_init_kwargs,
         )
         self._last_base_env_obs_float = base_env_obs_float.copy()
-        return self._get_dict_obs(base_env_obs_float), info
+        return self._get_dict_obs(base_env_obs_float, info), info
 
     def step(self, action):
         previous_base_env_obs = self._last_base_env_obs_float
@@ -411,9 +439,47 @@ class PFDictWithWeightsObservationWrapper(gym.Wrapper):
             self.particle_filter.update(base_env_obs_float)
 
         self._last_base_env_obs_float = base_env_obs_float.copy()
-        return self._get_dict_obs(base_env_obs_float), reward, terminated, truncated, info
+        return (self._get_dict_obs(base_env_obs_float, info), reward, terminated,
+                truncated, info)
 
-    def _get_dict_obs(self, base_env_obs: np.ndarray) -> dict:
+    def _checked_weights(self, info: dict | None) -> np.ndarray:
+        """The filter's weights, unless they carry no information.
+
+        Dead = any non-finite entry, or a total mass that is not > 0. See the
+        class docstring for why this is checked here and not in the encoders.
+        """
+        weights = np.asarray(self.particle_filter.weights, dtype=np.float64)
+        finite = bool(np.all(np.isfinite(weights)))
+        total = float(np.sum(weights)) if finite else float("nan")
+        if finite and total > 0.0:
+            return weights.astype(np.float32)
+
+        self.dead_belief_count += 1
+        what = ("non-finite weights" if not finite
+                else f"total mass {total!r}")
+        filter_name = type(self.particle_filter).__name__
+        if self.on_dead_belief == "raise":
+            raise RuntimeError(
+                f"{filter_name} produced a dead belief ({what}) at PF reset "
+                f"#{self._pf_reset_count}: every particle is refuted and the "
+                "row carries no information. The encoders would read it as a "
+                "plausible belief (CGF K': a uniform belief; Gaussian: a delta "
+                "at the arena centre), so it is refused here. Fix the filter "
+                "(floor the likelihood before normalising, as the Ant-Tag "
+                "filters do with += 1e-300, or reset to uniform), or construct "
+                "the wrapper with on_dead_belief='uniform' to substitute "
+                "uniform weights and flag info['pf_dead_belief'].")
+        if not self._warned_dead_belief:
+            print(f"PFDictWithWeightsObservationWrapper: {filter_name} produced "
+                  f"a dead belief ({what}); substituting uniform weights. "
+                  "Counted in dead_belief_count; further occurrences are silent.",
+                  flush=True)
+            self._warned_dead_belief = True
+        if info is not None:
+            info["pf_dead_belief"] = True
+        return np.full(weights.shape, 1.0 / weights.shape[0], dtype=np.float32)
+
+    def _get_dict_obs(self, base_env_obs: np.ndarray, info: dict | None = None) -> dict:
         agent_obs = base_env_obs
         if self.obs_mask_indices is not None:
             agent_obs = base_env_obs.copy()
@@ -421,5 +487,5 @@ class PFDictWithWeightsObservationWrapper(gym.Wrapper):
         return {
             "obs": agent_obs.astype(np.float32),
             "particles": self.particle_filter.particles.astype(np.float32),
-            "weights": self.particle_filter.weights.astype(np.float32),
+            "weights": self._checked_weights(info),
         }
