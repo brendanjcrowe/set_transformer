@@ -702,7 +702,7 @@ def test_sentinel_callback_logs_over_the_whole_rollout(tmp_path):
                 weight_channel=True),
         },
         encoder="st", variant=VARIANT, total_timesteps=256, n_envs=1,
-        ppo_n_steps=128, batch_size=32, n_epochs=1, num_particles=NS,
+        ppo_n_steps=128, batch_size=32, n_epochs=2, num_particles=NS,
         device="cpu", seed=0, run_subdir="test_sentinel",
         log_dir=str(tmp_path / "logs") + "/",
         model_save_path=str(tmp_path / "models" / "st_agent.zip"),
@@ -713,12 +713,17 @@ def test_sentinel_callback_logs_over_the_whole_rollout(tmp_path):
     # Read what the callback recorded, not the logger: SB3 clears
     # name_to_value on each dump, so by training end it is empty.
     recorded = callback.last_stats
-    assert recorded["st/feat_samples"] > 100, (
-        "the sentinel saw almost no samples; it is reading a single forward "
-        "batch rather than the rollout")
+    # EXACTLY the rollout: n_steps * n_envs = 128. With n_epochs=2 the old
+    # forward hook also swallowed 2 x 128 training-minibatch forwards (and
+    # the eval episode), reporting ~384 "rollout" samples of which two thirds
+    # were re-forwards of the previous rollout mid-update.
+    assert recorded["st/feat_samples"] == 128, recorded["st/feat_samples"]
     for key in ("st/feat_std_relative", "st/feat_std_relative_max",
-                "st/feat_std_mean", "st/feat_std_max", "st/feat_abs_mean"):
+                "st/feat_std_mean_rollout", "st/feat_std_max", "st/feat_abs_mean"):
         assert np.isfinite(recorded[key]), f"{key} is not finite"
+    assert "st/feat_std_mean" not in recorded, (
+        "the sentinel must not reuse the shared callback's key; SB3's logger "
+        "is last-write-wins and this callback runs second")
 
 
 # ---------------------------------------------------------------------------
@@ -1011,3 +1016,68 @@ def test_rebalance_never_duplicates_rows():
     assert int(((out_s >= 3) & (out_s < 21)).sum()) == 4
     assert int((out_s >= 21).sum()) == 3
     assert out_w.shape == (12, NS)
+
+
+# ---------------------------------------------------------------------------
+# Audit 2026-09-06 fixes (PITFALLS.md section 8, items 1-2)
+# ---------------------------------------------------------------------------
+
+
+def test_eval_sem_is_per_episode_not_per_step():
+    """Item 1. Nine identical steady rewards in one episode are ONE sample.
+
+    Two episodes, one all-hit and one all-miss in steady state: the per-
+    episode SEM is std([1, 0], ddof=1) / sqrt(2) = 0.5. The old step-pooled
+    SEM treated the 18 steady steps as independent and read 0.121.
+    """
+    module = _load("eval_true_reward_odd_even", _ODD_EVEN_DIR / "eval_scripts")
+    collapse = module.COLLAPSE_STEP
+    hit = np.concatenate([np.zeros(collapse), np.ones(9)])
+    miss = np.zeros(collapse + 9)
+    out = module._split_metric([hit, miss], collapse)
+    assert out["steady"] == pytest.approx(0.5)
+    assert out["steady_sem"] == pytest.approx(0.5)
+    assert out["steady_sem"] > 0.12 * 3, "step-pooled SEM is back"
+    # Transient: both episodes are all-zero -> identical means -> SEM 0.
+    assert out["transient_sem"] == pytest.approx(0.0)
+    # An episode with no steady steps is not a sample of the steady split.
+    short = np.zeros(collapse)
+    out2 = module._split_metric([hit, miss, short], collapse)
+    assert out2["steady_sem"] == pytest.approx(0.5)
+
+
+def test_st_checkpoint_with_a_different_arena_scale_is_refused(st_pieces, tmp_path):
+    """Item 2. No parameter shape changes with the particle scale, so a
+    checkpoint pretrained in one frame loaded silently into an encoder fed
+    another (the CGF extractor already refused this). Both checkpoint
+    formats must be caught: 3_pretrain_st_belief.py records arena_scale in
+    config; 3_train_st.py (Trainer) records particle_scale top-level."""
+    from stable_baselines3.common.vec_env import DummyVecEnv
+
+    st_module, venv, path, _reference = st_pieces
+    state = torch.load(path, map_location="cpu", weights_only=False)["model_state_dict"]
+    space = venv.observation_space
+    kwargs = dict(num_encodings=8, dim_encoder=8, num_inds=32, dim_hidden=128,
+                  num_heads=4, ln=True, weight_channel=True)
+
+    supervised = tmp_path / "supervised.pt"
+    torch.save({"model_state_dict": state, "config": {"arena_scale": 24.5}}, supervised)
+    trainer = tmp_path / "trainer.pt"
+    torch.save({"model_state_dict": state, "particle_scale": 24.5}, trainer)
+
+    for ck in (supervised, trainer):
+        # Matching scale loads.
+        st_module.SetTransformerFeaturesExtractor(
+            space, arena_scale=24.5, pretrained_st_model_path=str(ck), **kwargs)
+        # A float that is equal within tolerance loads too.
+        st_module.SetTransformerFeaturesExtractor(
+            space, arena_scale=24.5 * (1 + 1e-9), pretrained_st_model_path=str(ck), **kwargs)
+        with pytest.raises(RuntimeError, match="scale"):
+            st_module.SetTransformerFeaturesExtractor(
+                space, arena_scale=4.5, pretrained_st_model_path=str(ck), **kwargs)
+
+    # A checkpoint that records neither (pre-2026-09-05) still loads.
+    bare = tmp_path / "bare.pt"
+    torch.save({"model_state_dict": state}, bare)
+    st_module.SetTransformerFeaturesExtractor(
+        space, arena_scale=4.5, pretrained_st_model_path=str(bare), **kwargs)

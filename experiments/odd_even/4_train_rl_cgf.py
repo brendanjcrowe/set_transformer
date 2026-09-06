@@ -27,9 +27,25 @@ Ant-Tag counterweighted-den case (ESS about 11 of 100).
 the spread init is what put the CGF features where the signal already was, so
 PPO needed no ~10x growth of ||t_j|| to resolve it; the 0.1-scale linspace
 init has to grow into place first. spread_1d is the 1-D analogue: log-spaced
-magnitudes in BOTH signs, bounded at 2.0 because in 1-D the elementwise
-t_clamp IS the norm bound. It is a separate mode from "spread", whose 8
-planar directions and rho_hi=2.8 are intrinsically 2-D.
+magnitudes in BOTH signs, from 0.25 up to --t_init_max. It is a separate mode
+from "spread", whose 8 planar directions and rho_hi=2.8 are intrinsically 2-D.
+
+t IS TANH-BOUNDED AT 50 BY DEFAULT (2026-09-05), the ClusterHunt/LeastMass
+pattern: t = t_bound * tanh(raw_t), smooth everywhere, so a probe never
+freezes the way it does past a hard clamp. Why 50: same-parity neighbours are
+2 / 24.5 = 0.0816 apart in normalized units and the CGF only resolves them
+once t * 0.0816 is of order 2..4; the legacy clamp at 2.0 gave 0.16, which is
+why every feature was a multiple of the posterior mean (domain_mds/oddeven.md,
+2026-09-04/05). --t_init_max 40 makes the init span that range. The CGF block
+is standardised per feature with running statistics (--feature_norm running)
+because at wide t the raw K values reach magnitudes of tens. The exact3M runs
+predate all of this and used --t_param clamp --t_clamp 2.0 --feature_norm
+none; run_config.json records which generation a run belongs to.
+
+Know what this can and cannot buy before launching 3M steps: the offline mode
+probe puts K'(t) at +-50 at 0.60 / 0.69 on the posterior mode, against the
+Gaussian arm's 0.58 / 0.74 and the exact posterior's 0.997. This arm is the
+correctly computed CGF, not a route to the oracle.
 
 REWARD NORMALIZATION IS ON. -(pred - s*)^2 reaches -2401 at n=50, and
 PITFALLS.md records a value loss of order 10^3 dominating a learned encoder's
@@ -76,6 +92,7 @@ import pdomains  # noqa: F401,E402 - registers the pdomains-odd-even-* envs
 # process. See _sibling.py -- this was measured happening in the test suite.
 import _sibling  # noqa: E402
 variants = _sibling.load("variants")
+_pretrained = _sibling.load("pretrained_encoder")
 _belief_env = _sibling.load("odd_even_belief_env")
 make_odd_even_belief_env = _belief_env.make_odd_even_belief_env
 make_vec_env_from_fns = _belief_env.make_vec_env_from_fns
@@ -87,6 +104,9 @@ make_vec_normalize = _belief_env.make_vec_normalize
 from set_transformer.rl.feature_extractors.cgf import (  # noqa: E402
     TNormLoggingCallback,
     WeightedCGFFeaturesExtractor,
+    cgf_raw_dim,
+    matched_readout_hidden,
+    non_readout_param_count,
 )
 
 
@@ -491,6 +511,117 @@ def net_arch_from_args(args):
             if args.net_arch else None)
 
 
+#: CGF geometry flags a pretrained checkpoint carries in its ``config``. When
+#: --pretrained_cgf_model_path is given and one of these is left at its
+#: default, the checkpoint's value is used; an explicit value that disagrees
+#: is an error, not an override (same rule as 4_train_rl_st.py's geometry).
+CGF_GEOMETRY_FLAGS = ("num_cgf_features", "feature_mode", "t_param", "t_bound",
+                      "t_clamp", "feature_norm", "readout_hidden", "readout_depth",
+                      "readout_dim", "arena_scale", "t_init_mode", "t_init_max",
+                      "x_embed_dim", "x_embed_hidden", "x_embed_depth")
+
+
+def add_readout_and_pretrained_arguments(parser) -> None:
+    """The readout MLP and the pretrained-encoder flags (2026-09-05).
+
+    Shared with 3_pretrain_st_belief.py --encoder cgf so a checkpoint's
+    geometry is spelled the same way in both scripts.
+    """
+    parser.add_argument(
+        "--readout_hidden", type=int, default=0,
+        help="Width of the readout MLP between the (normalised) CGF block and "
+             "the policy. 0 (default) = no readout, the extractor as before. "
+             "This is where a parameter-matched CGF arm keeps its budget; see "
+             "--match_params.")
+    parser.add_argument(
+        "--readout_depth", type=int, default=0,
+        help="Hidden layers in the readout MLP. 0 = none. --match_params "
+             "with depth 0 uses 2 (ClusterHunt's).")
+    parser.add_argument(
+        "--readout_dim", type=int, default=None,
+        help="Readout output width. Default 64, the ST arm's feature width, "
+             "whatever --num_cgf_features is, so the policy heads are "
+             "identical across arms.")
+    parser.add_argument(
+        "--match_params", type=int, default=None,
+        help="Pick --readout_hidden so the encoder's parameter total (learned "
+             "t + norm affine + readout) lands closest to this count, e.g. "
+             "109448 for the small 2-SAB ST encoder. The chosen width and "
+             "the exact total are printed and recorded in run_config.json.")
+    parser.add_argument(
+        "--pretrained_cgf_model_path", type=str, default=None,
+        help="Checkpoint from 3_pretrain_st_belief.py --encoder cgf. Loaded "
+             "into the extractor, RE-loaded after PPO construction and "
+             "verified max|delta| == 0 (PITFALLS.md section 1). Geometry "
+             "flags left at their defaults are taken from it.")
+    parser.add_argument(
+        "--x_embed_dim", type=int, default=0,
+        help="Learned per-particle embedding phi: R^D -> R^d before the CGF, "
+             "with t in R^d (idea 3, 2026-09-05). 0 = off, the plain CGF. NOTE "
+             "this makes the arm a learned Deep-Set-family encoder, not a "
+             "parameter-free statistic; report it as such.")
+    parser.add_argument("--x_embed_hidden", type=int, default=64)
+    parser.add_argument("--x_embed_depth", type=int, default=1)
+    parser.add_argument(
+        "--cgf_frozen", action="store_true",
+        help="Freeze the WHOLE pretrained encoder: t, the running-norm "
+             "statistics and the readout. Only PPO's heads learn -- the arm "
+             "that matches the ST's --st_frozen. Requires a checkpoint.")
+
+
+def resolve_cgf_geometry(args, parser) -> None:
+    """CLI > checkpoint config > default for the geometry flags, then size
+    the readout if --match_params asks for it. Prints the resulting encoder
+    parameter total so every run's size is on record."""
+    from_ckpt = {}
+    if args.pretrained_cgf_model_path:
+        import torch
+        checkpoint = torch.load(args.pretrained_cgf_model_path,
+                                map_location="cpu", weights_only=False)
+        config = checkpoint.get("config", {}) if isinstance(checkpoint, dict) else {}
+        from_ckpt = {k: config[k] for k in CGF_GEOMETRY_FLAGS if k in config}
+        for key, ckpt_value in from_ckpt.items():
+            given = getattr(args, key)
+            if given == parser.get_default(key):
+                setattr(args, key, ckpt_value)
+            elif given != ckpt_value:
+                parser.error(
+                    f"--{key} {given!r} disagrees with the checkpoint's {key}="
+                    f"{ckpt_value!r} ({args.pretrained_cgf_model_path}). Drop the "
+                    "flag to take the checkpoint's geometry.")
+        if args.match_params is not None:
+            parser.error("--match_params sizes a NEW readout; with a pretrained "
+                         "checkpoint the readout shape comes from the checkpoint.")
+    particle_dim = 1  # Odd-Even: scalar state
+    t_dim = args.x_embed_dim if args.x_embed_dim > 0 else particle_dim
+    raw_dim = cgf_raw_dim(args.num_cgf_features, t_dim, args.feature_mode)
+    fixed = non_readout_param_count(args.num_cgf_features, particle_dim,
+                                    args.feature_mode, args.t_frozen, args.feature_norm,
+                                    args.x_embed_dim, args.x_embed_hidden, args.x_embed_depth)
+    if args.match_params is not None:
+        if args.readout_depth <= 0:
+            args.readout_depth = 2
+        out_dim = (args.readout_dim if args.readout_dim is not None
+                   else WeightedCGFFeaturesExtractor.DEFAULT_READOUT_DIM)
+        args.readout_hidden, total = matched_readout_hidden(
+            args.match_params, raw_dim, args.readout_depth, out_dim, fixed)
+        print(f"CGF readout sized to match {args.match_params:,} params: "
+              f"hidden={args.readout_hidden} depth={args.readout_depth} "
+              f"-> encoder total {total:,} ({100 * (total - args.match_params) / args.match_params:+.2f}%)")
+    else:
+        from set_transformer.rl.feature_extractors.cgf import readout_param_count
+        out_dim = args.readout_dim if args.readout_dim is not None else (
+            WeightedCGFFeaturesExtractor.DEFAULT_READOUT_DIM if args.readout_depth > 0 else raw_dim)
+        total = fixed + readout_param_count(raw_dim, args.readout_hidden,
+                                            args.readout_depth, out_dim)
+        print(f"CGF encoder parameters: {total:,} (raw block {raw_dim}, "
+              f"readout hidden={args.readout_hidden} depth={args.readout_depth})")
+    args.encoder_params = int(total)
+    if from_ckpt:
+        print(f"CGF geometry taken from checkpoint: "
+              + ", ".join(f"{k}={getattr(args, k)!r}" for k in from_ckpt))
+
+
 def main() -> None:
     """Entry point for the CGF arm."""
     encoder = "cgf"
@@ -510,18 +641,65 @@ def main() -> None:
              "'spread' is NOT offered -- its 8 planar directions are "
              "intrinsically 2-D and it rejects 1-D particles.")
     parser.add_argument("--t_init_scale", type=float, default=0.1)
-    parser.add_argument("--t_clamp", type=float, default=2.0)
-    parser.add_argument("--exp_arg_clamp", type=float, default=20.0)
+    parser.add_argument(
+        "--t_param", type=str, default="tanh", choices=["clamp", "tanh"],
+        help="How the learned t is bounded. 'tanh' (default since "
+             "2026-09-05): t = t_bound * tanh(raw_t), smooth everywhere, the "
+             "ClusterHunt/LeastMass parameterisation. 'clamp': the legacy hard "
+             "torch.clamp at +-t_clamp, zero gradient beyond the bound -- the "
+             "exact3M runs used this.")
+    parser.add_argument(
+        "--t_bound", type=float, default=50.0,
+        help="tanh mode only. Chosen by t_bound * (same-parity spacing in "
+             "normalized units, 2/24.5 = 0.0816) ~ 2..4; 50 gives 4.1. The "
+             "offline mode probe (oddeven.md 2026-09-05) was run out to +-50.")
+    parser.add_argument(
+        "--t_init_max", type=float, default=40.0,
+        help="Largest |t| in the spread_1d init (log-spaced from 0.25). Must "
+             "be below t_bound in tanh mode. 40 with t_bound 50 covers the "
+             "mean/variance regime at small t and the support-edge regime at "
+             "large t. The exact3M runs used the legacy 2.0.")
+    parser.add_argument(
+        "--t_clamp", type=float, default=2.0,
+        help="clamp mode only: the hard bound on each t component.")
+    parser.add_argument(
+        "--feature_mode", type=str, default="K",
+        choices=["K", "K_grad", "both"],
+        help="K: log-MGF at each t (legacy). K_grad: the tilted mean K'(t), "
+             "which beat K on ClusterHunt, LeastMass and the Odd-Even mode "
+             "probe at every t range. both: concatenated.")
+    parser.add_argument(
+        "--feature_norm", type=str, default="running",
+        choices=["none", "running", "layernorm"],
+        help="Standardise the CGF block before the policy MLP. 'running' "
+             "(default): per-feature z-score with running statistics. "
+             "'layernorm' normalises across features per sample and on "
+             "near-rank-1 features divides the posterior mean out -- do not "
+             "use it here without reading RunningFeatureNorm's docstring. "
+             "'none': raw features, what the exact3M runs used.")
+    parser.add_argument(
+        "--exp_arg_clamp", type=float, default=20.0,
+        help="DEPRECATED, no longer applied: the CGF is computed with "
+             "logsumexp, which needs no clamp on the exponent. Accepted and "
+             "recorded in run_config.json for compatibility only.")
     parser.add_argument(
         "--t_frozen", action="store_true",
         help="Register t_values as a BUFFER, so PPO cannot learn the "
              "projection directions. With --t_init_mode spread_1d this "
              "isolates representational CAPACITY from the optimization "
              "dynamics of t_j growth.")
+    add_readout_and_pretrained_arguments(parser)
     args = parser.parse_args()
     if args.list_variants:
         variants.print_variants()
         return
+
+    if args.cgf_frozen and not args.pretrained_cgf_model_path:
+        parser.error(
+            "--cgf_frozen without --pretrained_cgf_model_path would freeze a "
+            "RANDOM readout. Pass a checkpoint from 3_pretrain_st_belief.py "
+            "--encoder cgf, or drop the flag (use --t_frozen alone to fix t).")
+    resolve_cgf_geometry(args, parser)
 
     (_run_dir, log_dir, model_save_path, run_subdir,
      particle_filter_class) = resolve_common(args, encoder)
@@ -536,11 +714,30 @@ def main() -> None:
             t_clamp=args.t_clamp,
             exp_arg_clamp=args.exp_arg_clamp,
             t_frozen=args.t_frozen,
+            t_param=args.t_param,
+            t_bound=args.t_bound if args.t_param == "tanh" else None,
+            t_init_max=args.t_init_max,
+            feature_mode=args.feature_mode,
+            feature_norm=args.feature_norm,
+            readout_hidden=args.readout_hidden,
+            readout_depth=args.readout_depth,
+            readout_dim=args.readout_dim,
+            pretrained_cgf_model_path=args.pretrained_cgf_model_path,
+            cgf_frozen=args.cgf_frozen,
+            x_embed_dim=args.x_embed_dim,
+            x_embed_hidden=args.x_embed_hidden,
+            x_embed_depth=args.x_embed_depth,
         ),
     }
     net_arch = net_arch_from_args(args)
     if net_arch is not None:
         policy_kwargs["net_arch"] = net_arch
+
+    post_construct = None
+    if args.pretrained_cgf_model_path:
+        def post_construct(model):
+            _pretrained.reload_pretrained_cgf(
+                model, args.pretrained_cgf_model_path, args.cgf_frozen)
 
     train_odd_even(
         policy_kwargs=policy_kwargs,
@@ -566,6 +763,7 @@ def main() -> None:
         lr_anneal=args.lr_anneal,
         target_kl=args.target_kl,
         progress_bar=args.progress_bar,
+        post_construct=post_construct,
         # cgf/t_norm_q* in TensorBoard: whether PPO actually grows ||t_j|| is
         # a first-class experimental question, and a FLAT line is the
         # built-in sanity check for --t_frozen.

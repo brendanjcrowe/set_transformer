@@ -133,9 +133,18 @@ def summarize_episode(rewards, collapse_step: int = COLLAPSE_STEP) -> dict:
 def _split_metric(values, collapse_step: int = COLLAPSE_STEP) -> dict:
     """Per-episode arrays -> transient / steady / pooled means over all steps.
 
-    Pools across episodes at the STEP level, not by averaging per-episode
+    MEANS pool across episodes at the STEP level, not by averaging per-episode
     means: episodes here can differ in length, and a per-episode average
     would weight a short episode's steps more heavily.
+
+    SEMs are PER EPISODE: the standard error of the per-episode means over
+    the episodes that have any step in the split. Steps within an episode
+    are not independent samples -- once the belief locks on, the policy
+    repeats the same right or wrong guess, and 82% of oracle episodes have
+    all nine steady rewards identical -- so a step-pooled SEM understated
+    the uncertainty ~2.5x (0.009 vs 0.022 at 150 episodes; PITFALLS.md
+    section 8 item 1). Every number quoted before 2026-09-06 used the
+    step-pooled SEM; the means were unaffected.
     """
     transient, steady, pooled = [], [], []
     for row in values:
@@ -149,9 +158,9 @@ def _split_metric(values, collapse_step: int = COLLAPSE_STEP) -> dict:
         return float(flat.mean()) if flat.size else float("nan")
 
     def _sem(chunks):
-        flat = np.concatenate(chunks) if chunks else np.array([])
-        return (float(flat.std(ddof=1) / np.sqrt(flat.size))
-                if flat.size > 1 else float("nan"))
+        per_episode = np.array([c.mean() for c in chunks if c.size], dtype=np.float64)
+        return (float(per_episode.std(ddof=1) / np.sqrt(per_episode.size))
+                if per_episode.size > 1 else float("nan"))
 
     return {
         "transient": _mean(transient), "transient_sem": _sem(transient),

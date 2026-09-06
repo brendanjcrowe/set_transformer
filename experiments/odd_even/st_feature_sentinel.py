@@ -164,42 +164,56 @@ class OddEvenSTFeatureSentinel(BaseCallback):
     def __init__(self, eps: float = 1e-8, verbose: int = 0):
         super().__init__(verbose)
         self.eps = float(eps)
-        self._batches: list[torch.Tensor] = []
-        self._handle = None
         self._warned = False
         #: The statistics from the most recent rollout, under their logged
         #: names. Kept so a test or a post-run check can read exactly what
         #: was recorded; SB3's logger flushes name_to_value each dump.
         self.last_stats: dict[str, float] = {}
 
-    def _on_training_start(self) -> None:
-        extractor = getattr(self.model.policy, "features_extractor", None)
-        if extractor is None:
-            return
-
-        def _capture(_module, _args, output):
-            # The extractor returns [base_obs, st_features]; the base
-            # observation is a passthrough and would dilute the statistic
-            # with the step index's own (large, deterministic) variation.
-            obs_dim = int(np.prod(
-                self.model.observation_space["obs"].shape))
-            self._batches.append(output[:, obs_dim:].detach().float().cpu())
-
-        self._handle = extractor.register_forward_hook(_capture)
-
-    def _on_training_end(self) -> None:
-        if self._handle is not None:
-            self._handle.remove()
-            self._handle = None
-
     def _on_step(self) -> bool:  # required abstract method
         return True
 
+    def _rollout_features(self) -> torch.Tensor | None:
+        """Encoder features of EXACTLY the observations in the rollout buffer.
+
+        Until 2026-09-06 this was a forward hook on the extractor, cleared at
+        rollout end. That captured every PPO minibatch forward (n_epochs x the
+        rollout) and every EvalCallback forward as well, so at n_epochs=10
+        about 91% of the "rollout" sample was re-forwards of the PREVIOUS
+        rollout through an encoder mid-update, and the first logged point
+        was a different population from all later ones (PITFALLS.md section
+        8 item 3). Re-encoding the buffer costs one extra pass over
+        n_steps x n_envs observations per rollout and is exact.
+        """
+        from stable_baselines3.common.utils import obs_as_tensor
+
+        extractor = getattr(self.model.policy, "features_extractor", None)
+        buffer = getattr(self.model, "rollout_buffer", None)
+        if extractor is None or buffer is None or not isinstance(
+                buffer.observations, dict):
+            return None
+        flat = {key: np.asarray(value).reshape(-1, *value.shape[2:])
+                for key, value in buffer.observations.items()}
+        n = next(iter(flat.values())).shape[0]
+        # The extractor returns [base_obs, st_features]; the base observation
+        # is a passthrough and would dilute the statistic with the step
+        # index's own (large, deterministic) variation.
+        obs_dim = int(np.prod(self.model.observation_space["obs"].shape))
+        was_training = extractor.training
+        extractor.eval()
+        chunks = []
+        with torch.no_grad():
+            for start in range(0, n, 1024):
+                batch = {key: value[start:start + 1024] for key, value in flat.items()}
+                out = extractor(obs_as_tensor(batch, self.model.device))
+                chunks.append(out[:, obs_dim:].detach().float().cpu())
+        extractor.train(was_training)
+        return torch.cat(chunks, dim=0)
+
     def _on_rollout_end(self) -> None:
-        if not self._batches:
+        features = self._rollout_features()
+        if features is None:
             return
-        features = torch.cat(self._batches, dim=0)
-        self._batches.clear()
         if features.shape[0] < 2:
             # Cannot form a std from one sample. Say so rather than logging
             # NaN, which is how the shared callback's reading disappears at
@@ -223,7 +237,11 @@ class OddEvenSTFeatureSentinel(BaseCallback):
             "st/feat_std_relative": relative_mean,
             "st/feat_std_relative_max": relative_max,
             "st/feat_std_max": float(std.max()),
-            "st/feat_std_mean": std_mean,
+            # NOT "st/feat_std_mean": that key belongs to the shared
+            # STFeatureLoggingCallback (last-batch definition, comparable with
+            # Ant-Tag). SB3's logger is last-write-wins, and this callback runs
+            # after the shared one, so reusing the name silently replaced it.
+            "st/feat_std_mean_rollout": std_mean,
             "st/feat_abs_mean": float(abs_mean.mean()),
             "st/feat_samples": float(features.shape[0]),
         }
