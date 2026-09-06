@@ -38,7 +38,11 @@ once t * 0.0816 is of order 2..4; the legacy clamp at 2.0 gave 0.16, which is
 why every feature was a multiple of the posterior mean (domain_mds/oddeven.md,
 2026-09-04/05). --t_init_max 40 makes the init span that range. The CGF block
 is standardised per feature with running statistics (--feature_norm running)
-because at wide t the raw K values reach magnitudes of tens. The exact3M runs
+because at wide t the raw K values reach magnitudes of tens; since 2026-09-06
+those statistics are held fixed for each PPO collect + update cycle and
+refreshed from the rollout buffer in between (--running_norm_update rollout,
+RolloutFeatureNormCallback), so the stored and recomputed log-probs are
+standardised identically -- PITFALLS.md section 8 item 5. The exact3M runs
 predate all of this and used --t_param clamp --t_clamp 2.0 --feature_norm
 none; run_config.json records which generation a run belongs to.
 
@@ -102,6 +106,8 @@ make_vec_normalize = _belief_env.make_vec_normalize
 # script would pull in MuJoCo and, worse, `4_train_rl_cgf` is now an ambiguous
 # flat module name -- both experiment directories hold one (Gap 12).
 from set_transformer.rl.feature_extractors.cgf import (  # noqa: E402
+    EncoderDriftLoggingCallback,
+    RolloutFeatureNormCallback,
     TNormLoggingCallback,
     WeightedCGFFeaturesExtractor,
     cgf_raw_dim,
@@ -741,6 +747,17 @@ def main() -> None:
              "use it here without reading RunningFeatureNorm's docstring. "
              "'none': raw features, what the exact3M runs used.")
     parser.add_argument(
+        "--running_norm_update", type=str, default="rollout",
+        choices=["rollout", "minibatch"],
+        help="How --feature_norm running refreshes its statistics under PPO. "
+             "'rollout' (default since 2026-09-06): fixed for a whole "
+             "collect + update cycle, re-estimated from the rollout buffer "
+             "between cycles (RolloutFeatureNormCallback), so the stored and "
+             "recomputed log-probs are standardised identically. 'minibatch': "
+             "the pre-fix behaviour, lerp on every training minibatch, kept "
+             "only as the A/B control (PITFALLS.md section 8 item 5). Ignored "
+             "for --cgf_frozen, whose statistics are pinned either way.")
+    parser.add_argument(
         "--exp_arg_clamp", type=float, default=20.0,
         help="DEPRECATED, no longer applied: the CGF is computed with "
              "logsumexp, which needs no clamp on the exponent. Accepted and "
@@ -802,6 +819,17 @@ def main() -> None:
             _pretrained.reload_pretrained_cgf(
                 model, args.pretrained_cgf_model_path, args.cgf_frozen)
 
+    # cgf/t_norm_q* in TensorBoard: whether PPO actually grows ||t_j|| is a
+    # first-class experimental question, and a FLAT line is the built-in
+    # sanity check for --t_frozen. cgf/drift_*: relative parameter movement
+    # since training start, per group -- exactly 0 for --cgf_frozen.
+    callbacks = [TNormLoggingCallback(), EncoderDriftLoggingCallback()]
+    if (args.feature_norm == "running" and args.running_norm_update == "rollout"
+            and not args.cgf_frozen):
+        # Statistics fixed for each collect + update cycle, refreshed from
+        # the rollout buffer in between (PITFALLS.md section 8 item 5).
+        callbacks.append(RolloutFeatureNormCallback())
+
     train_odd_even(
         policy_kwargs=policy_kwargs,
         encoder=encoder,
@@ -827,10 +855,7 @@ def main() -> None:
         target_kl=args.target_kl,
         progress_bar=args.progress_bar,
         post_construct=post_construct,
-        # cgf/t_norm_q* in TensorBoard: whether PPO actually grows ||t_j|| is
-        # a first-class experimental question, and a FLAT line is the
-        # built-in sanity check for --t_frozen.
-        extra_callbacks=[TNormLoggingCallback()],
+        extra_callbacks=callbacks,
     )
 
 

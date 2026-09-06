@@ -144,37 +144,268 @@ class RunningFeatureNorm(nn.Module):
     rollouts. Running statistics do the same without a calibration pass and
     keep tracking as a learned ``t`` moves.
 
-    Statistics update from the (detached) batch only in training mode -- SB3
-    puts the policy in training mode during the PPO update and in eval mode
-    during rollout collection -- and the RUNNING statistics are used for the
-    output in both modes, so the same input maps to the same output within
-    an update. The first update copies the batch statistics outright rather
-    than lerping from (0, 1), so the features are on scale from the first
-    gradient step instead of after ``1 / momentum`` updates.
+    **Two update modes** (``update``):
+
+    ``"minibatch"`` (constructor default)
+        The statistics lerp towards each training-mode batch (momentum
+        ``momentum``) and the SAME forward normalises with the updated
+        values, as BatchNorm's running buffers do. Right for a supervised
+        loop (``3_pretrain_st_belief.py --encoder cgf``), where nothing
+        compares a stored output against a recomputed one. WRONG under PPO:
+        an update makes ``n_epochs * n_steps * n_envs / batch_size`` = 1280
+        train-mode forwards, so the statistics turn over inside the update
+        (``0.99 ** 1280`` of the rollout's values survive) and the stored
+        ``old_log_prob`` and the recomputed log-probs are on differently
+        standardised features -- PPO's ratio then moves without the
+        parameters moving (domain_mds/PITFALLS.md section 8 item 5).
+    ``"rollout"``
+        The module NEVER updates itself; forward only normalises. The owner
+        sets the statistics through :meth:`set_statistics`, which
+        :class:`RolloutFeatureNormCallback` does exactly once per PPO cycle,
+        between an update and the next collection. Within a collection and
+        the update trained on it the statistics are constant, so stored and
+        recomputed log-probs see the same normalisation -- the discipline
+        SB3's ``VecNormalize`` applies to observations. The Odd-Even CGF RL
+        arm flips the module into this mode at training start.
+
+    In both modes the RUNNING statistics (not the batch's) normalise the
+    output, and eval mode never updates anything, so a saved policy is a
+    fixed function whatever mode trained it. The first minibatch update
+    copies the batch statistics outright rather than lerping from (0, 1).
     """
 
+    UPDATE_MODES = ("minibatch", "rollout")
+
     def __init__(self, num_features: int, momentum: float = 0.01,
-                 eps: float = 1e-5):
+                 eps: float = 1e-5, update: str = "minibatch"):
         super().__init__()
+        if update not in self.UPDATE_MODES:
+            raise ValueError(f"update must be one of {self.UPDATE_MODES}, got {update!r}")
         self.momentum = float(momentum)
         self.eps = float(eps)
+        self.update = update
         self.register_buffer("running_mean", torch.zeros(num_features))
         self.register_buffer("running_var", torch.ones(num_features))
         self.register_buffer("num_updates", torch.zeros((), dtype=torch.long))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.training and x.shape[0] > 1:
+        if self.update == "minibatch" and self.training and x.shape[0] > 1:
             with torch.no_grad():
-                batch_mean = x.mean(dim=0)
-                batch_var = x.var(dim=0, unbiased=False)
-                if int(self.num_updates) == 0:
-                    self.running_mean.copy_(batch_mean)
-                    self.running_var.copy_(batch_var)
-                else:
-                    self.running_mean.lerp_(batch_mean, self.momentum)
-                    self.running_var.lerp_(batch_var, self.momentum)
-                self.num_updates += 1
+                self.set_statistics(x.mean(dim=0), x.var(dim=0, unbiased=False),
+                                    momentum=self.momentum)
         return (x - self.running_mean) / torch.sqrt(self.running_var + self.eps)
+
+    @torch.no_grad()
+    def set_statistics(self, mean: torch.Tensor, var: torch.Tensor,
+                       momentum: float = 1.0) -> None:
+        """Move the running statistics towards (mean, var).
+
+        ``momentum=1.0`` adopts them outright. The very first call always
+        copies, whatever the momentum, so the features are on scale from the
+        first use instead of after ``1 / momentum`` updates.
+        """
+        mean = mean.to(self.running_mean)
+        var = var.to(self.running_var)
+        if int(self.num_updates) == 0 or momentum >= 1.0:
+            self.running_mean.copy_(mean)
+            self.running_var.copy_(var)
+        else:
+            self.running_mean.lerp_(mean, float(momentum))
+            self.running_var.lerp_(var, float(momentum))
+        self.num_updates += 1
+
+
+def _policy_extractors(policy) -> list:
+    """The features extractor(s) a policy owns, without duplicates.
+
+    PPO's ActorCriticPolicy shares one; ``share_features_extractor=False``
+    or an off-policy actor/critic pair hold several.
+    """
+    extractors = []
+    for candidate in [getattr(policy, "features_extractor", None)] + [
+            getattr(getattr(policy, attr, None), "features_extractor", None)
+            for attr in ("pi_features_extractor", "vf_features_extractor",
+                         "actor", "critic", "critic_target")]:
+        if candidate is not None and all(candidate is not e for e in extractors):
+            extractors.append(candidate)
+    return extractors
+
+
+class RolloutFeatureNormCallback(BaseCallback):
+    """Refresh a ``RunningFeatureNorm`` once per PPO cycle, never inside one.
+
+    PPO alternates COLLECT (``n_steps`` env steps per worker, policy in eval
+    mode, actions' log-probs stored) and UPDATE (``n_epochs`` passes over
+    that rollout in minibatches, each recomputing the stored actions'
+    log-probs and clipping the ratio to the stored ones). The ratio is only
+    meaningful if the two log-probs differ ONLY through the parameters, so
+    the standardisation the CGF block goes through must be identical in
+    both phases. This callback guarantees that:
+
+    * ``_on_training_start``: every ``RunningFeatureNorm`` in an UNFROZEN
+      extractor is switched to ``update="rollout"`` (it stops updating
+      itself). A frozen extractor is left alone -- ``freeze_encoder`` already
+      pins it in eval mode and its statistics are part of the checkpoint.
+    * ``_on_rollout_end`` (after collection, before the update): the raw
+      pre-norm CGF block is recomputed over EXACTLY the rollout buffer's
+      observations (same re-encoding the ST sentinel does) and its
+      per-feature mean / variance are stashed. NOT applied yet: the update
+      about to run must use the statistics the rollout was collected under.
+    * ``_on_rollout_start`` (after the update): the stashed statistics are
+      applied (``momentum`` = 1.0 adopts them outright; < 1 lerps). So each
+      cycle runs under statistics estimated from the previous rollout, held
+      fixed for the whole cycle.
+
+    The very first rollout runs on the initial (0, 1) statistics, i.e. raw
+    features, consistently in both of its phases; the first refresh follows
+    its update. Logged per rollout: ``cgf/norm_refreshes`` (count),
+    ``cgf/norm_mean_shift`` (mean over features of |new - old mean| / old
+    std, how far the standardisation moved), ``cgf/norm_std_ratio_mean``
+    (mean over features of new std / old std) and ``cgf/norm_samples``.
+    """
+
+    def __init__(self, momentum: float = 1.0, verbose: int = 0):
+        super().__init__(verbose)
+        if not 0.0 < momentum <= 1.0:
+            raise ValueError(f"momentum must be in (0, 1], got {momentum}")
+        self.momentum = float(momentum)
+        self._norms: list = []
+        self._pending = None
+        self.refreshes = 0
+        self.last_stats: dict = {}
+
+    # -- lifecycle -------------------------------------------------------
+    def _on_training_start(self) -> None:
+        self._norms = []
+        for extractor in _policy_extractors(self.model.policy):
+            if getattr(extractor, "_frozen", False):
+                continue
+            norm = getattr(extractor, "feature_norm", None)
+            if isinstance(norm, RunningFeatureNorm):
+                norm.update = "rollout"
+                self._norms.append((extractor, norm))
+        if self.verbose and not self._norms:
+            print("RolloutFeatureNormCallback: no unfrozen RunningFeatureNorm "
+                  "on this policy; idle")
+
+    def _on_step(self) -> bool:
+        return True
+
+    def _on_rollout_end(self) -> None:
+        if not self._norms:
+            return
+        stats = self._rollout_raw_statistics()
+        if stats is not None:
+            self._pending = stats
+
+    def _on_rollout_start(self) -> None:
+        if self._pending is None:
+            return
+        mean, var, n = self._pending
+        self._pending = None
+        for _extractor, norm in self._norms:
+            old_mean = norm.running_mean.clone()
+            old_std = torch.sqrt(norm.running_var + norm.eps)
+            norm.set_statistics(mean, var, momentum=self.momentum)
+            shift = float(((norm.running_mean - old_mean).abs() / old_std).mean())
+            ratio = float((torch.sqrt(norm.running_var + norm.eps) / old_std).mean())
+        self.refreshes += 1
+        self.last_stats = {"cgf/norm_refreshes": self.refreshes,
+                           "cgf/norm_mean_shift": shift,
+                           "cgf/norm_std_ratio_mean": ratio,
+                           "cgf/norm_samples": n}
+        for key, value in self.last_stats.items():
+            self.logger.record(key, value)
+
+    # -- the statistic ---------------------------------------------------
+    def _rollout_raw_statistics(self):
+        """Mean / var of the PRE-norm CGF block over the rollout buffer.
+
+        Uses the primary extractor; a second (unshared) extractor has the
+        same t only if it was constructed identically, and PPO's default
+        shares one anyway.
+        """
+        from stable_baselines3.common.utils import obs_as_tensor
+
+        extractor, _norm = self._norms[0]
+        buffer = getattr(self.model, "rollout_buffer", None)
+        if buffer is None or not isinstance(buffer.observations, dict):
+            return None
+        flat = {key: np.asarray(value).reshape(-1, *value.shape[2:])
+                for key, value in buffer.observations.items()}
+        n = next(iter(flat.values())).shape[0]
+        total = None
+        total_sq = None
+        was_training = extractor.training
+        extractor.eval()
+        with torch.no_grad():
+            for start in range(0, n, 1024):
+                batch = {key: value[start:start + 1024] for key, value in flat.items()}
+                raw = extractor.raw_cgf_features(
+                    obs_as_tensor(batch, self.model.device)).double()
+                total = raw.sum(dim=0) if total is None else total + raw.sum(dim=0)
+                sq = (raw * raw).sum(dim=0)
+                total_sq = sq if total_sq is None else total_sq + sq
+        extractor.train(was_training)
+        mean = total / n
+        var = torch.clamp(total_sq / n - mean * mean, min=0.0)
+        return mean.float(), var.float(), int(n)
+
+
+class EncoderDriftLoggingCallback(BaseCallback):
+    """Log how far the extractor's parameters have moved since training start.
+
+    Per rollout: ``cgf/drift_<name>`` = ||p - p_0|| / (||p_0|| + 1e-12) for
+    each top-level parameter group of the features extractor (``raw_t`` or
+    ``t_values``, ``readout``, ``x_embed``) and ``cgf/drift_feature_norm``
+    for the running-norm mean buffer (its variance and counter are skipped:
+    the relative norm of a counter means nothing). A frozen encoder logs
+    exactly 0 on every
+    line; ``--t_frozen`` alone logs 0 for t and > 0 for the readout. This is
+    the direct check that PPO IS updating the encoder weights in the
+    finetuned arm, next to :class:`TNormLoggingCallback`'s ||t|| quantiles.
+    """
+
+    def __init__(self, verbose: int = 0):
+        super().__init__(verbose)
+        self._reference: dict[str, torch.Tensor] = {}
+        self.last_stats: dict = {}
+
+    @staticmethod
+    def _groups(extractor) -> dict[str, list[torch.Tensor]]:
+        groups: dict[str, list[torch.Tensor]] = {}
+        for name, tensor in list(extractor.named_parameters()) + list(
+                extractor.named_buffers()):
+            if name.endswith(("num_updates", "running_var")):
+                continue
+            key = name.split(".")[0] if "." in name else name
+            groups.setdefault(key, []).append(tensor.detach())
+        return groups
+
+    def _on_training_start(self) -> None:
+        extractor = getattr(self.model.policy, "features_extractor", None)
+        if extractor is None:
+            return
+        self._reference = {
+            key: torch.cat([t.flatten().clone().cpu() for t in tensors])
+            for key, tensors in self._groups(extractor).items()}
+
+    def _on_step(self) -> bool:
+        return True
+
+    def _on_rollout_end(self) -> None:
+        extractor = getattr(self.model.policy, "features_extractor", None)
+        if extractor is None or not self._reference:
+            return
+        self.last_stats = {}
+        for key, tensors in self._groups(extractor).items():
+            ref = self._reference.get(key)
+            if ref is None:
+                continue
+            now = torch.cat([t.flatten().cpu() for t in tensors])
+            value = float(torch.linalg.norm(now - ref) / (torch.linalg.norm(ref) + 1e-12))
+            self.last_stats[f"cgf/drift_{key}"] = value
+            self.logger.record(f"cgf/drift_{key}", value)
 
 
 def readout_param_count(raw_dim: int, hidden: int, depth: int, out_dim: int) -> int:
@@ -626,8 +857,7 @@ class WeightedCGFFeaturesExtractor(BaseFeaturesExtractor):
     #: behaviour of every saved checkpoint on a dead filter are unchanged.
     DEAD_ROW_VALUE = math.log(1e-8)
 
-    def _forward(self, obs_dict: dict[str, torch.Tensor]) -> torch.Tensor:
-        base_obs = obs_dict["obs"]
+    def _raw_cgf(self, obs_dict: dict[str, torch.Tensor]) -> torch.Tensor:
         particles = obs_dict["particles"] / self.arena_scale
         weights = obs_dict["weights"]
 
@@ -684,9 +914,19 @@ class WeightedCGFFeaturesExtractor(BaseFeaturesExtractor):
             tilt = torch.softmax(scores, dim=1)                       # [B, N, T]
             k_grad = torch.einsum("bnt,bnd->btd", tilt, particles)   # [B, T, D]
             parts.append(k_grad.reshape(k_grad.shape[0], -1))         # [B, T*D]
-        cgf = parts[0] if len(parts) == 1 else torch.cat(parts, dim=-1)
-        cgf = self.readout(self.feature_norm(cgf))
-        return torch.cat([base_obs, cgf], dim=-1)
+        return parts[0] if len(parts) == 1 else torch.cat(parts, dim=-1)
+
+    def raw_cgf_features(self, obs_dict: dict[str, torch.Tensor]) -> torch.Tensor:
+        """The CGF block BEFORE feature_norm and the readout, ``[B, num_encoded]``.
+
+        What :class:`RolloutFeatureNormCallback` takes its statistics on:
+        the quantity the norm standardises, not the norm's own output.
+        """
+        return self._raw_cgf(obs_dict)
+
+    def _forward(self, obs_dict: dict[str, torch.Tensor]) -> torch.Tensor:
+        cgf = self.readout(self.feature_norm(self._raw_cgf(obs_dict)))
+        return torch.cat([obs_dict["obs"], cgf], dim=-1)
 
     def forward(self, obs_dict: dict[str, torch.Tensor]) -> torch.Tensor:  # noqa: F811
         if self._frozen:

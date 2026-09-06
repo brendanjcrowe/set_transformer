@@ -1133,3 +1133,151 @@ def test_failed_run_is_marked_failed_beside_its_saved_model(tmp_path):
               tmp_path / "models" / "checkpoints" / "odd_even_cgf_100_steps.zip"):
         assert evaluate._read_run_status(str(p))["status"] == "failed", p
     assert evaluate._read_run_status(str(tmp_path / "elsewhere" / "x.zip")) is None
+
+
+# ---------------------------------------------------------------------------
+# CGF running norm under PPO: fixed within a cycle, refreshed between cycles
+# ---------------------------------------------------------------------------
+
+
+def _run_cgf_with_norm(tmp_path, total_timesteps=384, n_epochs=2,
+                       post_construct=None, extra_callbacks=(), **extractor_kwargs):
+    """Three 128-step rollouts of the CGF arm with the running norm on."""
+    from set_transformer.rl.feature_extractors.cgf import (
+        WeightedCGFFeaturesExtractor,
+    )
+
+    cgf = _load("4_train_rl_cgf")
+    kwargs = dict(num_cgf_features=8, arena_scale=(NS - 1) / 2,
+                  t_init_mode="spread_1d", t_param="tanh", t_bound=50.0,
+                  t_init_max=40.0, feature_norm="running",
+                  readout_hidden=16, readout_depth=1)
+    kwargs.update(extractor_kwargs)
+    return cgf.train_odd_even(
+        policy_kwargs={"features_extractor_class": WeightedCGFFeaturesExtractor,
+                       "features_extractor_kwargs": kwargs},
+        encoder="cgf", variant=VARIANT, total_timesteps=total_timesteps,
+        n_envs=1, ppo_n_steps=128, batch_size=32, n_epochs=n_epochs,
+        num_particles=NS, device="cpu", seed=0, run_subdir="test_norm",
+        log_dir=str(tmp_path / "logs") + "/",
+        model_save_path=str(tmp_path / "models" / "cgf_agent.zip"),
+        eval_freq=10**9, save_freq=10**9, n_eval_episodes=1,
+        post_construct=post_construct, extra_callbacks=list(extra_callbacks),
+    )
+
+
+class _NormTrace:
+    """Record (training-mode flag, running_mean) at every norm forward."""
+
+    def __init__(self):
+        self.calls = []
+
+    def attach(self, model):
+        norm = model.policy.features_extractor.feature_norm
+        norm.register_forward_pre_hook(
+            lambda module, _inputs: self.calls.append(
+                (module.training, module.running_mean.detach().clone())))
+
+    def change_points(self):
+        """Indices i where running_mean differs from call i-1."""
+        return [i for i in range(1, len(self.calls))
+                if not torch.equal(self.calls[i][1], self.calls[i - 1][1])]
+
+
+def test_running_norm_is_fixed_within_a_cycle_and_refreshed_between(tmp_path):
+    """PITFALLS.md section 8 item 5, the fix pinned.
+
+    384 steps at n_steps=128 is three collect + update cycles. The running
+    statistics may change exactly twice, each time between an update (train-
+    mode forwards) and the next collection (eval-mode forwards) -- never
+    inside an update, which is where the pre-fix module lerped 1280 times.
+    """
+    from set_transformer.rl.feature_extractors.cgf import (
+        EncoderDriftLoggingCallback,
+        RolloutFeatureNormCallback,
+    )
+
+    trace = _NormTrace()
+    refresh, drift = RolloutFeatureNormCallback(), EncoderDriftLoggingCallback()
+    model = _run_cgf_with_norm(tmp_path, post_construct=trace.attach,
+                               extra_callbacks=[refresh, drift])
+    norm = model.policy.features_extractor.feature_norm
+
+    assert norm.update == "rollout", "the callback must switch the module over"
+    assert refresh.refreshes == 2 and int(norm.num_updates) == 2
+    assert refresh.last_stats["cgf/norm_samples"] == 128       # exactly the rollout
+
+    changes = trace.change_points()
+    assert len(changes) == 2, f"statistics changed {len(changes)} times: {changes}"
+    for i in changes:
+        assert trace.calls[i - 1][0] is True and trace.calls[i][0] is False, (
+            "a refresh must land between the last train-mode forward of an "
+            "update and the first eval-mode forward of the next collection")
+    # Every train-mode forward (the PPO minibatches) ran on the statistics the
+    # rollout it trains on was collected under.
+    train_calls = [c for c in trace.calls if c[0]]
+    assert len(train_calls) == 3 * 2 * (128 // 32)
+    # The first cycle runs on the initial (0, 1) statistics, consistently.
+    assert torch.equal(trace.calls[0][1], torch.zeros(8))
+    assert norm.running_mean.abs().max() > 0                   # then real ones
+
+    # And the encoder IS being finetuned: t, readout and the norm all moved.
+    assert drift.last_stats["cgf/drift_raw_t"] > 0
+    assert drift.last_stats["cgf/drift_readout"] > 0
+    assert drift.last_stats["cgf/drift_feature_norm"] > 0
+
+
+def test_running_norm_minibatch_mode_is_the_pre_fix_behaviour(tmp_path):
+    """Without the callback the module lerps on every PPO minibatch: the A/B
+    control `--running_norm_update minibatch` and the documented bug."""
+    trace = _NormTrace()
+    model = _run_cgf_with_norm(tmp_path, post_construct=trace.attach)
+    norm = model.policy.features_extractor.feature_norm
+    assert norm.update == "minibatch"
+    assert int(norm.num_updates) == 3 * 2 * (128 // 32)         # one per minibatch
+    # The pre-hook sees the buffers BEFORE a forward updates them, so a lerp
+    # made by train-mode call i-1 shows up at call i; the cause is call i-1.
+    changes = trace.change_points()
+    assert len(changes) >= 20 and all(trace.calls[i - 1][0] for i in changes), (
+        "in minibatch mode the statistics move inside the update")
+
+
+def test_frozen_cgf_is_untouched_by_the_norm_and_drift_callbacks(tmp_path):
+    from set_transformer.rl.feature_extractors.cgf import (
+        EncoderDriftLoggingCallback,
+        RolloutFeatureNormCallback,
+    )
+
+    trace = _NormTrace()
+    snapshot = {}
+
+    def freeze(model):
+        ext = model.policy.features_extractor
+        ext.freeze_encoder()
+        snapshot.update({k: v.detach().clone() for k, v in ext.state_dict().items()})
+        trace.attach(model)
+
+    refresh, drift = RolloutFeatureNormCallback(), EncoderDriftLoggingCallback()
+    model = _run_cgf_with_norm(tmp_path, post_construct=freeze,
+                               extra_callbacks=[refresh, drift])
+    ext = model.policy.features_extractor
+    assert refresh.refreshes == 0 and refresh.last_stats == {}
+    assert ext.feature_norm.update == "minibatch", "frozen: left alone"
+    for key, value in ext.state_dict().items():
+        assert torch.equal(value, snapshot[key]), f"{key} moved on a frozen encoder"
+    assert trace.change_points() == []
+    assert all(c[0] is False for c in trace.calls), "frozen norm never in train mode"
+    assert drift.last_stats and all(v == 0.0 for v in drift.last_stats.values()), drift.last_stats
+
+
+def test_t_frozen_moves_the_readout_but_not_t(tmp_path):
+    from set_transformer.rl.feature_extractors.cgf import (
+        EncoderDriftLoggingCallback,
+        RolloutFeatureNormCallback,
+    )
+
+    drift = EncoderDriftLoggingCallback()
+    _run_cgf_with_norm(tmp_path, t_frozen=True,
+                       extra_callbacks=[RolloutFeatureNormCallback(), drift])
+    assert drift.last_stats["cgf/drift_raw_t"] == 0.0            # tanh mode: raw_t is the buffer
+    assert drift.last_stats["cgf/drift_readout"] > 0
