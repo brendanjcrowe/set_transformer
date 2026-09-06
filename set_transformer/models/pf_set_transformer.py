@@ -32,6 +32,8 @@ class PFSetTransformer(nn.Module):
             weights, not in the reconstructed points — asking the decoder to
             regress a weight would put probability mass inside the geometric
             ground metric and let it predict negative, unnormalized "weights".
+        num_post_sab (int, optional): SAB blocks after the PMA in the encoder.
+            Defaults to 2; see :class:`SetTransformer`.
     """
 
     def __init__(
@@ -45,6 +47,7 @@ class PFSetTransformer(nn.Module):
         num_heads: int = 4,
         ln: bool = False,
         dim_output_particles: int | None = None,
+        num_post_sab: int = 2,
     ) -> None:
         super(PFSetTransformer, self).__init__()
         if dim_output_particles is None:
@@ -59,6 +62,7 @@ class PFSetTransformer(nn.Module):
             dim_hidden=dim_hidden,
             num_heads=num_heads,
             ln=ln,
+            num_post_sab=num_post_sab,
         )
         self.decoder = PFDecoder(
             dim_encoder, dim_hidden, num_particles, dim_output_particles

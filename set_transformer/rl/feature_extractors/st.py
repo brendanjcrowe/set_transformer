@@ -34,6 +34,8 @@ and the re-export is what keeps saved runs loadable.
 
 import gymnasium as gym
 import numpy as np
+import math
+
 import torch
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
@@ -94,6 +96,7 @@ class SetTransformerFeaturesExtractor(BaseFeaturesExtractor):
         weight_channel: bool = True,
         pretrained_st_model_path: str | None = None,
         st_frozen: bool = False,
+        num_post_sab: int = 2,
     ):
         obs_dim = observation_space["obs"].shape[0]
         particle_dim = observation_space["particles"].shape[1]
@@ -131,6 +134,7 @@ class SetTransformerFeaturesExtractor(BaseFeaturesExtractor):
             dim_hidden=dim_hidden,
             num_heads=num_heads,
             ln=ln,
+            num_post_sab=num_post_sab,
         )
         self.encoder = pf_st.set_transformer
 
@@ -148,6 +152,18 @@ class SetTransformerFeaturesExtractor(BaseFeaturesExtractor):
             num_heads=num_heads,
             use_layer_norm=bool(ln),
             weighted_particles=self.weight_channel,
+            # Absent from checkpoints written before 2026-09-05; the geometry
+            # check skips fields the checkpoint does not carry, and those
+            # checkpoints were all built with the default 2.
+            num_post_sab=int(num_post_sab),
+            # The coordinate frame the encoder was trained in. A checkpoint
+            # pretrained at one particle scale loads into an encoder fed
+            # another without any shape changing (PITFALLS.md section 4 and
+            # section 8 item 2); the CGF extractor already refuses this.
+            # 3_pretrain_st_belief.py writes it into config; Trainer
+            # checkpoints carry it top-level as particle_scale (checked in
+            # _load_pretrained_encoder).
+            arena_scale=float(arena_scale),
         )
 
         if pretrained_st_model_path:
@@ -200,7 +216,11 @@ class SetTransformerFeaturesExtractor(BaseFeaturesExtractor):
                 continue
             if isinstance(expected, bool):
                 actual = bool(actual)
-            if actual != expected:
+            if isinstance(expected, float):
+                same = math.isclose(float(actual), expected, rel_tol=1e-6, abs_tol=1e-9)
+            else:
+                same = actual == expected
+            if not same:
                 mismatches.append(
                     f"{field}: checkpoint={actual!r}, this run={expected!r}")
         if mismatches:
@@ -209,9 +229,10 @@ class SetTransformerFeaturesExtractor(BaseFeaturesExtractor):
                 "geometry than this run requests:\n  "
                 + "\n  ".join(mismatches)
                 + "\nPass the matching --num_encodings/--dim_encoder/--num_inds/"
-                "--dim_hidden/--num_heads/--ln flags (or --no_st_weight_channel "
-                "for an unweighted checkpoint). A num_heads mismatch changes "
-                "no parameter shape and would otherwise load silently."
+                "--dim_hidden/--num_heads/--ln/--arena_scale flags (or "
+                "--no_st_weight_channel for an unweighted checkpoint). A "
+                "num_heads or arena_scale mismatch changes no parameter shape "
+                "and would otherwise load silently."
             )
 
     def _load_pretrained_encoder(self, path: str, dim_input: int) -> None:
@@ -224,6 +245,19 @@ class SetTransformerFeaturesExtractor(BaseFeaturesExtractor):
         if isinstance(loaded, dict) and "model_state_dict" in loaded:
             state_dict = loaded["model_state_dict"]
             self._check_checkpoint_geometry(loaded.get("config"), path)
+            # Trainer (3_train_st.py) checkpoints record the dataset frame
+            # top-level rather than in config.
+            recorded_scale = loaded.get("particle_scale")
+            if recorded_scale is not None and not math.isclose(
+                    float(recorded_scale), float(self.arena_scale),
+                    rel_tol=1e-6, abs_tol=1e-9):
+                raise RuntimeError(
+                    f"Checkpoint {path} was pretrained on particles scaled by "
+                    f"particle_scale={float(recorded_scale)!r}, but this run "
+                    f"divides by arena_scale={float(self.arena_scale)!r}. The "
+                    "encoder would read inputs in a different frame than it "
+                    "was trained on (PITFALLS.md section 4). Pass the matching "
+                    "--arena_scale, or pretrain on a dataset in this frame.")
         elif isinstance(loaded, dict):
             state_dict = loaded
         else:

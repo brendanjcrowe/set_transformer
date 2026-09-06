@@ -20,6 +20,11 @@ class SetTransformer(nn.Module):
         dim_hidden (int, optional): Dimension of hidden layers. Defaults to 128.
         num_heads (int, optional): Number of attention heads. Defaults to 4.
         ln (bool, optional): Whether to use layer normalization. Defaults to False.
+        num_post_sab (int, optional): Number of SAB blocks between the PMA and
+            the output Linear. Defaults to 2 (Lee et al., 2019). 0 gives the
+            PMA -> Linear head used by the ClusterHunt/LeastMass encoders:
+            the seed vectors then never attend to each other, so every output
+            feature is a fixed linear combination of per-seed pooled statistics.
     """
 
     def __init__(
@@ -31,16 +36,20 @@ class SetTransformer(nn.Module):
         dim_hidden: int = 128,
         num_heads: int = 4,
         ln: bool = False,
+        num_post_sab: int = 2,
     ) -> None:
         super(SetTransformer, self).__init__()
+        if num_post_sab < 0:
+            raise ValueError(f"num_post_sab must be >= 0, got {num_post_sab}")
+        self.num_post_sab = int(num_post_sab)
         self.enc = nn.Sequential(
             ISAB(dim_input, dim_hidden, num_heads, num_inds, ln=ln),
             ISAB(dim_hidden, dim_hidden, num_heads, num_inds, ln=ln),
         )
         self.dec = nn.Sequential(
             PMA(dim_hidden, num_heads, num_outputs, ln=ln),
-            SAB(dim_hidden, dim_hidden, num_heads, ln=ln),
-            SAB(dim_hidden, dim_hidden, num_heads, ln=ln),
+            *[SAB(dim_hidden, dim_hidden, num_heads, ln=ln)
+              for _ in range(self.num_post_sab)],
             nn.Linear(dim_hidden, dim_output),
         )
 
