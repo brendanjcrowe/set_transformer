@@ -355,7 +355,8 @@ class RolloutFeatureNormCallback(BaseCallback):
 class EncoderDriftLoggingCallback(BaseCallback):
     """Log how far the extractor's parameters have moved since training start.
 
-    Per rollout: ``cgf/drift_<name>`` = ||p - p_0|| / (||p_0|| + 1e-12) for
+    Per rollout: ``cgf/drift_<name>`` = ||p - p_0|| / ||p_0|| (over ||p||
+    when p_0 = 0, so an initially-zero buffer reads ~1 once set, not 1e12) for
     each top-level parameter group of the features extractor (``raw_t`` or
     ``t_values``, ``readout``, ``x_embed``) and ``cgf/drift_feature_norm``
     for the running-norm mean buffer (its variance and counter are skipped:
@@ -403,7 +404,13 @@ class EncoderDriftLoggingCallback(BaseCallback):
             if ref is None:
                 continue
             now = torch.cat([t.flatten().cpu() for t in tensors])
-            value = float(torch.linalg.norm(now - ref) / (torch.linalg.norm(ref) + 1e-12))
+            # Relative to the starting value; a group that STARTS at zero
+            # (the running norm's mean before its first refresh) is measured
+            # against its current norm instead, so it reads ~1 once it has
+            # moved rather than 1e12 -- and 0 if it never moves.
+            ref_norm = float(torch.linalg.norm(ref))
+            denom = ref_norm if ref_norm > 0 else float(torch.linalg.norm(now))
+            value = float(torch.linalg.norm(now - ref)) / denom if denom > 0 else 0.0
             self.last_stats[f"cgf/drift_{key}"] = value
             self.logger.record(f"cgf/drift_{key}", value)
 
