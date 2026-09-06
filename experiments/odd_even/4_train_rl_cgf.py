@@ -384,20 +384,83 @@ def train_odd_even(
     ]
     callbacks.extend(extra_callbacks or [])
 
+    # The finally: block below saves on ANY exit, so a run that died in its
+    # first rollout leaves a directory byte-for-byte shaped like a finished
+    # one (PITFALLS.md section 8 item 7). run_status.json beside the model
+    # records which it was; the eval script warns on anything but
+    # "completed".
+    completed, error = False, None
     try:
         model.learn(total_timesteps=total_timesteps, callback=callbacks,
                     progress_bar=progress_bar)
+        completed = True
+    except BaseException as exc:      # noqa: B902 - recorded, then re-raised
+        error = exc
+        raise
     finally:
-        model.save(model_save_path)
-        if use_vec_normalize and isinstance(vec_env, VecNormalize):
-            vecnorm_path = (os.path.join(model_dir, "vecnormalize.pkl")
-                            if model_dir else "vecnormalize.pkl")
-            vec_env.save(vecnorm_path)
-            print(f"VecNormalize saved to {vecnorm_path}")
-        print(f"Model saved to {model_save_path}")
-        vec_env.close()
-        eval_vec_env.close()
+        try:
+            model.save(model_save_path)
+            if use_vec_normalize and isinstance(vec_env, VecNormalize):
+                vecnorm_path = (os.path.join(model_dir, "vecnormalize.pkl")
+                                if model_dir else "vecnormalize.pkl")
+                vec_env.save(vecnorm_path)
+                print(f"VecNormalize saved to {vecnorm_path}")
+        finally:
+            status = write_run_status(
+                model_save_path, completed=completed, error=error,
+                timesteps=int(getattr(model, "num_timesteps", 0)),
+                total_timesteps=int(total_timesteps))
+            if completed:
+                print(f"Model saved to {model_save_path}")
+            else:
+                print(f"Model saved to {model_save_path} -- but the run "
+                      f"FAILED at step {status['timesteps']:,} of "
+                      f"{status['total_timesteps']:,} ({status['error']}); "
+                      "this is NOT a trained policy. See run_status.json.")
+            vec_env.close()
+            eval_vec_env.close()
     return model
+
+
+RUN_STATUS_FILENAME = "run_status.json"
+
+
+def write_run_status(model_save_path: str, *, completed: bool, error,
+                     timesteps: int, total_timesteps: int) -> dict:
+    """Write <model dir>/run_status.json and return its contents.
+
+    "completed" means learn() returned. Anything else -- an exception, a
+    KeyboardInterrupt, a SIGTERM-driven SystemExit -- is "failed", with the
+    exception recorded, so no reader has to infer from stdout.log whether
+    the sibling <encoder>_agent.zip is a result or a crash artefact.
+    """
+    status = {
+        "status": "completed" if completed else "failed",
+        "timesteps": int(timesteps),
+        "total_timesteps": int(total_timesteps),
+        "error": None if error is None else f"{type(error).__name__}: {error}",
+        "finished_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    model_dir = os.path.dirname(model_save_path)
+    path = os.path.join(model_dir, RUN_STATUS_FILENAME) if model_dir else RUN_STATUS_FILENAME
+    with open(path, "w") as handle:
+        json.dump(status, handle, indent=2)
+    return status
+
+
+def read_run_status(model_path: str) -> dict | None:
+    """run_status.json for a saved agent, or None if the run predates it.
+
+    Looks beside the model and one directory up, so best_model/best_model.zip
+    and checkpoints/*.zip resolve to the run's status as well.
+    """
+    here = Path(model_path).resolve().parent
+    for directory in (here, here.parent):
+        candidate = directory / RUN_STATUS_FILENAME
+        if candidate.exists():
+            with open(candidate) as handle:
+                return json.load(handle)
+    return None
 
 
 def add_common_arguments(parser, encoder: str) -> None:

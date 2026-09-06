@@ -229,6 +229,21 @@ def run_reference_policies(variant: str, n_episodes: int, seed: int,
     return results
 
 
+def _read_run_status(model_path: str) -> dict | None:
+    """<model dir>/run_status.json written by train_odd_even (2026-09-06), or
+    None for older runs. Also looks one directory up so best_model/*.zip and
+    checkpoints/*.zip resolve to their run. Kept local so this script does not
+    import the training module (and MuJoCo-free arms stay that way)."""
+    import json
+    here = Path(model_path).resolve().parent
+    for directory in (here, here.parent):
+        candidate = directory / "run_status.json"
+        if candidate.exists():
+            with open(candidate) as handle:
+                return json.load(handle)
+    return None
+
+
 def _checkpoint_num_particles(model_path: str) -> int | None:
     """Particle-set size recorded in a saved policy's observation space.
 
@@ -395,6 +410,17 @@ def main() -> None:
 
     model = PPO.load(args.model_path, env=env)
     print(f"Loaded model from {args.model_path}")
+    run_status = _read_run_status(args.model_path)
+    if run_status is None:
+        print("  (no run_status.json beside it: a run from before 2026-09-06, "
+              "or not written by train_odd_even; check its stdout.log "
+              "reached 'Model saved')")
+    elif run_status.get("status") != "completed":
+        print("  WARNING: run_status.json says this run "
+              f"{run_status.get('status', '?').upper()} at step "
+              f"{run_status.get('timesteps')} of {run_status.get('total_timesteps')} "
+              f"({run_status.get('error')}). The saved agent is a crash "
+              "artefact, not a trained policy (PITFALLS.md section 8 item 7).")
 
     # RE-SEED AFTER THE LOAD. PPO.load restores the TRAINING seed and
     # BaseAlgorithm.set_random_seed re-seeds the env with it, overriding

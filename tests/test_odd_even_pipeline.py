@@ -801,6 +801,9 @@ def test_arm_trains_end_to_end(tmp_path, arm, encoder):
     assert (tmp_path / "models" / "vecnormalize.pkl").exists(), (
         "VecNormalize statistics were not saved; an eval could not reproduce "
         "the policy's input distribution")
+    status = json.loads((tmp_path / "models" / "run_status.json").read_text())
+    assert status["status"] == "completed" and status["error"] is None, status
+    assert status["timesteps"] >= 256 and status["total_timesteps"] == 256
     # The features_dim must be the base obs (the 1-D step index) plus the
     # encoder's own width, or the arms are not reading the same observation.
     obs_dim = 1
@@ -1081,3 +1084,52 @@ def test_st_checkpoint_with_a_different_arena_scale_is_refused(st_pieces, tmp_pa
     torch.save({"model_state_dict": state}, bare)
     st_module.SetTransformerFeaturesExtractor(
         space, arena_scale=4.5, pretrained_st_model_path=str(bare), **kwargs)
+
+
+def test_failed_run_is_marked_failed_beside_its_saved_model(tmp_path):
+    """Item 7. The finally: block saves on ANY exit, so a run that dies in its
+    first rollout leaves <encoder>_agent.zip + vecnormalize.pkl exactly like
+    a finished run. run_status.json must say "failed", name the exception and
+    the step it died at, and the eval script's reader must find it from the
+    model path, from best_model/ and from checkpoints/."""
+    from stable_baselines3.common.callbacks import BaseCallback
+
+    from set_transformer.rl.feature_extractors.cgf import WeightedCGFFeaturesExtractor
+
+    cgf = _load("4_train_rl_cgf")
+    evaluate = _load("eval_true_reward_odd_even", _ODD_EVEN_DIR / "eval_scripts")
+
+    class Die(BaseCallback):
+        def _on_step(self):
+            if self.num_timesteps >= 40:
+                raise RuntimeError("simulated crash in the first rollout")
+            return True
+
+    model_path = tmp_path / "models" / "cgf_agent.zip"
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        cgf.train_odd_even(
+            policy_kwargs={
+                "features_extractor_class": WeightedCGFFeaturesExtractor,
+                "features_extractor_kwargs": dict(
+                    num_cgf_features=8, arena_scale=(NS - 1) / 2, t_init_mode="spread_1d"),
+            },
+            encoder="cgf", variant=VARIANT, total_timesteps=256, n_envs=1,
+            ppo_n_steps=128, batch_size=32, n_epochs=1, num_particles=NS,
+            device="cpu", seed=0, run_subdir="test_failed",
+            log_dir=str(tmp_path / "logs") + "/", model_save_path=str(model_path),
+            eval_freq=10**9, save_freq=10**9, n_eval_episodes=1,
+            extra_callbacks=[Die()])
+    # The crash artefacts are there, shaped like a finished run ...
+    assert model_path.exists() and (tmp_path / "models" / "vecnormalize.pkl").exists()
+    # ... and the status file says what they are.
+    status = json.loads((tmp_path / "models" / "run_status.json").read_text())
+    assert status["status"] == "failed"
+    assert "RuntimeError" in status["error"] and "simulated crash" in status["error"]
+    assert 40 <= status["timesteps"] < 256 and status["total_timesteps"] == 256
+    # The eval script resolves it from every saved-agent location.
+    (tmp_path / "models" / "best_model").mkdir(exist_ok=True)   # EvalCallback pre-creates it
+    (tmp_path / "models" / "checkpoints").mkdir(exist_ok=True)
+    for p in (model_path, tmp_path / "models" / "best_model" / "best_model.zip",
+              tmp_path / "models" / "checkpoints" / "odd_even_cgf_100_steps.zip"):
+        assert evaluate._read_run_status(str(p))["status"] == "failed", p
+    assert evaluate._read_run_status(str(tmp_path / "elsewhere" / "x.zip")) is None

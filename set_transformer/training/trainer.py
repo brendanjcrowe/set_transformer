@@ -636,6 +636,13 @@ class Trainer:
             # Evaluation
             if self.global_step % self.config.eval_freq == 0:
                 val_loss, val_metrics = self.evaluate()
+                # evaluate() leaves the model in eval mode; every remaining
+                # batch of this epoch trained that way until 2026-09-06. Inert
+                # for pf_st (LayerNorm + attention only) but the VAEs then
+                # decode the posterior mean instead of a sample while still
+                # paying the KL term, and the VQ-VAEs' EMA codebook update is
+                # gated on self.training (PITFALLS.md section 8 item 6).
+                self.model.train()
 
                 # Log to tensorboard
                 self.writer.add_scalar("val/loss", val_loss, self.global_step)

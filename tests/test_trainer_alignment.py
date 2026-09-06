@@ -85,6 +85,32 @@ def _epoch_losses(trainer):
     return losses
 
 
+def test_train_epoch_restores_train_mode_after_a_mid_epoch_evaluate(tmp_path, weighted_npz):
+    """PITFALLS.md section 8 item 6. evaluate() calls model.eval() and, until
+    2026-09-06, nothing switched the model back, so every batch after a
+    mid-epoch evaluation trained in eval mode (deterministic VAE posterior,
+    frozen VQ-VAE codebook). With eval_freq=1 every step evaluates; the model
+    must nevertheless be in training mode at the end of the epoch, and every
+    training forward after the first evaluation must have run in train mode."""
+    trainer = _trainer(tmp_path, weighted_npz, "evalmode", indexed=False, eval_freq=1)
+    modes = []
+    handle = trainer.model.register_forward_pre_hook(
+        lambda module, _inputs: modes.append(module.training))
+    try:
+        trainer.current_epoch = 0
+        trainer.train_epoch()
+    finally:
+        handle.remove()
+    assert trainer.model.training, "train_epoch left the model in eval mode"
+    # Forwards alternate: training batch (True), then evaluate() over the val
+    # set (False, ...). After the FIRST evaluation there must still be
+    # training-mode forwards, i.e. the flag was restored between them.
+    first_eval = modes.index(False)
+    assert any(modes[first_eval:]), (
+        "no training-mode forward after the first evaluate(): the model stayed "
+        "in eval mode for the rest of the epoch")
+
+
 def test_lambda_zero_leaves_the_reconstruction_path_untouched(tmp_path, weighted_npz):
     """With alignment off, an indexed loader and the new code path must give the
     SAME numbers as the plain loader: same seed, same batches, same losses."""
