@@ -72,19 +72,30 @@ from set_transformer.loss import ChamferDistanceLoss, SinkhornLoss
 
 ## ST autoencoder pretraining (model-agnostic)
 
-The canonical training entry point trains `PFSetTransformer` on a particle
-filter dataset to reconstruct unordered particle sets:
+The training entry point is `experiments/ant_tag/3_train_st.py`. Despite its
+location it is env-generic: it reads a `.npz` written by a domain's
+`2_collect_pf_dataset.py` (particles, PF weights, coordinate frame, git
+provenance) and never touches an env, so the same script pretrains the
+Odd-Even and Ant-Tag encoders. Set size, coordinate dimension, weightedness
+and frame all come from the dataset; a contradicting flag is an error.
 
 ```bash
-python -m set_transformer.training.main \
-    --data_path data/<domain>_pf_dataset.npy \
-    --dim_particles 2 \
-    --num_epochs 100 \
-    --batch_size 32 \
-    --loss_type chamfer
+cd experiments/ant_tag
+WANDB_MODE=offline python3 3_train_st.py \
+    --data_path data/<domain>_pf_dataset.npz \
+    --num_encodings 8 --dim_encoder 8 \
+    --sinkhorn_blur 0.02 --seed 0
 ```
 
-Available losses: `chamfer`, `sinkhorn`, `emd`, `hausdorff`.
+Trainable losses: `sinkhorn` (default; the only one that accepts weighted
+measures) and `chamfer` (unweighted sets only). `emd` is the eval metric and
+`hausdorff` is broken upstream in geomloss. `--align_lambda` adds the latent
+metric-alignment term (see `2b_precompute_emd.py`).
+
+`set_transformer/training/main.py` is RETIRED (2026-09-06): on a weighted
+dataset it scored the reconstruction against the weighted measure while
+feeding the encoder bare coordinates, and it took the set geometry from CLI
+defaults. Its banner has the details.
 
 ## RL pipeline (per domain)
 
@@ -139,12 +150,19 @@ Eval / rendering helpers in the same directory:
 
 ### Odd-Even BeliefMDP
 
-Discrete POMDP test bed (also from `pomdp-domains`). The ST pretraining
-step uses `set_transformer.training.main` directly with a domain-specific
-`--data_path`; only RL training has a per-domain script:
+Discrete POMDP test bed (also from `pomdp-domains`; four gym ids,
+`pdomains-odd-even-{10,50,50-long,50-short}-v0`). The pipeline lives in
+`experiments/odd_even/`: `2_collect_pf_dataset.py`, the shared `3_train_st.py`
+above for Sinkhorn pretraining, `3_pretrain_st_belief.py` for supervised
+pretraining on exact posteriors, `4_train_rl_{cgf,st,gaussian}.py`, and
+`eval_scripts/eval_true_reward_odd_even.py`. Results and run directories are
+recorded in the parent repo's `domain_mds/oddeven.md`.
+`experiments/odd_even/train_rl_pretrained.py` is retired (banner in file).
 
 ```bash
-python experiments/odd_even/train_rl_pretrained.py
+cd experiments/odd_even
+python3 4_train_rl_st.py --variant oe50_short --total_timesteps 3000000 \
+    --target_kl 0.03 --lr_anneal --pretrained_st_model_path <ckpt> --st_frozen
 ```
 
 ## Tests
