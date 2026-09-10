@@ -1,0 +1,21 @@
+{
+  "env": "msearch",
+  "encoder": "cgf",
+  "arm": "align",
+  "seed": 0,
+  "encoder_params": 1168,
+  "num_epochs": 60,
+  "loss_type": "sinkhorn",
+  "blur": 0.05,
+  "best_val_emd": 4.5456475734710695,
+  "wall_clock_sec": 118.3,
+  "align": {
+    "lam": 0.2,
+    "metric": "cosine",
+    "warmup_epochs": 15,
+    "ramp_epochs": 15
+  },
+  "best_epoch": 52,
+  "final_val_r": 0.695685625076294,
+  "selected_val_r": 0.6953759789466858
+}

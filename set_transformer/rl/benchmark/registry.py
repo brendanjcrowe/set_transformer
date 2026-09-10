@@ -90,7 +90,7 @@ class MethodSpec:
     extractor_class: type
     extractor_kwargs: dict = field(default_factory=dict)
     is_pretrainable: bool = False
-    encoder_kind: Optional[str] = None  # "st" | "ds" | "pn"
+    encoder_kind: Optional[str] = None  # "st" | "ds" | "pn" | "cgf"
     aligned: bool = False
 
 
@@ -248,11 +248,21 @@ ENV_REGISTRY: dict[str, EnvSpec] = {
 # from the shared CLI arch so every learned method moves together when it is changed;
 # dim_hidden is what differs per encoder family to bring their parameter counts in line.
 POOLING_ARCH = {"dim_hidden": 128}
+#: Same pin for the CGF: its autoencoder is pretrained with a dim_hidden=128 decoder, and
+#: `load_state_dict` is strict, so an extractor built at the CLI default (64, which suits
+#: the ST) fails to load the checkpoint even though the decoder never runs in the policy.
+CGF_ARCH = {"dim_hidden": 128}
 
 #: stat_dim every learned encoder is matched to.
 MATCHED_STAT_DIM = 16
 #: Learned encoders must land within this fraction of each other's parameter count.
 PARAM_PARITY_TOLERANCE = 0.15
+#: Encoder families exempt from the parameter band, though NOT from the matched
+#: bottleneck. The CGF is a handful of learned sampling points plus a linear readout
+#: (~1.2k parameters against ~100k); being cheap is the property it is in the benchmark
+#: to demonstrate, exactly as Gaussian and k-moments are at zero. Holding it to a band
+#: built for the deep encoders would mean padding it with parameters it does not use.
+PARAM_PARITY_EXEMPT_KINDS = {"cgf"}
 
 
 def _pretrained_methods() -> dict[str, MethodSpec]:
@@ -262,6 +272,7 @@ def _pretrained_methods() -> dict[str, MethodSpec]:
         "st": (SetTransformerExtractor, {}),
         "ds": (DeepSetExtractor, dict(POOLING_ARCH)),
         "pn": (PointNetExtractor, dict(POOLING_ARCH)),
+        "cgf": (CGFExtractor, dict(CGF_ARCH)),
     }
     out: dict[str, MethodSpec] = {}
     for kind, (cls, arch) in encoders.items():
@@ -279,7 +290,8 @@ METHOD_REGISTRY: dict[str, MethodSpec] = {
     # --- analytic baselines (no learned particle-side parameters) ---
     "gaussian": MethodSpec("gaussian", GaussianExtractor),
     "kmoments": MethodSpec("kmoments", KMomentsExtractor, {"k": 4}),
-    "cgf": MethodSpec("cgf", CGFExtractor),
+    "cgf": MethodSpec("cgf", CGFExtractor, dict(CGF_ARCH),
+                      is_pretrainable=True, encoder_kind="cgf"),
     # --- learned encoders trained from scratch with the policy ---
     "deepset": MethodSpec("deepset", DeepSetExtractor, dict(POOLING_ARCH),
                           is_pretrainable=True, encoder_kind="ds"),
@@ -298,6 +310,7 @@ METHOD_ORDER: list[str] = [
     "ds_frozen", "ds_finetune", "ds_align_frozen", "ds_align_finetune",
     "pn_frozen", "pn_finetune", "pn_align_frozen", "pn_align_finetune",
     "st_frozen", "st_finetune", "st_align_frozen", "st_align_finetune",
+    "cgf_frozen", "cgf_finetune", "cgf_align_frozen", "cgf_align_finetune",
 ]
 
 

@@ -370,7 +370,8 @@ def test_cgf_t_clamp_bounds_the_sampling_points():
 def test_cgf_frozen_t_is_not_trainable_but_still_saves():
     import torch
     frozen = _cgf(t_frozen=True)
-    assert "t_values" in frozen.state_dict()          # buffer still round-trips
+    # The encoder is shared with the autoencoder, so the buffer is nested under it.
+    assert any(k.endswith("t_values") for k in frozen.state_dict())
     assert not any(p is frozen.t_values for p in frozen.parameters())
     learned = _cgf(t_frozen=False)
     assert any(p is learned.t_values for p in learned.parameters())
@@ -429,3 +430,39 @@ def test_cgf_survives_extreme_particles():
     assert torch.isfinite(e(obs)).all()
     obs["particles"][0, 0] = float("nan")
     assert torch.isfinite(e(obs)).all()
+
+
+def test_cgf_autoencoder_checkpoint_loads_into_the_extractor(tmp_path):
+    """Pretraining and the policy must share one CGF implementation, or a checkpoint's
+    weights stop meaning what the consumer expects."""
+    import torch
+    from set_transformer.models import CGFAutoencoder
+    from set_transformer.rl.feature_extractors import CGFExtractor
+
+    arch = dict(num_particles=100, dim_particles=2, num_encodings=8, dim_encoder=2,
+                particle_scale=14.0)
+    ae = CGFAutoencoder(**arch)
+    ckpt = tmp_path / "cgf.pt"
+    torch.save(ae.state_dict(), ckpt)
+
+    space = _dict_space()
+    frozen = CGFExtractor(space, pretrained_model_path=str(ckpt), freeze=True,
+                          particle_scale=14.0)
+    assert torch.allclose(frozen.encoder.t_values, ae.encoder.t_values)
+    assert all(not p.requires_grad for p in frozen.encoder.parameters())
+    frozen.train(True)
+    assert not frozen.encoder.training
+
+    finetune = CGFExtractor(space, pretrained_model_path=str(ckpt), freeze=False,
+                            particle_scale=14.0)
+    assert all(p.requires_grad for p in finetune.encoder.parameters())
+
+
+def test_cgf_encoder_is_shared_between_autoencoder_and_extractor():
+    from set_transformer.models import CGFAutoencoder, CGFEncoder
+    from set_transformer.rl.feature_extractors import CGFExtractor
+    ae = CGFAutoencoder(num_particles=100, dim_particles=2, num_encodings=8,
+                        dim_encoder=2)
+    ex = CGFExtractor(_dict_space())
+    assert isinstance(ae.encoder, CGFEncoder) and isinstance(ex.encoder, CGFEncoder)
+    assert set(ae.encoder.state_dict()) == set(ex.encoder.state_dict())

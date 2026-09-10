@@ -154,11 +154,14 @@ def test_learned_encoder_parameter_counts_are_within_tolerance():
     # The paper's fairness claim: no learned encoder has a large capacity advantage. The
     # analytic baselines are excluded by design -- being parameter-free is their point.
     from set_transformer.rl.benchmark.registry import (
-        METHOD_ORDER, METHOD_REGISTRY, PARAM_PARITY_TOLERANCE,
+        METHOD_ORDER, METHOD_REGISTRY, PARAM_PARITY_EXEMPT_KINDS,
+        PARAM_PARITY_TOLERANCE,
     )
     counts = {
         m: _build_extractor(m).particle_encoder_parameters()
-        for m in METHOD_ORDER if METHOD_REGISTRY[m].is_pretrainable
+        for m in METHOD_ORDER
+        if METHOD_REGISTRY[m].is_pretrainable
+        and METHOD_REGISTRY[m].encoder_kind not in PARAM_PARITY_EXEMPT_KINDS
     }
     lo, hi = min(counts.values()), max(counts.values())
     assert lo > 0
@@ -205,3 +208,59 @@ def test_find_features_extractor_handles_sac_style_policies():
 
     with pytest.raises(AttributeError):
         train.find_features_extractor(_Neither())
+
+
+def test_cgf_honours_the_matched_bottleneck_even_though_it_is_param_exempt():
+    """The exemption is about parameter COUNT only. Every learned encoder, CGF included,
+    must still hand the policy the same width, or the comparison is not like-for-like."""
+    from set_transformer.rl.benchmark.registry import MATCHED_STAT_DIM
+    for method in ("cgf", "cgf_frozen", "cgf_align_finetune"):
+        assert _build_extractor(method)._particle_stat_dim() == MATCHED_STAT_DIM
+
+
+@pytest.mark.parametrize("kind,ae_name", [("cgf", "CGFAutoencoder"),
+                                          ("ds", "DeepSetAE"), ("pn", "PointNetAE")])
+def test_pretrained_checkpoints_load_into_their_extractor(tmp_path, kind, ae_name):
+    """Every pretrainable family must build its autoencoder with the SAME arch the
+    pretraining script uses.
+
+    `load_state_dict` is strict, so a decoder width that differs from the checkpoint's
+    fails the load even though the decoder never runs in the policy. This is not
+    hypothetical: 16 runs of a sweep died this way because CGF took the CLI's
+    dim_hidden=64 (chosen for the ST) while its checkpoint was written at 128.
+    """
+    import importlib
+    import torch
+    from set_transformer.rl.benchmark.registry import (
+        METHOD_REGISTRY, build_extractor_kwargs,
+    )
+    import set_transformer.models as models
+
+    pretrain = importlib.import_module("importlib.util")
+    spec = pretrain.spec_from_file_location(
+        "_pre", "experiments/benchmark/pretrain/3_pretrain_encoder.py")
+    mod = pretrain.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    ae_cls, ae_arch = mod.ENCODERS[kind]
+    assert ae_cls is getattr(models, ae_name)
+    ae = ae_cls(num_particles=100, dim_particles=2, num_encodings=8, dim_encoder=2,
+                **ae_arch)
+    ckpt = tmp_path / "enc.pt"
+    torch.save(ae.state_dict(), ckpt)
+
+    method = next(m for m, sp in METHOD_REGISTRY.items()
+                  if sp.encoder_kind == kind and m.endswith("_frozen")
+                  and "align" not in m)
+    ms = METHOD_REGISTRY[method]
+    kwargs = build_extractor_kwargs(
+        ms, 128, [64, 64], pretrained_model_path=str(ckpt),
+        # deliberately the ST-shaped CLI arch, which is what bit us
+        encoder_arch=dict(num_encodings=8, dim_encoder=2, num_inds=32, dim_hidden=64,
+                          num_heads=4, ln=True),
+    )
+    space = gym.spaces.Dict({
+        "obs": gym.spaces.Box(-1.0, 1.0, (8,)),
+        "particles": gym.spaces.Box(-9.0, 9.0, (100, 2)),
+    })
+    ms.extractor_class(space, **kwargs)      # must not raise

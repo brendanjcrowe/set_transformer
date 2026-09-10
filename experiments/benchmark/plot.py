@@ -55,6 +55,8 @@ METHOD_COLORS = {
     "gaussian": "tab:blue",
     "kmoments": "tab:cyan",
     "cgf": "tab:purple",
+    "cgf_frozen": "#6a3d9a", "cgf_finetune": "#9e79c4",
+    "cgf_align_frozen": "#c3a3dd", "cgf_align_finetune": "#e0d0ee",
     # from-scratch learned encoders
     "deepset": "tab:green",
     "pointnet": "tab:olive",

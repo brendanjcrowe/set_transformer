@@ -39,8 +39,14 @@ from torch.utils.data import DataLoader
 
 from set_transformer.data.dataset import IndexedDataset, POMDPDataset
 from set_transformer.emd_matrix import DEFAULT_BLUR, load_matrix
+from set_transformer.rl.benchmark.registry import get_env_spec
 from set_transformer.latent_alignment import flatten_upper_triangle
-from set_transformer.models import DeepSetAE, PFSetTransformer, PointNetAE
+from set_transformer.models import (
+    CGFAutoencoder,
+    DeepSetAE,
+    PFSetTransformer,
+    PointNetAE,
+)
 from set_transformer.training.autoencoder import (
     MIN_ALIGN_BATCH,
     AlignConfig,
@@ -56,12 +62,19 @@ ENCODERS = {
     "st": (PFSetTransformer, dict(num_inds=32, dim_hidden=64, num_heads=4, ln=True)),
     "ds": (DeepSetAE, dict(dim_hidden=128)),
     "pn": (PointNetAE, dict(dim_hidden=128)),
+    # particle_scale must match the env's EnvSpec, or the CGF evaluates at a different
+    # place on the moment<->support-function continuum than the policy will.
+    "cgf": (CGFAutoencoder, dict(dim_hidden=128, num_t=64, t_init_mode="spread")),
 }
 
 
 def build_encoder(kind: str, num_particles: int, particle_dim: int,
-                  num_encodings: int, dim_encoder: int) -> torch.nn.Module:
+                  num_encodings: int, dim_encoder: int,
+                  particle_scale: float | None = None) -> torch.nn.Module:
     cls, arch = ENCODERS[kind]
+    arch = dict(arch)
+    if kind == "cgf" and particle_scale is not None:
+        arch["particle_scale"] = particle_scale
     return cls(num_particles=num_particles, dim_particles=particle_dim,
                num_encodings=num_encodings, dim_encoder=dim_encoder, **arch)
 
@@ -94,7 +107,8 @@ def run_one(kind: str, aligned: bool, args, train_pts, eval_pts, emd_train, val_
                             shuffle=False)
 
     model = build_encoder(kind, train_pts.shape[1], train_pts.shape[2],
-                          args.num_encodings, args.dim_encoder).to(args.device)
+                          args.num_encodings, args.dim_encoder,
+                          particle_scale=args.particle_scale).to(args.device)
     n_params = sum(p.numel() for p in encoder_module(model).parameters())
     print(f"encoder params: {n_params:,}", flush=True)
 
@@ -164,6 +178,8 @@ def main() -> None:
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--loss", choices=["chamfer", "sinkhorn"], default="sinkhorn")
     ap.add_argument("--blur", type=float, default=DEFAULT_BLUR)
+    ap.add_argument("--particle_scale", type=float, default=None,
+                    help="CGF only; defaults to the env's EnvSpec.particle_scale")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--progress_every", type=int, default=10)
     # alignment
