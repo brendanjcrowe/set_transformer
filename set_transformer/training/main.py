@@ -1,4 +1,42 @@
-"""Main script for running Set Transformer training experiments."""
+"""RETIRED 2026-09-06. Do not use. Superseded by experiments/ant_tag/3_train_st.py.
+
+Kept as history only; nothing imports it and no checkpoint any RL run consumed
+was produced by it (checked across both experiment directories and the
+collaborator's exp/PaperResults branch). It is unsafe on the datasets this
+repo now produces, for three independent reasons (domain_mds/PITFALLS.md
+section 8, item 4):
+
+1. HALF-WEIGHTED OBJECTIVE. It builds the loaders with the default
+   load_weights=True, so a weighted .npz yields (particles, weights) and the
+   Trainer scores the reconstruction against the WEIGHTED target measure --
+   but it never sets TrainingConfig.weighted_particles, so the encoder gets
+   bare coordinates and cannot see which particles carry the mass. On the
+   Odd-Even exact-support filter every belief has the same 50 positions and
+   only the weights differ, so the encoder sees one input and is asked for 50
+   different targets. Training runs without error, and the checkpoint's
+   config.weighted_particles=False then tells the RL side to drop the weight
+   channel too, so nothing downstream detects it. With --loss_type chamfer
+   the weighted path raises; with sinkhorn it trains quietly.
+2. SET GEOMETRY FROM CLI DEFAULTS. --num_particles / --dim_particles default
+   to 500 / 4 instead of being read from the dataset. A wrong value is silent:
+   Sinkhorn compares sets of different sizes without complaint and the ISAB
+   encoder accepts any set size (PITFALLS.md section 4).
+3. NO FRAME RECORD. It does not record particle_scale / particle_centre in
+   the checkpoint, so the RL-side frame check (st.py) cannot refuse a
+   mismatched encoder.
+
+experiments/ant_tag/3_train_st.py does all three correctly (weights and set
+geometry from the dataset, contradicting flags refused, frame recorded), is
+env-generic (it reads a .npz and never touches an env), and adds the latent
+metric-alignment option. Use it for every domain:
+
+    cd set_transformer/experiments/ant_tag
+    WANDB_MODE=offline python3 3_train_st.py \
+        --data_path ../odd_even/data/oe50_short_pf_dataset.npz \
+        --num_encodings 8 --dim_encoder 8 --sinkhorn_blur 0.02 --seed 0
+
+The code below is unchanged from the last live version and still runs.
+"""
 
 import argparse
 from datetime import datetime
@@ -15,8 +53,14 @@ from .experiment import run_training_experiments
 
 
 def get_loss_choices() -> List[str]:
-    """Get available loss function choices."""
-    return ["emd", "chamfer", "sinkhorn", "hausdorff"]
+    """Trainable loss functions.
+
+    "emd" (the eval metric, no gradient) and "hausdorff" (broken upstream in
+    geomloss) used to be listed here, and "emd" was the default: every run
+    crashed on its first backward() and the runner still printed "All
+    experiments completed!".
+    """
+    return ["chamfer", "sinkhorn"]
 
 
 def create_experiment_name(base_name: str, loss_type: str) -> str:
@@ -89,18 +133,25 @@ def main() -> None:
         "--clip_grad_norm", type=float, default=1.0, help="Gradient clipping norm"
     )
 
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="Seeds model init, batch order and the train/val split.",
+    )
+
     # Loss function settings
     parser.add_argument(
         "--loss_type",
         type=str,
         choices=get_loss_choices(),
-        default="emd",
+        default="sinkhorn",
         help="Type of loss function to use",
     )
     parser.add_argument(
         "--sinkhorn_blur",
         type=float,
-        default=0.5,
+        default=0.05,
         help="Blur parameter for Sinkhorn loss",
     )
     parser.add_argument(
@@ -226,6 +277,7 @@ def main() -> None:
         data_path=args.data_path,
         device="cuda" if torch.cuda.is_available() else "cpu",
         num_workers=args.num_workers,
+        seed=args.seed,
     )
 
     # Create a single config from command line arguments
@@ -259,6 +311,7 @@ def main() -> None:
         loss_type=args.loss_type,
         sinkhorn_blur=args.sinkhorn_blur,
         sinkhorn_scaling=args.sinkhorn_scaling,
+        seed=args.seed,
         # Logging parameters
         log_freq=args.log_freq,
         eval_freq=args.eval_freq,

@@ -4,9 +4,11 @@ from set_transformer.rl.particle_filters.car_flag import CarFlagParticleFilter
 from set_transformer.rl.particle_filters.multimodal_search import (
     MultimodalSearchParticleFilter,
 )
-from set_transformer.rl.particle_filters.odd_even import OddEvenParticleFilter
-from set_transformer.rl.particle_filters.odd_even_parity import (
-    ParityAwareOddEvenParticleFilter,
+from set_transformer.rl.particle_filters.odd_even import (
+    OddEvenBootstrapParticleFilter,
+    OddEvenExactSupportParticleFilter,
+    # Deprecated alias of the exact-support filter; see odd_even.py.
+    OddEvenParticleFilter,
 )
 
 __all__ = [
@@ -14,6 +16,8 @@ __all__ = [
     "AntTagParticleFilter",
     "CarFlagParticleFilter",
     "MultimodalSearchParticleFilter",
+    "OddEvenExactSupportParticleFilter",
+    "OddEvenBootstrapParticleFilter",
     "OddEvenParticleFilter",
     "ParityAwareOddEvenParticleFilter",
 ]

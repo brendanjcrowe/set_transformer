@@ -38,6 +38,7 @@ from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
 import pdomains  # noqa: F401 - registers pdomains-ant-tag-v0
+import variants  # noqa: E402 - env/filter/subdir registry
 
 
 # Reuse the existing AntTag curriculum/PF/dict-obs utilities. The dict-obs env
@@ -58,59 +59,18 @@ _make_vec_normalize = _train_rl_cgf._make_vec_normalize
 _make_vec_env_from_fns = _train_rl_cgf._make_vec_env_from_fns
 AntTagParticleFilter = _train_rl_cgf.AntTagParticleFilter
 _tee_stdout_stderr = _train_rl_cgf._tee_stdout_stderr
+_git_provenance = _train_rl_cgf._git_provenance
 
-
-class WeightedGaussianFeaturesExtractor(BaseFeaturesExtractor):
-    """SB3 feature extractor for weighted Gaussian (mean + covariance) particle features.
-
-    Computes the weighted mean and covariance of the particle set (normalized
-    by arena_scale, matching WeightedCGFFeaturesExtractor's particle scaling),
-    then exposes [mean, var, off-diagonal covariance] as features. For
-    particle_dim=D this is D + D + D*(D-1)/2 features (5 for D=2).
-    """
-
-    def __init__(
-        self,
-        observation_space: gym.spaces.Dict,
-        arena_scale: float = 4.5,
-    ):
-        obs_dim = observation_space["obs"].shape[0]
-        particle_dim = observation_space["particles"].shape[1]
-        num_gaussian_features = particle_dim + particle_dim + particle_dim * (particle_dim - 1) // 2
-        super().__init__(observation_space, features_dim=obs_dim + num_gaussian_features)
-
-        self.particle_dim = particle_dim
-        self.arena_scale = arena_scale
-
-        triu_indices = torch.triu_indices(particle_dim, particle_dim, offset=1)
-        self.register_buffer("triu_rows", triu_indices[0])
-        self.register_buffer("triu_cols", triu_indices[1])
-
-    def forward(self, obs_dict: dict[str, torch.Tensor]) -> torch.Tensor:
-        base_obs = obs_dict["obs"]
-        particles = obs_dict["particles"] / self.arena_scale
-        weights = obs_dict["weights"]
-
-        particles = torch.nan_to_num(particles, nan=0.0, posinf=1.0, neginf=-1.0)
-        weights = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
-        weights = torch.clamp(weights, min=0.0)
-        weights = weights / (weights.sum(dim=1, keepdim=True) + 1e-8)
-
-        w = weights.unsqueeze(-1)  # [B, N, 1]
-        mean = torch.sum(w * particles, dim=1)  # [B, D]
-
-        centered = particles - mean.unsqueeze(1)  # [B, N, D]
-        cov = torch.einsum("bni,bnj->bij", w * centered, centered)  # [B, D, D]
-        cov = torch.nan_to_num(cov, nan=0.0)
-
-        # Weighted variance can dip slightly below zero from floating-point
-        # cancellation (mean subtracted then squared back out); clamp so the
-        # policy never sees a negative "variance" feature.
-        var = torch.clamp(torch.diagonal(cov, dim1=-2, dim2=-1), min=0.0)  # [B, D]
-        off_diag_cov = cov[:, self.triu_rows, self.triu_cols]  # [B, D*(D-1)/2]
-
-        gaussian_features = torch.cat([mean, var, off_diag_cov], dim=-1)
-        return torch.cat([base_obs, gaussian_features], dim=-1)
+# The Gaussian belief encoder now lives in the shared package so a second
+# domain can use it without importing an Ant-Tag script. It is re-exported
+# here, unchanged and as the SAME object, because SB3 pickles a policy's
+# features-extractor CLASS into the saved zip by module path: loading an
+# existing checkpoint runs
+# getattr(import_module("4_train_rl_gaussian"),
+#         "WeightedGaussianFeaturesExtractor").
+from set_transformer.rl.feature_extractors.gaussian import (  # noqa: E402
+    WeightedGaussianFeaturesExtractor,
+)
 
 
 def _default_run_dir(seed: int, run_subdir: str = "ant_tag_gaussian",
@@ -287,6 +247,11 @@ def train_ant_tag_gaussian(
         save_freq=max(save_freq // n_envs, 1),
         save_path=os.path.join(model_dir, "checkpoints") if model_dir else "checkpoints",
         name_prefix="ant_tag_gaussian",
+        # Also snapshot VecNormalize with every checkpoint: without it the
+        # 100k-step checkpoints cannot be evaluated faithfully (the obs
+        # normalization is otherwise written once, at the end), and a run
+        # killed early is a total loss (PITFALLS.md section 7).
+        save_vecnormalize=True,
     )
     eval_cb = EvalCallback(
         eval_vec_env,
@@ -342,16 +307,23 @@ def _parse_reward_schedule(reward_schedule: str) -> list[tuple[float, ...]]:
     return schedule
 
 
-def main(
-    env_id: str = "pdomains-ant-tag-v0",
-    particle_filter_class: type = AntTagParticleFilter,
-    run_subdir: str = "ant_tag_gaussian",
-):
+def main(encoder: str = "gaussian"):
+    """Entry point. --variant selects env id, particle filter and run subdir
+    together from variants.py, so the three cannot disagree."""
     parser = argparse.ArgumentParser(
         description=(
             "RL with weighted Gaussian (mean+covariance) particle-belief "
-            f"features on AntTag (env_id={env_id})"
+            "features on AntTag. Use --variant to pick the env; "
+            "--list_variants to see them."
         )
+    )
+    variants.add_variant_argument(parser)
+    parser.add_argument(
+        "--run_subdir", type=str, default=None,
+        help="Override the derived runs/ant_tag_gaussian[_<variant>] "
+             "directory. For a sweep that needs its own tree "
+             "(e.g. ant_tag_cgf_cdens_hard_dist0), which the "
+             "derived name cannot express.",
     )
     parser.add_argument("--algorithm", type=str, default="PPO", choices=["PPO", "SAC"])
     parser.add_argument("--total_timesteps", type=int, default=3_000_000)
@@ -390,13 +362,13 @@ def main(
         "--log_dir",
         type=str,
         default=None,
-        help=f"Defaults to runs/{run_subdir}/<timestamp>_seed<seed>/logs/",
+        help="Defaults to runs/ant_tag_gaussian[_<variant>]/<timestamp>_seed<seed>/logs/",
     )
     parser.add_argument(
         "--model_save_path",
         type=str,
         default=None,
-        help=f"Defaults to runs/{run_subdir}/<timestamp>_seed<seed>/models/gaussian_agent.zip",
+        help="Defaults to runs/ant_tag_gaussian[_<variant>]/<timestamp>_seed<seed>/models/gaussian_agent.zip",
     )
     parser.add_argument("--eval_freq", type=int, default=20_000)
     parser.add_argument("--save_freq", type=int, default=100_000)
@@ -408,17 +380,33 @@ def main(
         help="Policy/value MLP sizes, e.g. '256,256'.",
     )
 
-    parser.add_argument("--distance_coeff", type=float, default=1.0)
-    parser.add_argument("--entropy_coeff", type=float, default=0.0)
+    parser.add_argument(
+        "--distance_coeff", type=float, default=None,
+        help="Constant PF-mean-distance shaping coefficient (default 1.0). "
+             "Only honoured with --reward_schedule none: the schedule sets "
+             "these coefficients on every step, so combining the two is an "
+             "error rather than a silent override.")
+    parser.add_argument(
+        "--entropy_coeff", type=float, default=None,
+        help="Constant PF belief-entropy shaping coefficient (default 0.0). "
+             "NOT PPO's entropy bonus. Same rule as --distance_coeff.")
     parser.add_argument(
         "--curriculum",
         type=str,
-        default="0:100,0.3:100,0.7:3,1:3",
+        default=None,
+        help="Visibility curriculum 'frac:radius,...'. Defaults to the "
+             "variant's own curriculum, else the base schedule.",
     )
     parser.add_argument(
         "--reward_schedule",
         type=str,
-        default="0:1:0:0,0.3:1:0:0,0.7:0:0:50,1:0:0:50",
+        default=None,
+        help="Defaults to the variant's own recipe (variants.py default_reward_schedule), else "
+             "'0:1:0:0,0.3:1:0:0,0.7:0:0:50,1:0:0:50' (PF-entropy 0 throughout). "
+             "Shaping schedule 'frac:distance:entropy[:tag_bonus],...', "
+             "interpolated over training progress and applied on every step. "
+             "Pass 'none' to run on the constant --distance_coeff / "
+             "--entropy_coeff values instead; giving both is an error.",
     )
     parser.add_argument(
         "--evasion_curriculum",
@@ -476,6 +464,30 @@ def main(
     parser.add_argument("--n_eval_episodes", type=int, default=20)
 
     args = parser.parse_args()
+    # Before _resolve_reward_shaping: it reads an empty schedule as "use the
+    # constant flags", so a None default must be resolved first.
+    args.reward_schedule = variants.resolve_schedule(
+        args.variant, args.reward_schedule, "default_reward_schedule",
+        "0:1:0:0,0.3:1:0:0,0.7:0:0:50,1:0:0:50")
+    _train_rl_cgf._resolve_reward_shaping(parser, args)
+    if args.list_variants:
+        variants.print_variants()
+        return
+
+    variant = variants.resolve(args.variant)
+    env_id = variant.env_id
+    particle_filter_class = variant.particle_filter
+    run_subdir = args.run_subdir or variants.run_subdir(
+        encoder, args.variant)
+    args.curriculum = variants.resolve_schedule(
+        args.variant, args.curriculum, "default_curriculum",
+        "0:100,0.3:100,0.7:3,1:3")
+    variants.warn_if_not_evading(
+        args.variant, args.evasion_curriculum, args.target_speed_scale)
+    args.evasion_curriculum = variants.resolve_schedule(
+        args.variant, args.evasion_curriculum, "default_evasion_curriculum",
+        None)
+
     net_arch = [int(x) for x in args.net_arch.split(",")] if args.net_arch else None
     obs_mask = [-2, -1] if args.mask_target_obs else None
 
@@ -489,12 +501,21 @@ def main(
     print(f"Mirroring stdout/stderr to {stdout_log_path}")
 
     run_config = vars(args).copy()
+    # The resolved run_subdir is passed explicitly below; drop the raw flag so
+    # the two do not collide as duplicate keyword arguments. --list_variants
+    # already returned by this point and is not part of the run's identity.
+    run_config.pop("run_subdir", None)
+    run_config.pop("list_variants", None)
     run_config.update(log_dir=log_dir, model_save_path=model_save_path)
+    # env_id / particle_filter_class / run_subdir are derived from --variant,
+    # but they are still written out: run_config.json stays a complete record
+    # even if the registry entry is later edited.
     _write_run_config(
         run_dir,
         env_id=env_id,
         particle_filter_class=particle_filter_class.__name__,
         run_subdir=run_subdir,
+        git=_git_provenance(),
         **run_config,
     )
 

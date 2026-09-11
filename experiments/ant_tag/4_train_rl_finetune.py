@@ -1,3 +1,33 @@
+"""RETIRED 2026-09-03. Do not use. Superseded by 4_train_rl_st.py.
+
+Nothing imports this file. Its only mention in the repo is one docstring line
+in 4_train_rl_st.py, explaining why that file exists instead of this one.
+
+Results from this script are NOT comparable with the CGF / Gaussian / ST arms.
+It is an earlier generation of the pipeline: it hardcodes pdomains-ant-tag-v0 +
+AntTagParticleFilter, and it lacks --run_tag / run_config.json (so a run leaves
+no record of what it used), --evasion_curriculum, --target_speed_scale,
+--lr_anneal, --target_kl, and the deterministic per-episode particle-filter
+seeding the other arms have since gained. Comparing its numbers against theirs
+compares two different experiments.
+
+Its sibling 4_train_rl_frozen.py is NOT retired: it is still live
+infrastructure. 4_train_rl_cgf.py takes six symbols from it
+(CurriculumCallback, CurriculumVisibilityWrapper, PFRewardShapingWrapper,
+_CurriculumRouter, ant_tag_pf_interaction_mapper, get_ant_tag_pf_kwargs), and
+the CGF, Gaussian and ST arms all inherit them from there. Do not delete it.
+
+Use instead:
+    python3 4_train_rl_st.py --variant <name> \
+        --pretrained_st_model_path <checkpoint> [--st_frozen]
+
+which reloads and re-freezes the pretrained encoder AFTER PPO(...) returns --
+the fix for PITFALLS.md section 1, the bug that cost this project two 6M-step
+runs. This file never had that fix.
+
+ORIGINAL FILE BELOW, UNCHANGED.
+"""
+
 """
 RL training with a fine-tunable (pretrained) Set Transformer for Ant-Tag.
 
@@ -11,9 +41,19 @@ Usage:
         --algorithm PPO --total_timesteps 3000000 --n_envs 4
 """
 
+import sys
 import argparse
 import importlib
 import os
+from pathlib import Path
+
+# Same bootstrap as the rest of this directory: put the package root on
+# sys.path so `set_transformer` resolves to the package, not the submodule
+# directory of the same name.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
 
 import gymnasium as gym
 import matplotlib

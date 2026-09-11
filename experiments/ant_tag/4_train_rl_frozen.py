@@ -12,8 +12,18 @@ Usage:
         --algorithm PPO --total_timesteps 2000000 --n_envs 4
 """
 
+import sys
 import argparse
 import os
+from pathlib import Path
+
+# Same bootstrap as the rest of this directory: put the package root on
+# sys.path so `set_transformer` resolves to the package, not the submodule
+# directory of the same name.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
 
 import gymnasium as gym
 import matplotlib
@@ -141,28 +151,49 @@ class PFRewardShapingWrapper(gym.Wrapper):
     """
     Dense reward shaping using the particle filter belief state.
 
-    Three components:
+    Four components:
       1. Distance: -dist_to_pf_mean (closer to belief mean = higher reward)
       2. Entropy: -sum(w_i * log(w_i)) of PF weights (lower entropy = higher reward)
       3. Tag bonus: large reward on successful tag (terminated=True)
+      4. Spread gain (2026-09-08): + (spread_{t-1} - spread_t), where spread is
+         the weighted std of the particle POSITIONS averaged over coordinates
+         (the collector's belief-spread measure). Pays for shrinking the
+         region the target could be in -- a sweep through a mass-carrying
+         part of a diffuse belief removes particles and earns it; standing
+         still (diffusion grows the spread) or re-sweeping an empty region
+         earns nothing. Potential-based: over an episode it telescopes to the
+         total shrinkage. Added because the weight entropy (2) is ~constant
+         during a blind search (weights are uniform after every resample),
+         so it carries no signal about WHERE to look
+         (domain_mds/smart_mid_slow_v15_ant_tag.md, 2026-09-08). gain_coeff 0
+         (the default and the meaning of a 3- or 4-field schedule) reproduces
+         the historical reward exactly.
 
     Coefficients are mutable — the CurriculumCallback can phase distance out
     and tag bonus in over the course of training.
     """
 
     def __init__(self, env: gym.Env, distance_coeff: float = 1.0,
-                 entropy_coeff: float = 0.0, tag_bonus_coeff: float = 0.0):
+                 entropy_coeff: float = 0.0, tag_bonus_coeff: float = 0.0,
+                 gain_coeff: float = 0.0):
         super().__init__(env)
         self.distance_coeff = distance_coeff
         self.entropy_coeff = entropy_coeff
         self.tag_bonus_coeff = tag_bonus_coeff
+        self.gain_coeff = gain_coeff
+        self._prev_spread: float | None = None
 
     def set_reward_coeffs(self, distance_coeff: float, entropy_coeff: float,
-                          tag_bonus_coeff: float):
-        """Called by CurriculumCallback to phase reward components."""
+                          tag_bonus_coeff: float, gain_coeff: float | None = None):
+        """Called by CurriculumCallback to phase reward components.
+
+        gain_coeff is optional so 3-argument callers (every pre-2026-09-08
+        schedule) keep working; None leaves the current value untouched."""
         self.distance_coeff = distance_coeff
         self.entropy_coeff = entropy_coeff
         self.tag_bonus_coeff = tag_bonus_coeff
+        if gain_coeff is not None:
+            self.gain_coeff = gain_coeff
 
     def _get_pf_wrapper(self):
         """Walk the wrapper stack to find a wrapper exposing a particle_filter."""
@@ -179,8 +210,20 @@ class PFRewardShapingWrapper(gym.Wrapper):
         w = weights[weights > 0]
         return -float(np.sum(w * np.log(w)))
 
+    @staticmethod
+    def _pf_spread(particles: np.ndarray, weights: np.ndarray) -> float:
+        """Weighted std of the particle positions per coordinate, averaged
+        (same measure as 2_collect_pf_dataset._weighted_spread)."""
+        w = np.clip(np.nan_to_num(weights, nan=0.0), 0.0, None)
+        w = w / max(float(w.sum()), 1e-12)
+        mu = (w[:, None] * particles).sum(axis=0)
+        var = (w[:, None] * (particles - mu) ** 2).sum(axis=0)
+        return float(np.sqrt(np.maximum(var, 0.0)).mean())
+
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
+        pf = self._get_pf_wrapper().particle_filter
+        self._prev_spread = self._pf_spread(pf.particles, pf.weights)
         return obs, info
 
     def step(self, action):
@@ -195,15 +238,30 @@ class PFRewardShapingWrapper(gym.Wrapper):
         dist_to_mean = float(np.linalg.norm(ant_pos - pf_mean))
         entropy = self._pf_entropy(pf.weights)
 
+        spread = self._pf_spread(pf.particles, pf.weights)
+        if self._prev_spread is None:      # step() without reset(): no baseline
+            self._prev_spread = spread
+        spread_gain = self._prev_spread - spread
+        self._prev_spread = spread
+
         distance_reward = self.distance_coeff * (-dist_to_mean)
         entropy_reward = self.entropy_coeff * (-entropy)
-        tag_bonus = self.tag_bonus_coeff if terminated else 0.0
+        gain_reward = self.gain_coeff * spread_gain
+        # Historically every base AntTag termination was a successful tag.
+        # New variants may also terminate on an explicit failure state, in
+        # which case the environment publishes is_success=False.  The fallback
+        # preserves behavior for every legacy environment.
+        is_success = bool(info.get("is_success", terminated))
+        tag_bonus = self.tag_bonus_coeff if is_success else 0.0
 
-        shaped_reward = reward + distance_reward + entropy_reward + tag_bonus
+        shaped_reward = reward + distance_reward + entropy_reward + tag_bonus + gain_reward
         info["distance_reward"] = distance_reward
         info["entropy_reward"] = entropy_reward
         info["tag_bonus"] = tag_bonus
+        info["gain_reward"] = gain_reward
         info["pf_entropy"] = entropy
+        info["pf_spread"] = spread
+        info["pf_spread_gain"] = spread_gain
         info["dist_to_pf_mean"] = dist_to_mean
         return obs, shaped_reward, terminated, truncated, info
 
@@ -346,12 +404,25 @@ class CurriculumCallback(BaseCallback):
                 return tuple(lo + t * (hi - lo) for lo, hi in zip(vals_lo, vals_hi))
         return schedule[-1][1:]
 
+    def _on_training_start(self) -> None:
+        # Apply the schedule at the CURRENT progress before the first env step.
+        # For a fresh run progress is 0 and this repeats the constructor's
+        # values; for a run resumed from a mid-run checkpoint (4_train_rl_st.py
+        # --resume_from, 2026-09-08) the envs were just built with the
+        # progress-0 radius and coefficients, and without this the first
+        # n_envs steps of the fork would be rewarded under the wrong schedule.
+        self._apply(self.num_timesteps / self.total_timesteps, announce=True)
+
     def _on_step(self) -> bool:
-        progress = self.num_timesteps / self.total_timesteps
+        self._apply(self.num_timesteps / self.total_timesteps)
+        return True
+
+    def _apply(self, progress: float, announce: bool = False) -> None:
         (radius,) = self._interpolate_schedule(self.schedule, progress)
         reward_vals = self._interpolate_schedule(self.reward_schedule, progress)
         dist_coeff, ent_coeff = reward_vals[0], reward_vals[1]
         tag_bonus_coeff = reward_vals[2] if len(reward_vals) > 2 else 0.0
+        gain_coeff = reward_vals[3] if len(reward_vals) > 3 else 0.0
         (evasion_scale,) = self._interpolate_schedule(self.evasion_schedule, progress)
 
         # Update all training envs (works through VecNormalize → SubprocVecEnv)
@@ -365,23 +436,22 @@ class CurriculumCallback(BaseCallback):
             # DummyVecEnv — direct access
             for env in vec_env.envs:
                 _set_radius_recursive(env, radius)
-                _set_reward_coeffs_recursive(env, dist_coeff, ent_coeff, tag_bonus_coeff)
+                _set_reward_coeffs_recursive(env, dist_coeff, ent_coeff, tag_bonus_coeff, gain_coeff)
                 _set_evasion_scale_recursive(env, evasion_scale)
         elif hasattr(vec_env, "env_method"):
             # SubprocVecEnv — call into subprocesses
             vec_env.env_method("set_curriculum_radius", radius)
-            vec_env.env_method("set_reward_coeffs", dist_coeff, ent_coeff, tag_bonus_coeff)
+            vec_env.env_method("set_reward_coeffs", dist_coeff, ent_coeff, tag_bonus_coeff, gain_coeff)
             vec_env.env_method("set_evasion_scale", evasion_scale)
 
-        if self.verbose > 0 and self.num_timesteps % 10000 < (self.training_env.num_envs if self.training_env else 1):
+        if self.verbose > 0 and (announce or self.num_timesteps % 10000 < (self.training_env.num_envs if self.training_env else 1)):
             print(
                 f"[Curriculum] step={self.num_timesteps}, progress={progress:.2f}, "
                 f"vis_radius={radius:.2f}, dist_coeff={dist_coeff:.3f}, "
                 f"ent_coeff={ent_coeff:.3f}, tag_bonus={tag_bonus_coeff:.1f}, "
-                f"evasion_scale={evasion_scale:.2f}"
+                f"gain_coeff={gain_coeff:.2f}, evasion_scale={evasion_scale:.2f}"
+                + (" (applied at training start)" if announce else "")
             )
-
-        return True
 
 
 def _set_radius_recursive(env, radius: float):
@@ -405,12 +475,12 @@ def _set_evasion_scale_recursive(env, scale: float):
 
 
 def _set_reward_coeffs_recursive(env, distance_coeff: float, entropy_coeff: float,
-                                  tag_bonus_coeff: float):
+                                  tag_bonus_coeff: float, gain_coeff: float | None = None):
     """Walk the wrapper stack and set reward coefficients on PFRewardShapingWrapper."""
     e = env
     while e is not None:
         if isinstance(e, PFRewardShapingWrapper):
-            e.set_reward_coeffs(distance_coeff, entropy_coeff, tag_bonus_coeff)
+            e.set_reward_coeffs(distance_coeff, entropy_coeff, tag_bonus_coeff, gain_coeff)
             return
         e = getattr(e, "env", None)
 
@@ -422,9 +492,9 @@ class _CurriculumRouter(gym.Wrapper):
         _set_radius_recursive(self.env, radius)
 
     def set_reward_coeffs(self, distance_coeff: float, entropy_coeff: float,
-                          tag_bonus_coeff: float):
+                          tag_bonus_coeff: float, gain_coeff: float | None = None):
         _set_reward_coeffs_recursive(self.env, distance_coeff, entropy_coeff,
-                                     tag_bonus_coeff)
+                                     tag_bonus_coeff, gain_coeff)
 
     def set_evasion_scale(self, scale: float):
         _set_evasion_scale_recursive(self.env, scale)

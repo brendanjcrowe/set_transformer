@@ -1,3 +1,38 @@
+"""RETIRED 2026-09-03. Do not use. Superseded by 4_train_rl_{cgf,st,gaussian}.py.
+
+Kept as history only, because it is the evidence for Gap 11 in
+domain_mds/oddeven.md. It cannot produce a number comparable with the current
+arms, for five independent reasons:
+
+1. It runs the Set Transformer inside a gym.Wrapper, on the CPU, per env step,
+   and REPLACES the observation with the ST features. So the encoder can never
+   be trained end to end, and the CGF-matched arm -- the one that matters --
+   is not expressible at all.
+2. It uses PretrainedSetTransformerProcessor, which carries hardcoded Odd-Even
+   assumptions and infers particle_dim = 1 by fallback.
+3. It ignores the particle-filter weights entirely. On this domain the belief
+   IS the weights: the exact posterior's effective sample size falls to about
+   1 of 50, so an unweighted read sees a near-uniform cloud and learns almost
+   nothing.
+4. It feeds the env's raw observation bag straight to the encoder, so it
+   inherits Gap 3 -- at the old n_particles=100 default the state was revealed
+   at step 1 and no encoder could be told apart from any other.
+5. It applies VecNormalize(norm_obs=True) to the ST features, and normalizes
+   the eval env with SEPARATELY accumulated statistics.
+
+It also predates the fix for PITFALLS.md section 1: because its extractor lives
+in a wrapper rather than in the policy, it never had to confront SB3's
+ActorCriticPolicy._build re-initializing the features extractor -- and so it
+offers no guidance for the arms that do.
+
+Use instead:
+    python3 4_train_rl_cgf.py      --variant oe50    # the baseline
+    python3 4_train_rl_st.py       --variant oe50 [--pretrained_st_model_path ...]
+    python3 4_train_rl_gaussian.py --variant oe50    # reference
+
+ORIGINAL FILE BELOW, UNCHANGED.
+"""
+
 """
 Training script for RL with pretrained Set Transformer on OddEvenPOMDP environment.
 

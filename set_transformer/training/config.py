@@ -29,6 +29,15 @@ class TrainingConfig:
     num_heads: int = 4
     use_layer_norm: bool = True
 
+    # Weighted particle sets (option B: mass in the measure, not the metric).
+    # `dim_particles` always means the COORDINATE dimension D of a particle.
+    # With weighted_particles=True the encoder additionally reads a mass
+    # channel, so its input is D+1 while the decoder still reconstructs D
+    # coordinates, and the reconstruction loss compares the weighted target
+    # measure against the uniform reconstruction. Requires model_type "pf_st"
+    # and a loss that accepts weights (sinkhorn / hausdorff / emd).
+    weighted_particles: bool = False
+
     # VAE-specific (ignored unless model_type == "set_vae")
     kl_weight: float = 1.0
 
@@ -49,14 +58,53 @@ class TrainingConfig:
     warmup_epochs: int = 10
     min_lr: float = 1e-6
 
-    # Loss parameters
-    loss_type: str = "hausdorff"  # ["hausdorff", "chamfer", "sinkhorn"]
-    sinkhorn_blur: float = 0.5
+    # Loss parameters.
+    # Sinkhorn is the default: it is the only differentiable loss here that
+    # accepts weighted measures, and unlike Chamfer it is an actual metric
+    # between point distributions. ("hausdorff" was the old default and is
+    # broken upstream in geomloss, which needs a kernel name it is never given.)
+    # Trainable choices: "sinkhorn" (weighted or not), "chamfer" (unweighted
+    # only). "emd" is the eval metric and has no gradient; "hausdorff" is
+    # broken upstream. Trainer._setup_loss refuses both.
+    loss_type: str = "sinkhorn"  # ["sinkhorn", "chamfer"]
+    # Blur is in COORDINATE UNITS: the length scale below which the loss stops
+    # telling points apart. Set it well under the smallest belief structure you
+    # need resolved (e.g. a den of radius 0.4 needs blur << 0.4).
+    sinkhorn_blur: float = 0.05
     sinkhorn_scaling: float = 0.5
+
+    # Latent metric alignment (set_transformer.latent_alignment). Adds
+    # align_lambda * (1 - pearson_r) between the batch's latent pairwise
+    # (cosine) distances and the corresponding entries of a precomputed
+    # pairwise debiased-Sinkhorn matrix over the dataset (emd_matrix.py --
+    # weighted when the dataset is). 0.0 = off (the default; nothing else in
+    # this block is read then). lambda is held at 0 for align_warmup_epochs and
+    # ramped linearly over align_ramp_epochs: alignment must not dominate
+    # before reconstruction has partially converged. The collaborator's MoG
+    # operating point was 0.2 / 15 / 15 over 60 epochs; our encoders converge
+    # (Ant-Tag, ~10 epochs) or collapse (Odd-Even, ~30) far sooner, so the
+    # schedule is a per-domain hyperparameter, not a constant.
+    # Requires the loaders to be built with get_data_loader(indexed=True).
+    # Model selection (best_val_loss) stays on the reconstruction loss alone,
+    # blind to alignment; val/align_r is logged separately.
+    align_lambda: float = 0.0
+    align_metric: str = "cosine"  # ["cosine", "euclidean"]
+    align_warmup_epochs: int = 0
+    align_ramp_epochs: int = 0
+    emd_matrix_path: Optional[str] = None
+    # Held-out latent<->EMD correlation is computed over at most this many
+    # val rows (pairs grow quadratically: 2000 rows = 2M pairs).
+    align_val_max_samples: int = 2000
 
     # Hardware
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     num_workers: int = 4
+
+    # Reproducibility. None keeps the process's global RNG state (legacy).
+    # Trainer seeds torch/numpy from this before building the model; the
+    # train/val split is seeded separately by get_data_loader(seed=...).
+    # Stored in every checkpoint via the pickled config.
+    seed: Optional[int] = None
 
     # Logging and checkpointing
     log_freq: int = 100  # Steps between logging
@@ -133,9 +181,8 @@ def get_default_training_configs() -> List[TrainingConfig]:
     """
     configs = []
 
-    # EMD Loss configuration
-    emd_config = TrainingConfig(loss_type="emd", batch_size=32, learning_rate=1e-3)
-    configs.append(emd_config)
+    # (No EMD configuration: EMD is the evaluation metric and is not
+    # differentiable, so a Trainer built on it raises at _setup_loss.)
 
     # Chamfer Loss configuration
     chamfer_config = TrainingConfig(
@@ -148,7 +195,7 @@ def get_default_training_configs() -> List[TrainingConfig]:
         loss_type="sinkhorn",
         batch_size=32,
         learning_rate=1e-3,
-        sinkhorn_blur=0.5,
+        sinkhorn_blur=0.05,
         sinkhorn_scaling=0.5,
     )
     configs.append(sinkhorn_config)

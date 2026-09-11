@@ -42,3 +42,8 @@ dev = [
 [tool.setuptools.packages.find]
 include = ["set_transformer*"]
 exclude = ["experiments*", "tests*"]
+
+[tool.pytest.ini_options]
+markers = [
+    "slow: multi-minute smoke runs of the real trainers (tests/test_ant_tag_shared_pieces_regression.py); deselect with -m 'not slow'",
+]

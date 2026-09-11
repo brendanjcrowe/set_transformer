@@ -1,5 +1,16 @@
 """Reusable set-autoencoder training loop, with optional latent metric alignment.
 
+STATUS IN THIS REPO (2026-09-03, alignment integration Phase 1): this is the
+collaborator's REFERENCE implementation from ``exp/PaperResults``, brought in
+unchanged so the alignment numbers reported in ``experiments/mog/`` can be
+reproduced and so Phase 2 has something to test against. It is UNWEIGHTED --
+``recon_loss(recon, batch)``, ``model.encode(batch)`` on D-dim input, and an
+EMD matrix over uniform clouds -- and it does not write ``Trainer``-format
+checkpoints. The pipeline path (``experiments/ant_tag/3_train_st.py`` ->
+``set_transformer.training.Trainer``) carries PF weights end to end; the
+alignment term is added THERE in Phase 2, with a weighted EMD matrix. Do not
+point the RL arms at checkpoints from this loop.
+
 Extracted from the MoG encoder study (``experiments/mog/_common.py``) so the benchmark's
 pretraining pipeline and that study run the *same* code: an encoder pretrained for the RL
 sweep should be trained exactly like the one whose alignment numbers were reported.

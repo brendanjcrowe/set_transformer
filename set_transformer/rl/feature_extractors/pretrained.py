@@ -1,3 +1,10 @@
+"""STATUS (2026-09-10): LEGACY, not used by any live pipeline. Kept importable
+only because ``rl/wrappers/particle_filter.py`` and ``rl/evaluate.py`` still
+name ``PretrainedSetTransformerProcessor``. It is unweighted, has no arena scale and no geometry check;
+the live encoders are ``rl/feature_extractors/{cgf,gaussian,st}.py``. Do not
+build on it. (A hard-coded debug-log write to another user's home directory was
+removed the same day; it would have raised FileNotFoundError on first use.)
+"""
 import os
 
 import numpy as np
@@ -29,9 +36,6 @@ class PretrainedSetTransformerProcessor:
             # Attempt to load the model. 
             # First try loading as a complete object, then try as state_dict
             loaded = torch.load(model_path, map_location=self.device, weights_only=False)
-            # #region agent log
-            import json; open('/home/brendan/rl_for_beliefmdps/.cursor/debug.log', 'a').write(json.dumps({'id': 'log_load_model', 'timestamp': __import__('time').time() * 1000, 'location': 'set_transformer_pretrained_processor.py:31', 'message': 'Loaded model', 'data': {'type': str(type(loaded)), 'is_dict': isinstance(loaded, dict), 'keys_sample': list(loaded.keys())[:10] if isinstance(loaded, dict) else None}, 'sessionId': 'debug-session', 'runId': 'run1', 'hypothesisId': 'B'}) + '\n')
-            # #endregion
             
             if isinstance(loaded, dict) and any(k.startswith('set_transformer.') or k.startswith('input_projection.') for k in loaded.keys()):
                 # It's a state_dict, likely from ParticleReconstructionModel
@@ -104,9 +108,6 @@ class PretrainedSetTransformerProcessor:
                 if any('encoder' in k or 'pma' in k.lower() or 'weight' in k for k in loaded.keys()):
                     # Try to treat as SetTransformer state_dict directly (without prefixes)
                     print("Detected plain state_dict format. Attempting to reconstruct model...")
-                    # #region agent log
-                    open('/home/brendan/rl_for_beliefmdps/.cursor/debug.log', 'a').write(json.dumps({'id': 'log_plain_state_dict', 'timestamp': __import__('time').time() * 1000, 'location': 'set_transformer_pretrained_processor.py:98', 'message': 'Treating as plain state_dict', 'data': {'keys_sample': list(loaded.keys())[:10]}, 'sessionId': 'debug-session', 'runId': 'run1', 'hypothesisId': 'B'}) + '\n')
-                    # #endregion
                     # Try to infer dimensions from state_dict
                     if 'encoder.0.weight' in loaded:
                         st_hidden_dim = loaded['encoder.0.weight'].shape[0]

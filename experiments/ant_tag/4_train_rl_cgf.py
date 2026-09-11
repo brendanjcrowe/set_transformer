@@ -11,10 +11,12 @@ where x_i is the target-position particle and w_i is its particle-filter weight.
 """
 
 import argparse
+import hashlib
 import importlib
 import json
 import os
 import re
+import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -39,8 +41,32 @@ from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize
 
 import pdomains  # noqa: F401 - registers pdomains-ant-tag-v0
+import variants  # noqa: E402 - env/filter/subdir registry
 from set_transformer.rl.particle_filters.ant_tag import AntTagParticleFilter
 from set_transformer.rl.wrappers.particle_filter import _call_pf_interaction_mapper
+
+# The belief-encoder pieces below now live in the shared package so a second
+# domain can use them without importing an Ant-Tag script. They are re-exported
+# here, unchanged and as the SAME objects, because SB3 pickles a policy's
+# features-extractor CLASS into the saved zip by module path: loading an
+# existing checkpoint runs
+# getattr(import_module("4_train_rl_cgf"), "WeightedCGFFeaturesExtractor").
+# 4_train_rl_st.py and 4_train_rl_gaussian.py also read all three off this
+# module by name.
+from set_transformer.rl.feature_extractors.cgf import (  # noqa: E402
+    EncoderDriftLoggingCallback,
+    RolloutFeatureNormCallback,
+    TNormLoggingCallback,
+    WeightedCGFFeaturesExtractor,
+    cgf_raw_dim,
+    matched_readout_hidden,
+    non_readout_param_count,
+    readout_param_count,
+)
+from set_transformer.rl.pretrained_encoder import reload_pretrained_cgf  # noqa: E402
+from set_transformer.rl.wrappers.particle_filter import (  # noqa: E402
+    PFDictWithWeightsObservationWrapper,
+)
 
 
 # Reuse the existing AntTag curriculum/PF utilities without touching ST code.
@@ -92,235 +118,6 @@ def get_env_visible_radius(env_id: str = "pdomains-ant-tag-v0") -> float:
         env.close()
 
 
-class PFDictWithWeightsObservationWrapper(gym.Wrapper):
-    """Dict observation wrapper exposing PF particles and PF weights."""
-
-    def __init__(
-        self,
-        env: gym.Env,
-        particle_filter_class,
-        particle_filter_kwargs: dict,
-        num_particles: int,
-        pf_interaction_mapper=None,
-        obs_mask_indices: list[int] | None = None,
-    ):
-        super().__init__(env)
-        self.particle_filter_class = particle_filter_class
-        self.particle_filter_kwargs = particle_filter_kwargs
-        self.num_particles = num_particles
-        self.pf_interaction_mapper = pf_interaction_mapper
-        self.obs_mask_indices = obs_mask_indices
-        self.particle_filter = None
-        self._last_base_env_obs_float = None
-
-        temp_obs, _ = self.env.reset()
-        temp_pf_kwargs = particle_filter_kwargs.copy()
-        temp_pf_kwargs["initial_env_obs"] = temp_obs
-        temp_pf = particle_filter_class(num_particles=num_particles, **temp_pf_kwargs)
-        self.particle_dim = temp_pf.particle_dim
-        del temp_pf
-        self.env.reset()
-
-        self.observation_space = gym.spaces.Dict({
-            "obs": self.env.observation_space,
-            "particles": gym.spaces.Box(
-                low=-np.inf,
-                high=np.inf,
-                shape=(self.num_particles, self.particle_dim),
-                dtype=np.float32,
-            ),
-            "weights": gym.spaces.Box(
-                low=0.0,
-                high=1.0,
-                shape=(self.num_particles,),
-                dtype=np.float32,
-            ),
-        })
-
-    def reset(self, **kwargs):
-        base_env_obs, info = self.env.reset(**kwargs)
-        base_env_obs_float = base_env_obs.astype(np.float32)
-
-        pf_init_kwargs = self.particle_filter_kwargs.copy()
-        pf_init_kwargs["initial_env_obs"] = base_env_obs_float
-        self.particle_filter = self.particle_filter_class(
-            num_particles=self.num_particles,
-            **pf_init_kwargs,
-        )
-        self._last_base_env_obs_float = base_env_obs_float.copy()
-        return self._get_dict_obs(base_env_obs_float), info
-
-    def step(self, action):
-        previous_base_env_obs = self._last_base_env_obs_float
-        base_env_obs, reward, terminated, truncated, info = self.env.step(action)
-        base_env_obs_float = base_env_obs.astype(np.float32)
-
-        predict_call_kwargs = {}
-        update_call_kwargs = {}
-        if self.pf_interaction_mapper is not None:
-            mapped_args = _call_pf_interaction_mapper(
-                self.pf_interaction_mapper,
-                base_env_obs=base_env_obs_float,
-                base_env_info=info,
-                base_env_action=action,
-                unwrapped_env=self.env.unwrapped,
-                previous_base_env_obs=previous_base_env_obs,
-            )
-            predict_call_kwargs = mapped_args.get("predict_args", {})
-            update_call_kwargs = mapped_args.get("update_args", {})
-
-        self.particle_filter.predict(action, **predict_call_kwargs)
-        if self.pf_interaction_mapper is not None:
-            self.particle_filter.update(**update_call_kwargs)
-        else:
-            self.particle_filter.update(base_env_obs_float)
-
-        self._last_base_env_obs_float = base_env_obs_float.copy()
-        return self._get_dict_obs(base_env_obs_float), reward, terminated, truncated, info
-
-    def _get_dict_obs(self, base_env_obs: np.ndarray) -> dict:
-        agent_obs = base_env_obs
-        if self.obs_mask_indices is not None:
-            agent_obs = base_env_obs.copy()
-            agent_obs[self.obs_mask_indices] = 0.0
-        return {
-            "obs": agent_obs.astype(np.float32),
-            "particles": self.particle_filter.particles.astype(np.float32),
-            "weights": self.particle_filter.weights.astype(np.float32),
-        }
-
-
-class TNormLoggingCallback(BaseCallback):
-    """Log the distribution of ||t_j|| every rollout.
-
-    The Twin-Den probe found CGF's advantage needs ||t_j|| ~ 10x the 0.1
-    legacy init scale, so whether PPO actually grows t is a first-class
-    experimental question. Quantiles land in TensorBoard as
-    cgf/t_norm_q{0,25,50,75,90,100}. No-op (and free) for encoders without
-    t_values, e.g. the Gaussian arm; a FLAT line is the expected, built-in
-    sanity check for the frozen arm.
-    """
-
-    def _on_step(self) -> bool:  # required abstract method
-        return True
-
-    def _on_rollout_end(self) -> None:
-        extractor = getattr(self.model.policy, "features_extractor", None)
-        t = getattr(extractor, "t_values", None)
-        if t is None:
-            return
-        with torch.no_grad():
-            norms = torch.linalg.norm(t.detach(), dim=1).cpu().numpy()
-        for q in (0, 25, 50, 75, 90, 100):
-            self.logger.record(f"cgf/t_norm_q{q}",
-                               float(np.percentile(norms, q)))
-
-
-class WeightedCGFFeaturesExtractor(BaseFeaturesExtractor):
-    """SB3 feature extractor for weighted empirical CGF particle features."""
-
-    def __init__(
-        self,
-        observation_space: gym.spaces.Dict,
-        num_cgf_features: int = 64,
-        arena_scale: float = 4.5,
-        t_init_mode: str = "linspace_first_dim",
-        t_init_scale: float = 0.1,
-        t_clamp: float = 2.0,
-        exp_arg_clamp: float = 20.0,
-        t_frozen: bool = False,
-    ):
-        obs_dim = observation_space["obs"].shape[0]
-        particle_dim = observation_space["particles"].shape[1]
-        super().__init__(observation_space, features_dim=obs_dim + num_cgf_features)
-
-        self.num_cgf_features = num_cgf_features
-        self.particle_dim = particle_dim
-        self.arena_scale = arena_scale
-        self.t_clamp = t_clamp
-        self.exp_arg_clamp = exp_arg_clamp
-
-        if t_init_mode == "linspace_all_dims":
-            # Round-robin the linspace directions across every particle
-            # dimension so each coordinate (not just dim 0) gets a nontrivial
-            # initial CGF sensitivity.
-            t_values = torch.zeros(num_cgf_features, particle_dim)
-            linspace_vals = torch.linspace(-t_init_scale, t_init_scale, num_cgf_features)
-            dim_assignment = torch.arange(num_cgf_features) % particle_dim
-            for d in range(particle_dim):
-                mask = dim_assignment == d
-                t_values[mask, d] = linspace_vals[mask]
-        elif t_init_mode == "linspace_first_dim":
-            t_values = torch.zeros(num_cgf_features, particle_dim)
-            t_values[:, 0] = torch.linspace(
-                -t_init_scale,
-                t_init_scale,
-                num_cgf_features,
-            )
-            if particle_dim > 1:
-                t_values[:, 1:] = 0.01 * torch.randn(
-                    num_cgf_features,
-                    particle_dim - 1,
-                )
-        elif t_init_mode == "spread":
-            # 8 directions x (num//8) log-spaced norms, matching the probe's
-            # CGF_SPREAD64 feature geometry. rho_hi=2.8 ~ the max norm
-            # reachable under the elementwise t_clamp=2.0 (diagonal norm
-            # 2*sqrt(2)). The den diagonal (45 deg) is one of the 8
-            # directions exactly. Unlike the legacy 0.1-scale linspace init,
-            # this starts where the signal actually is, so no ~10x growth of
-            # ||t_j|| is required for the encoder to see it.
-            if particle_dim != 2:
-                raise ValueError("t_init_mode='spread' assumes 2D particles")
-            num_dirs = 8
-            if num_cgf_features % num_dirs != 0:
-                raise ValueError(
-                    "num_cgf_features must be divisible by 8 for 'spread'")
-            num_norms = num_cgf_features // num_dirs
-            angles = torch.arange(num_dirs, dtype=torch.float32) * (
-                2 * torch.pi / num_dirs)
-            dirs = torch.stack([torch.cos(angles), torch.sin(angles)], dim=1)
-            norms = torch.tensor(np.geomspace(0.25, 2.8, num_norms),
-                                 dtype=torch.float32)
-            t_values = (norms[None, :, None] * dirs[:, None, :]).reshape(
-                -1, particle_dim)
-        elif t_init_mode == "random":
-            t_values = t_init_scale * torch.randn(num_cgf_features, particle_dim)
-        else:
-            raise ValueError(f"Unknown t_init_mode: {t_init_mode}")
-
-        self.t_frozen = bool(t_frozen)
-        if self.t_frozen:
-            # A buffer gets no gradient (so PPO cannot move it) while still
-            # saving/loading and moving across devices exactly like the
-            # Parameter. forward() is untouched: on the spread init the
-            # elementwise clamp is a no-op by construction.
-            self.register_buffer("t_values", t_values)
-        else:
-            self.t_values = nn.Parameter(t_values)
-
-    def forward(self, obs_dict: dict[str, torch.Tensor]) -> torch.Tensor:
-        base_obs = obs_dict["obs"]
-        particles = obs_dict["particles"] / self.arena_scale
-        weights = obs_dict["weights"]
-
-        particles = torch.nan_to_num(particles, nan=0.0, posinf=1.0, neginf=-1.0)
-        weights = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
-        weights = torch.clamp(weights, min=0.0)
-        weights = weights / (weights.sum(dim=1, keepdim=True) + 1e-8)
-
-        t = torch.clamp(self.t_values, -self.t_clamp, self.t_clamp)
-        exp_arg = torch.matmul(particles, t.transpose(0, 1))
-        exp_arg = torch.clamp(exp_arg, -self.exp_arg_clamp, self.exp_arg_clamp)
-
-        weighted_mgf = torch.sum(
-            weights.unsqueeze(-1) * torch.exp(exp_arg),
-            dim=1,
-        )
-        cgf = torch.log(torch.clamp(weighted_mgf, min=1e-8))
-        return torch.cat([base_obs, cgf], dim=-1)
-
-
 def _make_vec_normalize(vec_env, training: bool, norm_reward: bool):
     """Normalize only base obs so PF weights remain valid probabilities."""
     try:
@@ -352,6 +149,7 @@ def make_ant_tag_cgf_env(
     distance_coeff: float = 1.0,
     entropy_coeff: float = 0.0,
     tag_bonus_coeff: float = 0.0,
+    gain_coeff: float = 0.0,
     initial_visibility_radius: float = 100.0,
     obs_mask_indices: list[int] | None = None,
     apply_reward_shaping: bool = True,
@@ -426,6 +224,7 @@ def make_ant_tag_cgf_env(
             num_particles=num_particles,
             pf_interaction_mapper=ant_tag_pf_interaction_mapper,
             obs_mask_indices=obs_mask_indices,
+            particle_filter_seed=seed + rank,
         )
         if apply_reward_shaping:
             env = PFRewardShapingWrapper(
@@ -433,6 +232,7 @@ def make_ant_tag_cgf_env(
                 distance_coeff=distance_coeff,
                 entropy_coeff=entropy_coeff,
                 tag_bonus_coeff=tag_bonus_coeff,
+                gain_coeff=gain_coeff,
             )
 
         if monitor_dir:
@@ -479,6 +279,59 @@ def _write_run_config(run_dir: str, **config) -> None:
     print(f"Run config saved to {path}")
 
 
+def _git_provenance() -> dict:
+    """Record WHICH CODE produced this run, for run_config.json.
+
+    run_config.json pins every hyperparameter but not the source that read
+    them, and that gap has already bitten this project: the
+    ant_tag_cgf_cdens_terminal runs of 2026-08-26 finished at 17:30, and
+    4_train_rl_cgf.py gained deterministic per-episode PF seeding at 18:39.
+    Their run_config.json is byte-identical either side of that change, so
+    nothing on disk says which behavior those checkpoints were trained with.
+
+    HEAD alone would not close it — both submodules are routinely dirty — so
+    the SHA-256 of `git diff HEAD` gives an uncommitted working tree a stable
+    identity. Equal (head, diff_sha256) means the same code; a different
+    diff_sha256 means something moved between two runs, even when both say
+    "dirty". The porcelain status lines are kept as a human-readable hint of
+    WHICH files were dirty.
+
+    Never raises: a missing git, a detached worktree or a stripped checkout
+    records an "error" string rather than killing a multi-hour training run.
+    """
+    repos = {
+        "set_transformer": Path(__file__).resolve().parents[2],
+        "pomdp-domains": Path(__file__).resolve().parents[3] / "pomdp-domains",
+    }
+
+    def _git(repo: Path, *args: str) -> str:
+        return subprocess.run(
+            ("git", "-C", str(repo)) + args,
+            capture_output=True, text=True, check=True, timeout=15,
+        ).stdout
+
+    provenance = {}
+    for name, repo in repos.items():
+        try:
+            head = _git(repo, "rev-parse", "HEAD").strip()
+            status = [line for line in
+                      _git(repo, "status", "--porcelain").splitlines() if line]
+            diff = _git(repo, "diff", "HEAD")
+            provenance[name] = {
+                "path": str(repo),
+                "head": head,
+                "dirty": bool(status),
+                # Tracked-file modifications only; untracked content is not in
+                # `git diff HEAD`, which is why the status lines are kept too.
+                "diff_sha256": (hashlib.sha256(diff.encode()).hexdigest()
+                                if diff else None),
+                "status": status,
+            }
+        except Exception as exc:  # noqa: BLE001 - provenance must never abort a run
+            provenance[name] = {"path": str(repo), "error": f"{type(exc).__name__}: {exc}"}
+    return provenance
+
+
 def train_ant_tag_cgf(
     algorithm: str = "PPO",
     total_timesteps: int = 3_000_000,
@@ -516,6 +369,23 @@ def train_ant_tag_cgf(
     target_kl: float | None = None,
     n_epochs: int = 10,
     n_eval_episodes: int = 20,
+    # Ported from the Odd-Even arm on 2026-09-10 (change_mds/
+    # ant_tag_cgf_port_2026-09-10.md). Every default is the legacy value, so
+    # a caller that does not pass them trains exactly what it trained before.
+    t_param: str = "clamp",
+    t_bound: float | None = None,
+    t_init_max: float | None = None,
+    feature_mode: str = "K",
+    feature_norm: str = "none",
+    running_norm_update: str = "rollout",
+    readout_hidden: int = 0,
+    readout_depth: int = 0,
+    readout_dim: int | None = None,
+    pretrained_cgf_model_path: str | None = None,
+    cgf_frozen: bool = False,
+    x_embed_dim: int = 0,
+    x_embed_hidden: int = 64,
+    x_embed_depth: int = 1,
 ):
     resolved_arena_scale = (
         arena_scale if arena_scale is not None else get_ant_tag_arena_scale(env_id)
@@ -529,7 +399,11 @@ def train_ant_tag_cgf(
 
     print(f"Training {algorithm} on AntTag with weighted CGF features")
     print(f"CGF features={num_cgf_features}, t_init={t_init_mode}, "
-          f"t_frozen={t_frozen}")
+          f"t_frozen={t_frozen}, t_param={t_param}, t_bound={t_bound}, "
+          f"t_init_max={t_init_max}, feature_mode={feature_mode}, "
+          f"feature_norm={feature_norm}, readout={readout_hidden}x{readout_depth}"
+          f"->{readout_dim}, x_embed_dim={x_embed_dim}, "
+          f"pretrained={pretrained_cgf_model_path!r}, cgf_frozen={cgf_frozen}")
     print(f"Arena scale={resolved_arena_scale}")
     print(f"SB3 device={device}")
     print(f"log_dir={log_dir}")
@@ -602,6 +476,19 @@ def train_ant_tag_cgf(
             t_clamp=t_clamp,
             exp_arg_clamp=exp_arg_clamp,
             t_frozen=t_frozen,
+            t_param=t_param,
+            t_bound=t_bound if t_param != "clamp" else None,
+            t_init_max=t_init_max,
+            feature_mode=feature_mode,
+            feature_norm=feature_norm,
+            readout_hidden=readout_hidden,
+            readout_depth=readout_depth,
+            readout_dim=readout_dim,
+            pretrained_cgf_model_path=pretrained_cgf_model_path,
+            cgf_frozen=cgf_frozen,
+            x_embed_dim=x_embed_dim,
+            x_embed_hidden=x_embed_hidden,
+            x_embed_depth=x_embed_depth,
         ),
     }
     if net_arch is not None:
@@ -637,10 +524,22 @@ def train_ant_tag_cgf(
     else:
         raise ValueError(f"Unsupported algorithm: {algorithm}")
 
+    if pretrained_cgf_model_path:
+        # SB3's _build re-initialises every Linear in the extractor (the
+        # readout, the embedding) AFTER the constructor loaded them; reload,
+        # re-freeze and assert max|delta| == 0 (PITFALLS.md section 1). Also
+        # scrubs the absolute path from the saved policy_kwargs.
+        reload_pretrained_cgf(model, pretrained_cgf_model_path, cgf_frozen)
+
     checkpoint_cb = CheckpointCallback(
         save_freq=max(save_freq // n_envs, 1),
         save_path=os.path.join(model_dir, "checkpoints") if model_dir else "checkpoints",
         name_prefix="ant_tag_cgf",
+        # Also snapshot VecNormalize with every checkpoint: without it the
+        # 100k-step checkpoints cannot be evaluated faithfully (the obs
+        # normalization is otherwise written once, at the end), and a run
+        # killed early is a total loss (PITFALLS.md section 7).
+        save_vecnormalize=True,
     )
     eval_cb = EvalCallback(
         eval_vec_env,
@@ -651,7 +550,14 @@ def train_ant_tag_cgf(
         render=False,
         n_eval_episodes=n_eval_episodes,
     )
-    t_norm_cb = TNormLoggingCallback()
+    # cgf/t_norm_q*: does PPO grow ||t||; cgf/drift_*: relative movement of
+    # every extractor tensor group since training start (exactly 0 for
+    # --cgf_frozen). The running norm's per-cycle refresh only when that norm
+    # is in use and unfrozen (PITFALLS.md section 8 item 5).
+    encoder_cbs = [TNormLoggingCallback(), EncoderDriftLoggingCallback()]
+    if (feature_norm == "running" and running_norm_update == "rollout"
+            and not cgf_frozen):
+        encoder_cbs.append(RolloutFeatureNormCallback())
     curriculum_cb = CurriculumCallback(
         total_timesteps=total_timesteps,
         schedule=curriculum_schedule,
@@ -663,7 +569,7 @@ def train_ant_tag_cgf(
     try:
         model.learn(
             total_timesteps=total_timesteps,
-            callback=[checkpoint_cb, eval_cb, curriculum_cb, t_norm_cb],
+            callback=[checkpoint_cb, eval_cb, curriculum_cb, *encoder_cbs],
             progress_bar=progress_bar,
         )
     finally:
@@ -689,12 +595,57 @@ def _parse_reward_schedule(reward_schedule: str) -> list[tuple[float, ...]]:
     schedule = []
     for entry in reward_schedule.split(","):
         parts = [float(part) for part in entry.strip().split(":")]
-        if len(parts) == 3:
-            parts.append(0.0)
-        if len(parts) != 4:
-            raise ValueError("Each reward schedule entry must have 3 or 4 values")
+        # frac:distance:entropy[:tag_bonus[:spread_gain]] -- missing trailing
+        # fields are 0, so every pre-2026-09-08 schedule keeps its meaning.
+        if len(parts) in (3, 4):
+            parts.extend([0.0] * (5 - len(parts)))
+        if len(parts) != 5:
+            raise ValueError("Each reward schedule entry must have 3 to 5 values: "
+                             "frac:distance:entropy[:tag_bonus[:spread_gain]]")
         schedule.append(tuple(parts))
     return schedule
+
+
+def _resolve_reward_shaping(parser, args) -> None:
+    """Reconcile --distance_coeff/--entropy_coeff with --reward_schedule, in place.
+
+    CurriculumCallback writes the schedule's interpolated coefficients into
+    every env on every step, so a coefficient flag given alongside a schedule
+    used to govern the first n_envs steps only, while run_config.json recorded
+    it as live. Nobody noticed because the default schedule's first waypoint
+    equals the flag defaults. Two outcomes now:
+
+    * ``--reward_schedule none`` (or empty): the flags (defaults 1.0 / 0.0)
+      become a constant schedule, so they really do hold for the whole run.
+    * a schedule plus an explicit flag: ``parser.error``. The user asked for
+      two things that cannot both happen.
+
+    In both cases ``args.distance_coeff`` / ``args.entropy_coeff`` are set to
+    the values in force at progress 0 and ``args.reward_schedule`` to a
+    parseable string, so ``run_config.json`` records what actually ran.
+    Shared by the Gaussian and ST arms.
+    """
+    explicit = [f"--{name}" for name in ("distance_coeff", "entropy_coeff")
+                if getattr(args, name) is not None]
+    schedule_str = (args.reward_schedule or "").strip()
+    if schedule_str.lower() in ("", "none"):
+        distance = 1.0 if args.distance_coeff is None else float(args.distance_coeff)
+        entropy = 0.0 if args.entropy_coeff is None else float(args.entropy_coeff)
+        args.reward_schedule = f"0:{distance}:{entropy}:0,1:{distance}:{entropy}:0"
+    else:
+        if explicit:
+            parser.error(
+                f"{' and '.join(explicit)} cannot be combined with "
+                "--reward_schedule: the schedule sets the shaping coefficients "
+                "on every step, so the flag would govern the first rollout "
+                "only. Either drop the flag and put the values in the schedule "
+                "(entries are frac:distance:entropy[:tag_bonus]) or pass "
+                "--reward_schedule none to run on constant coefficients."
+            )
+        first = _parse_reward_schedule(schedule_str)[0]
+        distance, entropy = float(first[1]), float(first[2])
+    args.distance_coeff = distance
+    args.entropy_coeff = entropy
 
 
 class _TeeStream:
@@ -726,13 +677,242 @@ def _tee_stdout_stderr(log_path: str) -> None:
     sys.stderr = _TeeStream(sys.stderr, log_file)
 
 
-def main(
-    env_id: str = "pdomains-ant-tag-v0",
-    particle_filter_class: type = AntTagParticleFilter,
-    run_subdir: str = "ant_tag_cgf",
-):
+#: Ant-Tag particles are the target's (x, y): 2-D by construction of every
+#: registered filter. Used to size the readout before any env exists; the
+#: extractor's strict state_dict load is the backstop if this ever changes.
+ANT_TAG_PARTICLE_DIM = 2
+
+#: CGF geometry a pretrained checkpoint carries in its ``config``. With
+#: --pretrained_cgf_model_path, a flag left at its default takes the
+#: checkpoint's value and an explicit value that disagrees is an error (the
+#: Odd-Even arm's rule).
+CGF_GEOMETRY_FLAGS = ("num_cgf_features", "feature_mode", "t_param", "t_bound",
+                      "t_clamp", "feature_norm", "readout_hidden", "readout_depth",
+                      "readout_dim", "arena_scale", "t_init_mode", "t_init_max",
+                      "x_embed_dim", "x_embed_hidden", "x_embed_depth")
+
+
+def add_cgf_encoder_arguments(parser) -> None:
+    """The CGF encoder flags ported from experiments/odd_even/4_train_rl_cgf.py
+    (2026-09-10). Every default is the LEGACY behaviour -- clamp 2.0, K, no
+    norm, no readout -- so a bare re-run of any recorded Ant-Tag CGF command
+    still trains what it recorded. The new recipe is opted into per flag, or
+    through a variant's registry defaults; see change_mds/
+    ant_tag_cgf_port_2026-09-10.md for the reasoning and the sizing rule.
+    """
+    parser.add_argument(
+        "--t_param", type=str, default="clamp", choices=["clamp", "tanh", "polar"],
+        help="How the learned t is bounded. 'clamp' (default, legacy): hard "
+             "torch.clamp at +-t_clamp, zero gradient beyond it -- on the "
+             "'spread' init 4 of 64 probes already sit on the clamp. 'tanh': "
+             "t = t_bound * tanh(raw_t), a smooth box (Odd-Even's mode). "
+             "'polar': t = t_bound * sigmoid(a) * v/|v|, a smooth BALL with "
+             "direction and magnitude learned separately -- the recommended "
+             "2-D mode.")
+    parser.add_argument(
+        "--t_bound", type=float, default=None,
+        help="tanh / polar only: the largest tilt. Default: "
+             "variants.cgf_t_bound(variant) = 3 / (tag_radius / arena half-width) "
+             "-- 9.0 on smart, 13.5 on smart_mid_slow_v15, 35 on cdens_terminal "
+             "-- so t * tag_radius sits in the 2..4 window the CGF needs to "
+             "resolve the tag disc. The legacy clamp 2.0 gives 0.17..0.67.")
+    parser.add_argument(
+        "--t_init_max", type=float, default=None,
+        help="'spread' init only: the largest probe norm of the log-spaced "
+             "grid (from 0.25). Default: unset in clamp mode, which keeps the "
+             "extractor's legacy ceiling of 2.8 (4 axis probes then sit on the "
+             "clamp -- the recorded behaviour); 0.8 * t_bound otherwise, so the "
+             "init spans the range the bound allows without starting on its "
+             "flat region. An explicit value above t_clamp in clamp mode is "
+             "refused.")
+    parser.add_argument(
+        "--feature_mode", type=str, default="K", choices=["K", "K_grad", "both"],
+        help="K (default, legacy): log-MGF at each probe, T features. K_grad: "
+             "the tilted mean K'(t), T x 2 features, bounded by the particle "
+             "range whatever t is (needs no standardisation); beat K on "
+             "ClusterHunt, LeastMass and Odd-Even. both: concatenated.")
+    parser.add_argument(
+        "--feature_norm", type=str, default="none", choices=["none", "running", "layernorm"],
+        help="Standardise the CGF block before the policy MLP. 'none' "
+             "(default): raw, right for K_grad and for K at small t. "
+             "'running': per-feature z-score, statistics fixed per PPO cycle "
+             "(see --running_norm_update); the Odd-Even 2x2 found it COSTS "
+             "from-scratch CGF 0.15-0.25, so use it only for K at wide t. "
+             "'layernorm': across features per sample; divides the mean out "
+             "of near-rank-1 features (RunningFeatureNorm docstring).")
+    parser.add_argument(
+        "--running_norm_update", type=str, default="rollout", choices=["rollout", "minibatch"],
+        help="--feature_norm running only. 'rollout' (default): statistics "
+             "held fixed for each collect + update cycle and refreshed from "
+             "the rollout buffer between cycles (RolloutFeatureNormCallback), "
+             "so stored and recomputed log-probs are standardised identically. "
+             "'minibatch': the pre-fix lerp on every minibatch, A/B control "
+             "only (PITFALLS.md section 8 item 5).")
+    parser.add_argument(
+        "--readout_hidden", type=int, default=0,
+        help="Width of an MLP readout between the (normalised) CGF block and "
+             "the policy. 0 (default) = none. Where a parameter-matched CGF "
+             "arm keeps its budget; see --match_params.")
+    parser.add_argument(
+        "--readout_depth", type=int, default=0,
+        help="Hidden layers of the readout. 0 = none. --match_params with "
+             "depth 0 uses 2.")
+    parser.add_argument(
+        "--readout_dim", type=int, default=None,
+        help="Readout output width; default 64 (the ST arm's 8 x 8) whatever "
+             "the probe count, so the policy heads match across arms.")
+    parser.add_argument(
+        "--match_params", type=int, default=None,
+        help="Pick --readout_hidden so the encoder total (learned t + norm "
+             "affine + readout + embedding) lands closest to this count, e.g. "
+             "the ST arm's. Printed and recorded as encoder_params.")
+    parser.add_argument(
+        "--pretrained_cgf_model_path", type=str, default=None,
+        help="A CGF checkpoint (model_state_dict + config, as "
+             "experiments/odd_even/3_pretrain_st_belief.py --encoder cgf "
+             "writes). Loaded, RE-loaded after PPO construction and verified "
+             "max|delta| == 0 (PITFALLS.md section 1). Geometry flags left at "
+             "their defaults are taken from it; its arena_scale must equal "
+             "the variant's.")
+    parser.add_argument(
+        "--cgf_frozen", action="store_true",
+        help="Freeze the WHOLE pretrained encoder (t, norm statistics, "
+             "readout, embedding); only PPO's heads learn -- the CGF twin of "
+             "--st_frozen. Requires --pretrained_cgf_model_path.")
+    parser.add_argument(
+        "--x_embed_dim", type=int, default=0,
+        help="Learned per-particle embedding phi: R^2 -> R^d before the CGF "
+             "(t then lives in R^d). 0 = off. Makes the arm a learned "
+             "Deep-Set-family encoder, not a parameter-free statistic.")
+    parser.add_argument("--x_embed_hidden", type=int, default=64)
+    parser.add_argument("--x_embed_depth", type=int, default=1)
+
+
+def resolve_cgf_encoder_args(parser, args, env_id: str) -> None:
+    """CLI > checkpoint > registry/default for the CGF encoder flags, in place.
+
+    Order matters and is pinned by tests/test_ant_tag_cgf_port.py:
+
+    1. ``arena_scale`` is resolved from the live env so run_config.json
+       records a number, not None.
+    2. With a checkpoint, geometry flags at their defaults take the
+       checkpoint's values; explicit disagreements are errors. The
+       checkpoint's arena_scale must equal the variant's -- the t values
+       only mean anything in the frame they were fitted in.
+    3. ``t_bound`` (tanh / polar): registry ``cgf_t_bound`` when None.
+    4. ``t_init_max`` (spread): left None in clamp mode (the extractor's
+       legacy 2.8 ceiling, recorded as null as every old run did), 0.8 *
+       t_bound otherwise; an explicit value above t_clamp in clamp mode is
+       refused (the extractor refuses it too).
+    5. ``--match_params`` sizes the readout; ``encoder_params`` is recorded.
+    """
+    if args.arena_scale is None:
+        args.arena_scale = get_ant_tag_arena_scale(env_id)
+    if args.cgf_frozen and not args.pretrained_cgf_model_path:
+        parser.error("--cgf_frozen without --pretrained_cgf_model_path would "
+                     "freeze a RANDOM readout. Pass a checkpoint or drop the "
+                     "flag (use --t_frozen alone to fix t).")
+
+    from_ckpt = {}
+    if args.pretrained_cgf_model_path:
+        checkpoint = torch.load(args.pretrained_cgf_model_path,
+                                map_location="cpu", weights_only=False)
+        config = checkpoint.get("config", {}) if isinstance(checkpoint, dict) else {}
+        from_ckpt = {k: config[k] for k in CGF_GEOMETRY_FLAGS if k in config}
+        for key, ckpt_value in from_ckpt.items():
+            given = getattr(args, key)
+            if key == "arena_scale":
+                # Resolved above from the env; the checkpoint has to agree.
+                if not np.isclose(float(given), float(ckpt_value), rtol=1e-6, atol=1e-9):
+                    parser.error(
+                        f"checkpoint {args.pretrained_cgf_model_path} was fitted at "
+                        f"arena_scale={ckpt_value!r}, this variant's is {given!r}; the "
+                        "t values are meaningless in another frame (PITFALLS.md "
+                        "section 4).")
+                continue
+            if given == parser.get_default(key):
+                setattr(args, key, ckpt_value)
+            elif given != ckpt_value:
+                parser.error(
+                    f"--{key} {given!r} disagrees with the checkpoint's {key}="
+                    f"{ckpt_value!r} ({args.pretrained_cgf_model_path}). Drop the "
+                    "flag to take the checkpoint's geometry.")
+        if args.match_params is not None:
+            parser.error("--match_params sizes a NEW readout; with a pretrained "
+                         "checkpoint the readout shape comes from the checkpoint.")
+
+    if args.t_param == "clamp":
+        args.t_bound = None
+        # t_init_max stays None: the extractor then uses its built-in spread
+        # ceiling of 2.8, WITH the 4 axis probes clamped to 2.0 -- the exact
+        # behaviour every recorded Ant-Tag `spread` run had, and what a bare
+        # re-run must reproduce. Only an explicit value is policed.
+        if args.t_init_max is not None and args.t_init_max > args.t_clamp:
+            parser.error(
+                f"--t_init_max {args.t_init_max} exceeds --t_clamp {args.t_clamp}: "
+                "every probe beyond the clamp would be flattened to +-t_clamp "
+                "with zero gradient. Use --t_param polar (or tanh) with a "
+                "--t_bound, or lower --t_init_max.")
+    else:
+        if args.t_bound is None:
+            args.t_bound = variants.cgf_t_bound(args.variant)
+            print(f"CGF t_bound from the registry: {args.t_bound:.3g} "
+                  f"(= {variants.CGF_TILT_TARGET} / (tag_radius / arena half-width) "
+                  f"for variant {args.variant!r})")
+        if args.t_init_max is None and args.t_init_mode == "spread":
+            args.t_init_max = 0.8 * float(args.t_bound)
+        if args.t_init_max is not None and args.t_init_max >= args.t_bound:
+            parser.error(f"--t_init_max {args.t_init_max} must be below "
+                         f"--t_bound {args.t_bound}")
+
+    particle_dim = ANT_TAG_PARTICLE_DIM
+    t_dim = args.x_embed_dim if args.x_embed_dim > 0 else particle_dim
+    raw_dim = cgf_raw_dim(args.num_cgf_features, t_dim, args.feature_mode)
+    fixed = non_readout_param_count(
+        args.num_cgf_features, particle_dim, args.feature_mode, args.t_frozen,
+        args.feature_norm, args.x_embed_dim, args.x_embed_hidden, args.x_embed_depth)
+    if args.t_param == "polar" and not args.t_frozen:
+        fixed += args.num_cgf_features       # the extra magnitude scalar per probe
+    if args.match_params is not None:
+        if args.readout_depth <= 0:
+            args.readout_depth = 2
+        out_dim = (args.readout_dim if args.readout_dim is not None
+                   else WeightedCGFFeaturesExtractor.DEFAULT_READOUT_DIM)
+        args.readout_hidden, total = matched_readout_hidden(
+            args.match_params, raw_dim, args.readout_depth, out_dim, fixed)
+        print(f"CGF readout sized to match {args.match_params:,} params: "
+              f"hidden={args.readout_hidden} depth={args.readout_depth} "
+              f"-> encoder total {total:,}")
+    else:
+        out_dim = args.readout_dim if args.readout_dim is not None else (
+            WeightedCGFFeaturesExtractor.DEFAULT_READOUT_DIM
+            if args.readout_depth > 0 else raw_dim)
+        total = fixed + readout_param_count(raw_dim, args.readout_hidden,
+                                            args.readout_depth, out_dim)
+    args.encoder_params = int(total)
+    print(f"CGF encoder: t_param={args.t_param} t_bound={args.t_bound} "
+          f"t_init_max={args.t_init_max} feature_mode={args.feature_mode} "
+          f"feature_norm={args.feature_norm} raw block {raw_dim} -> "
+          f"{args.encoder_params:,} encoder parameters")
+    if from_ckpt:
+        print("CGF geometry taken from checkpoint: "
+              + ", ".join(f"{k}={getattr(args, k)!r}" for k in from_ckpt))
+
+
+def main(encoder: str = "cgf"):
+    """Entry point. --variant selects env id, particle filter and run subdir
+    together from variants.py, so the three cannot disagree."""
     parser = argparse.ArgumentParser(
-        description=f"RL with weighted CGF particle-belief features on AntTag (env_id={env_id})"
+        description="RL with weighted CGF particle-belief features on AntTag. "
+                    "Use --variant to pick the env; --list_variants to see them."
+    )
+    variants.add_variant_argument(parser)
+    parser.add_argument(
+        "--run_subdir", type=str, default=None,
+        help="Override the derived runs/ant_tag_cgf[_<variant>] "
+             "directory. For a sweep that needs its own tree "
+             "(e.g. ant_tag_cgf_cdens_hard_dist0), which the "
+             "derived name cannot express.",
     )
     parser.add_argument("--algorithm", type=str, default="PPO", choices=["PPO", "SAC"])
     parser.add_argument("--total_timesteps", type=int, default=3_000_000)
@@ -785,20 +965,25 @@ def main(
     )
     parser.add_argument("--t_init_scale", type=float, default=0.1)
     parser.add_argument("--t_clamp", type=float, default=2.0)
-    parser.add_argument("--exp_arg_clamp", type=float, default=20.0)
+    parser.add_argument(
+        "--exp_arg_clamp", type=float, default=20.0,
+        help="DEPRECATED, no longer applied: the CGF is computed with "
+             "logsumexp, which needs no clamp on the exponent. Accepted and "
+             "recorded in run_config.json for compatibility only.")
+    add_cgf_encoder_arguments(parser)
     parser.add_argument("--device", type=str, default="cuda:1")
 
     parser.add_argument(
         "--log_dir",
         type=str,
         default=None,
-        help=f"Defaults to runs/{run_subdir}/<timestamp>_seed<seed>/logs/",
+        help="Defaults to runs/ant_tag_cgf[_<variant>]/<timestamp>_seed<seed>/logs/",
     )
     parser.add_argument(
         "--model_save_path",
         type=str,
         default=None,
-        help=f"Defaults to runs/{run_subdir}/<timestamp>_seed<seed>/models/cgf_agent.zip",
+        help="Defaults to runs/ant_tag_cgf[_<variant>]/<timestamp>_seed<seed>/models/cgf_agent.zip",
     )
     parser.add_argument("--eval_freq", type=int, default=20_000)
     parser.add_argument("--save_freq", type=int, default=100_000)
@@ -810,17 +995,33 @@ def main(
         help="Policy/value MLP sizes, e.g. '256,256'.",
     )
 
-    parser.add_argument("--distance_coeff", type=float, default=1.0)
-    parser.add_argument("--entropy_coeff", type=float, default=0.0)
+    parser.add_argument(
+        "--distance_coeff", type=float, default=None,
+        help="Constant PF-mean-distance shaping coefficient (default 1.0). "
+             "Only honoured with --reward_schedule none: the schedule sets "
+             "these coefficients on every step, so combining the two is an "
+             "error rather than a silent override.")
+    parser.add_argument(
+        "--entropy_coeff", type=float, default=None,
+        help="Constant PF belief-entropy shaping coefficient (default 0.0). "
+             "NOT PPO's entropy bonus. Same rule as --distance_coeff.")
     parser.add_argument(
         "--curriculum",
         type=str,
-        default="0:100,0.3:100,0.7:3,1:3",
+        default=None,
+        help="Visibility curriculum 'frac:radius,...'. Defaults to the "
+             "variant's own curriculum, else the base schedule.",
     )
     parser.add_argument(
         "--reward_schedule",
         type=str,
-        default="0:1:0:0,0.3:1:0:0,0.7:0:0:50,1:0:0:50",
+        default=None,
+        help="Defaults to the variant's own recipe (variants.py default_reward_schedule), else "
+             "'0:1:0:0,0.3:1:0:0,0.7:0:0:50,1:0:0:50' (PF-entropy 0 throughout). "
+             "Shaping schedule 'frac:distance:entropy[:tag_bonus[:spread_gain]],...' (spread_gain pays gain*(spread_{t-1}-spread_t) of the belief's weighted std; 0 when omitted), "
+             "interpolated over training progress and applied on every step. "
+             "Pass 'none' to run on the constant --distance_coeff / "
+             "--entropy_coeff values instead; giving both is an error.",
     )
     parser.add_argument(
         "--evasion_curriculum",
@@ -878,8 +1079,35 @@ def main(
     parser.add_argument("--n_eval_episodes", type=int, default=20)
 
     args = parser.parse_args()
+    # Before _resolve_reward_shaping: it reads an empty schedule as "use the
+    # constant flags", so a None default must be resolved first.
+    args.reward_schedule = variants.resolve_schedule(
+        args.variant, args.reward_schedule, "default_reward_schedule",
+        "0:1:0:0,0.3:1:0:0,0.7:0:0:50,1:0:0:50")
+    _resolve_reward_shaping(parser, args)
+    if args.list_variants:
+        variants.print_variants()
+        return
+
+    variant = variants.resolve(args.variant)
+    env_id = variant.env_id
+    particle_filter_class = variant.particle_filter
+    run_subdir = args.run_subdir or variants.run_subdir(
+        encoder, args.variant)
+    args.curriculum = variants.resolve_schedule(
+        args.variant, args.curriculum, "default_curriculum",
+        "0:100,0.3:100,0.7:3,1:3")
+    variants.warn_if_not_evading(
+        args.variant, args.evasion_curriculum, args.target_speed_scale)
+    args.evasion_curriculum = variants.resolve_schedule(
+        args.variant, args.evasion_curriculum, "default_evasion_curriculum",
+        None)
+
     net_arch = [int(x) for x in args.net_arch.split(",")] if args.net_arch else None
     obs_mask = [-2, -1] if args.mask_target_obs else None
+    # Before run_config.json is written, so it records the numbers that ran
+    # (the 2026-09-03 audit found arena_scale recorded as None).
+    resolve_cgf_encoder_args(parser, args, env_id)
 
     run_dir = _default_run_dir(args.seed, run_subdir, run_tag=args.run_tag)
     log_dir = args.log_dir or os.path.join(run_dir, "logs") + "/"
@@ -891,12 +1119,21 @@ def main(
     print(f"Mirroring stdout/stderr to {stdout_log_path}")
 
     run_config = vars(args).copy()
+    # The resolved run_subdir is passed explicitly below; drop the raw flag so
+    # the two do not collide as duplicate keyword arguments. --list_variants
+    # already returned by this point and is not part of the run's identity.
+    run_config.pop("run_subdir", None)
+    run_config.pop("list_variants", None)
     run_config.update(log_dir=log_dir, model_save_path=model_save_path)
+    # env_id / particle_filter_class / run_subdir are derived from --variant,
+    # but they are still written out: run_config.json stays a complete record
+    # even if the registry entry is later edited.
     _write_run_config(
         run_dir,
         env_id=env_id,
         particle_filter_class=particle_filter_class.__name__,
         run_subdir=run_subdir,
+        git=_git_provenance(),
         **run_config,
     )
 
@@ -915,6 +1152,20 @@ def main(
         t_clamp=args.t_clamp,
         exp_arg_clamp=args.exp_arg_clamp,
         t_frozen=args.t_frozen,
+        t_param=args.t_param,
+        t_bound=args.t_bound,
+        t_init_max=args.t_init_max,
+        feature_mode=args.feature_mode,
+        feature_norm=args.feature_norm,
+        running_norm_update=args.running_norm_update,
+        readout_hidden=args.readout_hidden,
+        readout_depth=args.readout_depth,
+        readout_dim=args.readout_dim,
+        pretrained_cgf_model_path=args.pretrained_cgf_model_path,
+        cgf_frozen=args.cgf_frozen,
+        x_embed_dim=args.x_embed_dim,
+        x_embed_hidden=args.x_embed_hidden,
+        x_embed_depth=args.x_embed_depth,
         device=args.device,
         seed=args.seed,
         log_dir=log_dir,

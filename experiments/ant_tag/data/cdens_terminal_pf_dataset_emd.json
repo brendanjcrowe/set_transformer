@@ -1,0 +1,30 @@
+{
+  "source": "data/cdens_terminal_pf_dataset.npz",
+  "n_samples": 20000,
+  "metric": "debiased_sinkhorn",
+  "weighted": true,
+  "p": 2,
+  "blur": 0.01,
+  "scaling": 0.5,
+  "dtype": "float32",
+  "shape": [
+    20000,
+    20000
+  ],
+  "data_path": "/home/himanshu/Documents/Research/rl_for_beliefmdps/set_transformer/experiments/ant_tag/data/cdens_terminal_pf_dataset.npz",
+  "data_sha256": "c546e62d37fac5e92cefe2876b51702d8f0d3458dd9ae876a0d7fe799944eeff",
+  "particle_scale": 7.0,
+  "particle_centre": 0.0,
+  "num_particles": 100,
+  "particle_dim": 2,
+  "max_samples": 20000,
+  "device": "cuda",
+  "torch": "2.11.0+cu126",
+  "offdiag_mean": 0.40045725460011405,
+  "offdiag_std": 0.47200222797444535,
+  "offdiag_min": -0.0010904785012826324,
+  "offdiag_max": 3.739345073699951,
+  "diag_absmax": 0.0,
+  "stats_sampled_rows": 4000,
+  "wall_seconds": 2797.2
+}

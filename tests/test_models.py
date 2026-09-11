@@ -400,6 +400,42 @@ def test_deep_set_vqvae_shapes_and_grad(
     assert enc_param.grad.abs().sum().item() > 0
 
 
+def test_pf_set_transformer_asymmetric_output_dim():
+    """Encoder may read a mass channel the decoder does not reconstruct.
+
+    Weighted pretraining feeds D coordinates plus a mass channel and asks for
+    D coordinates back; the mass belongs to the loss's target measure, not to
+    the reconstructed points.
+    """
+    model = PFSetTransformer(
+        num_particles=32,
+        dim_particles=3,
+        num_encodings=8,
+        dim_encoder=8,
+        dim_output_particles=2,
+    )
+    out = model(torch.randn(4, 32, 3))
+
+    assert out.shape == torch.Size([4, 32, 2])
+    assert model.dim_particles == 3
+    assert model.dim_output_particles == 2
+
+
+def test_pf_set_transformer_defaults_to_symmetric():
+    """Omitting dim_output_particles keeps the original autoencoder shape."""
+    model = PFSetTransformer(
+        num_particles=32, dim_particles=4, num_encodings=8, dim_encoder=2
+    )
+    assert model(torch.randn(2, 32, 4)).shape == torch.Size([2, 32, 4])
+
+
+
+# ---------------------------------------------------------------------------
+# encode(): the uniform latent accessor the metric-alignment loss reads
+# (brought in from exp/PaperResults, Phase 1 of the alignment integration)
+# ---------------------------------------------------------------------------
+
+
 @pytest.mark.parametrize("cls", [PFSetTransformer, DeepSetAE, PointNetAE, SetVAE, DeepSetVAE])
 def test_encode_returns_the_bottleneck_code(
     cls,
@@ -431,6 +467,21 @@ def test_encode_returns_the_bottleneck_code(
         # The AEs must decode exactly what encode returns, so building recon from an
         # explicit encode() call (what the aligned trainer does) matches forward().
         assert torch.allclose(model.decoder(z), out, atol=1e-6)
+
+
+def test_encode_works_with_an_asymmetric_decoder(
+    batch_size: int, num_particles: int, num_encodings: int, dim_encoder: int
+) -> None:
+    """Our weighted pretraining builds PFSetTransformer with a D+1 input and a
+    D output; encode() must see the D+1 input and forward() the D output."""
+    model = PFSetTransformer(
+        num_particles=num_particles, dim_particles=3, num_encodings=num_encodings,
+        dim_encoder=dim_encoder, dim_output_particles=2)
+    X = torch.randn(batch_size, num_particles, 3)
+    z = model.encode(X)
+    assert z.shape == (batch_size, num_encodings, dim_encoder)
+    assert model(X).shape == (batch_size, num_particles, 2)
+    assert torch.allclose(model.decoder(z), model(X), atol=1e-6)
 
 
 def test_point_net_ae_is_a_max_pool_twin_of_deep_set_ae(
