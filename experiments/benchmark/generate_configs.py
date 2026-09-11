@@ -184,12 +184,16 @@ def emit_shared(defaults, check, stale):
     doc = {
         "protocol": {
             "seeds": SEEDS,
+            "observation_normalization": ("off (VecNormalize is opt-in via --vec_normalize "
+                                          "and no sweep uses it)"),
             "evaluation": {
                 "reward": "true task reward, unshaped",
                 "note": ("eval envs are built with for_eval=True, so any shaping or proxy "
                          "reward is present during training only"),
                 "n_eval_episodes": defaults["n_eval_episodes"],
                 "eval_freq_env_steps": defaults["eval_freq"],
+                "policy_at_eval": "deterministic (mean action / argmax)",
+                "checkpoint_kept": "best_model by mean eval return, plus the final model",
             },
             "run_record": "results/<env>/<method>/seed<n>/{meta.json,evaluations.npz}",
             "warning": ("train.py puts no algorithm in the results path; when sweeping two "
@@ -221,28 +225,256 @@ def emit_shared(defaults, check, stale):
           check, stale)
 
 
-def emit_algorithms(defaults, check, stale):
-    common = {
-        "learning_rate": defaults["learning_rate"],
-        "batch_size": defaults["batch_size"],
-        "n_envs": defaults["n_envs"],
-        "gamma": "per-env (see envs/<env>.yaml)",
-        "device": defaults["device"],
+def _layers(module) -> list[str]:
+    """Compact, reviewable layer list: 'Linear 128->64', 'Tanh', ..."""
+    import torch.nn as nn
+    out = []
+    mods = list(module) if isinstance(module, nn.Sequential) else [module]
+    for m in mods:
+        if isinstance(m, nn.Linear):
+            out.append(f"Linear {m.in_features}->{m.out_features}")
+        else:
+            out.append(type(m).__name__)
+    return out
+
+
+def _n(module) -> int:
+    return int(sum(p.numel() for p in module.parameters()))
+
+
+def _build_live(algo: str, env_name: str, defaults: dict, method: str = "st_scratch"):
+    """Build the model exactly as train.py does, so nothing below is transcribed."""
+    from stable_baselines3.common.vec_env import DummyVecEnv
+    from set_transformer.rl.benchmark.registry import get_env_spec, get_method_spec
+
+    spec = get_env_spec(env_name)
+    ms = get_method_spec(method)
+    args = argparse.Namespace(
+        learning_rate=defaults["learning_rate"], ppo_n_steps=defaults["ppo_n_steps"],
+        batch_size=defaults["batch_size"], results_dir=None, seed=0, device="cpu")
+    kwargs = build_extractor_kwargs(
+        ms, defaults["features_dim"], defaults["obs_mlp_hidden_dims"],
+        encoder_arch=dict(num_encodings=defaults["num_encodings"],
+                          dim_encoder=defaults["dim_encoder"], num_inds=defaults["num_inds"],
+                          dim_hidden=defaults["dim_hidden"], num_heads=defaults["num_heads"],
+                          ln=not defaults["no_ln"]),
+        particle_scale=spec.particle_scale)
+    vec = DummyVecEnv([train_mod.make_env_thunk(spec, 0, for_eval=True)])
+    model = train_mod.build_model(algo, vec, ms.extractor_class, kwargs, args, spec.gamma)
+    return model, vec
+
+
+def _ppo_doc(defaults: dict) -> dict:
+    import stable_baselines3 as sb3
+
+    heads = {}
+    for env_name, label in (("msearch", "continuous"), ("odd_even", "discrete")):
+        if env_name not in ENV_REGISTRY:
+            continue
+        m, vec = _build_live("PPO", env_name, defaults)
+        p = m.policy
+        head = {
+            "reference_env": env_name,
+            "action_space": str(m.action_space),
+            "action_distribution": type(p.action_dist).__name__,
+            "policy_mlp": _layers(p.mlp_extractor.policy_net),
+            "value_mlp": _layers(p.mlp_extractor.value_net),
+            "action_net": _layers(p.action_net),
+            "value_net": _layers(p.value_net),
+            "params": {
+                "policy_mlp": _n(p.mlp_extractor.policy_net),
+                "value_mlp": _n(p.mlp_extractor.value_net),
+                "action_net": _n(p.action_net),
+                "value_net": _n(p.value_net),
+            },
+        }
+        if hasattr(p, "log_std"):
+            head["log_std"] = {"type": "state-independent nn.Parameter",
+                               "init": float(p.log_std.detach().mean()),
+                               "size": int(p.log_std.numel())}
+            head["params"]["log_std"] = int(p.log_std.numel())
+        head["params"]["heads_total_excl_extractor"] = int(sum(head["params"].values()))
+        heads[label] = head
+        common = m
+        vec.close()
+
+    m = common
+    p = m.policy
+    return {
+        "algorithm": "PPO",
+        "library": f"stable-baselines3 {sb3.__version__}",
+        "policy_class": type(p).__name__,
+        "set_by_train_py": {
+            "learning_rate": defaults["learning_rate"],
+            "n_steps": defaults["ppo_n_steps"],
+            "batch_size": defaults["batch_size"],
+            "n_envs": defaults["n_envs"],
+            "gamma": "per-env (envs/<env>.yaml)",
+            "policy_kwargs": "features_extractor_class/kwargs ONLY -- every head setting "
+                             "below is an SB3 default",
+        },
+        "rollout_and_update": {
+            "n_steps_per_env": m.n_steps,
+            "rollout_size": m.n_steps * defaults["n_envs"],
+            "minibatch_size": m.batch_size,
+            "minibatches_per_epoch": (m.n_steps * defaults["n_envs"]) // m.batch_size,
+            "n_epochs": m.n_epochs,
+            "gradient_steps_per_rollout":
+                m.n_epochs * ((m.n_steps * defaults["n_envs"]) // m.batch_size),
+        },
+        "objective": {
+            "clip_range": float(m.clip_range(1.0)),
+            "clip_range_vf": m.clip_range_vf,
+            "gae_lambda": m.gae_lambda,
+            "normalize_advantage": m.normalize_advantage,
+            "ent_coef": m.ent_coef,
+            "vf_coef": m.vf_coef,
+            "max_grad_norm": m.max_grad_norm,
+            "target_kl": m.target_kl,
+            "learning_rate_schedule": "constant",
+        },
+        "optimizer": {
+            "class": type(p.optimizer).__name__,
+            "eps": p.optimizer.defaults.get("eps"),
+            "weight_decay": p.optimizer.defaults.get("weight_decay"),
+            "betas": list(p.optimizer.defaults.get("betas", ())),
+        },
+        "architecture": {
+            "share_features_extractor": p.share_features_extractor,
+            "extractor_copies": 1,
+            "net_arch": {k: list(v) for k, v in p.net_arch.items()},
+            "activation_fn": p.activation_fn.__name__,
+            "ortho_init": p.ortho_init,
+            "squash_output": p.squash_output,
+            "use_sde": m.use_sde,
+            "heads": heads,
+            "note": ("the actor and critic MLPs read the SAME extractor output; the "
+                     "extractor (method-specific, see methods/*.yaml) is counted once"),
+        },
     }
+
+
+def _sac_doc(defaults: dict) -> dict:
+    import stable_baselines3 as sb3
+
+    m, vec = _build_live("SAC", "msearch", defaults)
+    p = m.policy
+    n_envs = defaults["n_envs"]
+    actor_heads = _n(p.actor.latent_pi) + _n(p.actor.mu) + _n(p.actor.log_std)
+    q_net = _n(p.critic.q_networks[0])
+    doc = {
+        "algorithm": "SAC",
+        "library": f"stable-baselines3 {sb3.__version__}",
+        "policy_class": type(p).__name__,
+        "requires": "continuous (Box) action space -- odd_even is Discrete, PPO only",
+        "set_by_train_py": {
+            "learning_rate": defaults["learning_rate"],
+            "batch_size": defaults["batch_size"],
+            "n_envs": n_envs,
+            "gamma": "per-env (envs/<env>.yaml)",
+            "policy_kwargs": "features_extractor_class/kwargs ONLY -- every head setting "
+                             "below is an SB3 default",
+            "deviation_from_sb3_default": {
+                "batch_size": f"{defaults['batch_size']} (SB3 SAC default is 256)",
+            },
+        },
+        "replay": {
+            "buffer_class": type(m.replay_buffer).__name__,
+            "buffer_size": m.buffer_size,
+            "learning_starts": m.learning_starts,
+            "optimize_memory_usage": m.optimize_memory_usage,
+            "note": ("buffer_size exceeds the total step budget of every registered env, so "
+                     "nothing is ever evicted -- effectively full-history replay"),
+        },
+        "update": {
+            "train_freq": f"{m.train_freq.frequency} {m.train_freq.unit.value}",
+            "gradient_steps": m.gradient_steps,
+            "n_envs": n_envs,
+            "update_to_data_ratio": round(m.gradient_steps / n_envs, 4),
+            "note": (f"one gradient step per vectorized step, which collects {n_envs} "
+                     f"transitions -- UTD {m.gradient_steps}/{n_envs}, below the canonical "
+                     f"SAC ratio of 1"),
+            "tau": m.tau,
+            "target_update_interval": m.target_update_interval,
+        },
+        "entropy": {
+            "ent_coef": str(m.ent_coef),
+            "auto_tuned": m.ent_coef_optimizer is not None,
+            "initial_log_ent_coef": (float(m.log_ent_coef.detach())
+                                     if m.log_ent_coef is not None else None),
+            "target_entropy": float(m.target_entropy),
+            "target_entropy_rule": "-dim(action_space)",
+        },
+        "optimizer": {
+            "actor": type(p.actor.optimizer).__name__,
+            "critic": type(p.critic.optimizer).__name__,
+            "entropy_coef": type(m.ent_coef_optimizer).__name__ if m.ent_coef_optimizer else None,
+            "eps": p.actor.optimizer.defaults.get("eps"),
+            "betas": list(p.actor.optimizer.defaults.get("betas", ())),
+            "learning_rate_schedule": "constant, shared by all three optimizers",
+        },
+        "architecture": {
+            "share_features_extractor": p.share_features_extractor,
+            "extractor_copies": {
+                "actor": 1, "critic": 1, "critic_target": 1,
+                "trainable": 2,
+                "note": ("the actor and critic each own an INDEPENDENT extractor, so a "
+                         "learned encoder is trained twice with different gradients; the "
+                         "target critic holds a Polyak-averaged copy. For frozen arms all "
+                         "copies load the same checkpoint and stay fixed"),
+            },
+            "net_arch": list(p.net_arch),
+            "activation_fn": p.activation_fn.__name__,
+            "n_critics": p.critic.n_critics,
+            "use_sde": m.use_sde,
+            "actor": {
+                "action_distribution": type(p.actor.action_dist).__name__,
+                "latent_pi": _layers(p.actor.latent_pi),
+                "mu": _layers(p.actor.mu),
+                "log_std": _layers(p.actor.log_std),
+                "log_std_type": "state-dependent (a Linear head, clipped to [-20, 2])",
+                "params": {"latent_pi": _n(p.actor.latent_pi), "mu": _n(p.actor.mu),
+                           "log_std": _n(p.actor.log_std),
+                           "heads_total_excl_extractor": actor_heads},
+            },
+            "critic": {
+                "q_network_input": "extractor features ++ action",
+                "q_network": _layers(p.critic.q_networks[0]),
+                "params": {"per_q_network": q_net,
+                           "all_q_networks": q_net * p.critic.n_critics},
+            },
+        },
+    }
+    vec.close()
+    return doc
+
+
+def emit_algorithms(defaults, check, stale):
+    ppo, sac = _ppo_doc(defaults), _sac_doc(defaults)
+    ppo_head = ppo["architecture"]["heads"]["continuous"]["params"]["policy_mlp"]
+    sac_head = sac["architecture"]["actor"]["params"]["latent_pi"]
+    comparability = {
+        "comparability_with_other_algorithm": {
+            "head_widths_differ": (f"PPO uses {ppo['architecture']['net_arch']['pi']} "
+                                   f"{ppo['architecture']['activation_fn']}; SAC uses "
+                                   f"{sac['architecture']['net_arch']} "
+                                   f"{sac['architecture']['activation_fn']}"),
+            "actor_hidden_params": {"ppo": ppo_head, "sac": sac_head,
+                                    "ratio": round(sac_head / ppo_head, 1)},
+            "trainable_extractor_copies": {"ppo": 1, "sac": 2},
+            "implication": ("a SAC-vs-PPO difference is also a head-capacity and "
+                            "encoder-copy difference; it is not a pure algorithm effect "
+                            "unless net_arch is pinned to match"),
+        }
+    }
+    ppo.update(comparability)
+    sac.update(comparability)
     write(OUT / "algorithms" / "ppo.yaml",
-          header("PPO", "stable-baselines3 PPO; unlisted values are SB3 defaults.")
-          + yaml_dump({"algorithm": "PPO", **common, "n_steps": defaults["ppo_n_steps"]}),
-          check, stale)
+          header("PPO", "Read from a live model built by train.py::build_model.")
+          + yaml_dump(ppo), check, stale)
     write(OUT / "algorithms" / "sac.yaml",
-          header("SAC", "stable-baselines3 SAC; unlisted values are SB3 defaults.")
-          + yaml_dump({
-              "algorithm": "SAC", **common,
-              "requires_continuous_actions": True,
-              "note": ("SAC leaves policy.features_extractor as None and builds separate "
-                       "actor/critic extractors; train.py::find_features_extractor "
-                       "handles that"),
-          }),
-          check, stale)
+          header("SAC", "Read from a live model built by train.py::build_model.")
+          + yaml_dump(sac), check, stale)
 
 
 def _potential_name(fn):
@@ -425,7 +657,8 @@ def emit_readme(defaults, check, stale):
         "| Path | Contents |",
         "|---|---|",
         "| `_shared.yaml` | Protocol every run obeys: shared head, seeds, eval, capacity fairness |",
-        "| `algorithms/` | PPO and SAC hyperparameters |",
+        "| `algorithms/` | PPO and SAC: every hyperparameter, actor/critic head layers, "
+        "distributions, optimizers, parameter counts (read from live models) |",
         "| `envs/` | One per registered environment: belief, reward, defaults |",
         "| `methods/` | One per method — the encoder configuration and its parameter counts |",
         "| `pretraining/` | One per encoder family that can be pretrained |",

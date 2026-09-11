@@ -13,7 +13,7 @@ python experiments/benchmark/generate_configs.py --check  # fail if stale
 | Path | Contents |
 |---|---|
 | `_shared.yaml` | Protocol every run obeys: shared head, seeds, eval, capacity fairness |
-| `algorithms/` | PPO and SAC hyperparameters |
+| `algorithms/` | PPO and SAC: every hyperparameter, actor/critic head layers, distributions, optimizers, parameter counts (read from live models) |
 | `envs/` | One per registered environment: belief, reward, defaults |
 | `methods/` | One per method — the encoder configuration and its parameter counts |
 | `pretraining/` | One per encoder family that can be pretrained |

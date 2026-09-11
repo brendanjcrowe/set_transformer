@@ -5,11 +5,14 @@
 
 protocol:
   seeds: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+  observation_normalization: off (VecNormalize is opt-in via --vec_normalize and no sweep uses it)
   evaluation:
     reward: true task reward, unshaped
     note: eval envs are built with for_eval=True, so any shaping or proxy reward is present during training only
     n_eval_episodes: 10
     eval_freq_env_steps: 20000
+    policy_at_eval: deterministic (mean action / argmax)
+    checkpoint_kept: best_model by mean eval return, plus the final model
   run_record: "results/<env>/<method>/seed<n>/{meta.json,evaluations.npz}"
   warning: train.py puts no algorithm in the results path; when sweeping two algorithms use a separate --results_dir per algorithm or the second silently overwrites the first
 shared_head:
