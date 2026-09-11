@@ -86,6 +86,13 @@ from set_transformer.rl.feature_extractors.st import (  # noqa: E402
     STFeatureLoggingCallback,
     SetTransformerFeaturesExtractor,
 )
+from set_transformer.rl.encoder_finetune import (  # noqa: E402 - shared with experiments/ant_tag
+    EncoderLRLoggingCallback,
+    UnfreezeEncoderCallback,
+    _ScaledLRParamGroup,
+    _group_collapsing,
+    scale_encoder_learning_rate,
+)
 
 # The Odd-Even collapse sentinel. The shared STFeatureLoggingCallback logs a
 # 1-sample std at n_envs=1 (so it reads NaN), and its absolute statistic does
@@ -149,126 +156,8 @@ def reload_pretrained_encoder(model, path: str, frozen: bool,
         "pretrained_st_model_path"] = None
 
 
-class _ScaledLRParamGroup(dict):
-    """An optimizer param group whose ``lr`` is always ``lr_scale`` x the value written.
-
-    SB3's ``utils.update_learning_rate`` does ``param_group["lr"] = lr`` on every
-    group at the start of each ``train()``, which would wipe out a plain second
-    group's smaller rate. torch keeps the very dict object it was given in
-    ``optimizer.param_groups``, so a dict subclass intercepting ``__setitem__``
-    for ``"lr"`` makes the scale stick through every schedule update, with no
-    change to the shared training loop and nothing extra for ``model.save`` to
-    pickle (``state_dict()`` copies groups into plain dicts).
-    """
-
-    def __setitem__(self, key, value):
-        if key == "lr":
-            value = value * dict.get(self, "lr_scale", 1.0)
-        super().__setitem__(key, value)
-
-
-class EncoderLRLoggingCallback(BaseCallback):
-    def _on_step(self) -> bool:
-        return True
-
-    def _on_rollout_end(self) -> None:
-        groups = self.model.policy.optimizer.param_groups
-        self.logger.record("train/encoder_learning_rate", float(groups[0]["lr"]))
-
-
-def _group_collapsing(optimizer_class):
-    """Optimizer subclass whose saved ``state_dict`` looks like a FRESH
-    single-group optimizer over all parameters.
-
-    ``PPO.load`` rebuilds a plain policy (one param group) and then calls
-    ``optimizer.load_state_dict`` with ``exact_match=True``; a two-group state
-    dict is refused ("different number of parameter groups") and every saved
-    agent -- final, best_model, checkpoints -- becomes unloadable. Evaluation
-    never needs the Adam moments, so the state is dropped and the groups
-    merged. Resuming TRAINING from such a save restarts the moments; that is
-    the documented cost of fix 1.
-    """
-    class GroupCollapsing(optimizer_class):
-        def state_dict(self):
-            sd = super().state_dict()
-            groups = sd["param_groups"]
-            n = sum(len(g["params"]) for g in groups)
-            plain = {k: v for k, v in groups[-1].items() if k not in ("params", "lr_scale")}
-            return {"state": {}, "param_groups": [{**plain, "params": list(range(n))}]}
-    GroupCollapsing.__name__ = f"{optimizer_class.__name__}GroupCollapsing"
-    return GroupCollapsing
-
-
-def scale_encoder_learning_rate(model, scale: float) -> None:
-    """Finetune-collapse fix 1: give the encoder its own, smaller learning rate.
-
-    Rebuilds the policy optimizer with two param groups: the encoder in a
-    :class:`_ScaledLRParamGroup` carrying ``lr_scale``, everything else plain.
-    ``--lr_anneal`` still applies to both (the scaled group tracks the schedule
-    at ``scale`` x the rate).
-    """
-    policy = model.policy
-    encoder_params = list(policy.features_extractor.encoder.parameters())
-    encoder_ids = {id(p) for p in encoder_params}
-    other_params = [p for p in policy.parameters() if id(p) not in encoder_ids]
-    base_lr = model.lr_schedule(1.0)
-    encoder_group = _ScaledLRParamGroup(params=encoder_params, lr_scale=scale)
-    encoder_group["lr"] = base_lr          # -> base_lr * scale via __setitem__
-    policy.optimizer = _group_collapsing(policy.optimizer_class)(
-        [encoder_group, {"params": other_params, "lr": base_lr}],
-        lr=base_lr, **policy.optimizer_kwargs)
-    assert policy.optimizer.param_groups[0] is encoder_group
-    print(f"ST encoder learning rate scaled by {scale} "
-          f"({len(encoder_params)} encoder tensors at {encoder_group['lr']:.2e}, "
-          f"{len(other_params)} head tensors at {base_lr:.2e}; anneal applies to both)")
-
-
-class UnfreezeEncoderCallback(BaseCallback):
-    """Finetune-collapse fix 2: keep the encoder frozen for the first
-    ``unfreeze_at`` environment steps, then release it.
-
-    The heads first learn to read the pretrained code while it cannot move;
-    only then does the encoder see gradients, which by that point are
-    informative rather than the noise a random head emits. The encoder's
-    parameters were in the optimizer all along (SB3 builds it over
-    ``policy.parameters()`` regardless of requires_grad), so flipping the flag
-    is sufficient. Logs ``st/encoder_trainable`` so the switch is visible in
-    TensorBoard, and prints once.
-    """
-
-    def __init__(self, unfreeze_at: int):
-        super().__init__()
-        self.unfreeze_at = int(unfreeze_at)
-        self.done = False
-
-    def _encoders(self):
-        found = [self.model.policy.features_extractor]
-        for attr in ("actor", "critic", "critic_target"):
-            module = getattr(self.model.policy, attr, None)
-            other = getattr(module, "features_extractor", None)
-            if other is not None and other is not found[0]:
-                found.append(other)
-        return found
-
-    def _on_step(self) -> bool:
-        if not self.done and self.num_timesteps >= self.unfreeze_at:
-            n = 0
-            for extractor in self._encoders():
-                # The extractor's own flag wraps forward() in torch.no_grad()
-                # when set (st.py); requires_grad alone would leave the
-                # encoder trainable in name only.
-                extractor.st_frozen = False
-                extractor.encoder.train()
-                for param in extractor.encoder.parameters():
-                    param.requires_grad_(True)
-                    n += 1
-            self.done = True
-            print(f"UnfreezeEncoderCallback: encoder UNFROZEN at step "
-                  f"{self.num_timesteps:,} ({n} tensors now trainable)", flush=True)
-        self.logger.record("st/encoder_trainable", float(self.done))
-        return True
-
-
+# The finetune-collapse fixes live in set_transformer/rl/encoder_finetune.py
+# (shared with the Ant-Tag ST arm); imported above.
 SMALL_GEOMETRY = {"num_inds": 16, "dim_hidden": 64, "num_post_sab": 2}
 
 

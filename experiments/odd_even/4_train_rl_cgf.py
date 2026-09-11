@@ -638,6 +638,17 @@ def add_readout_and_pretrained_arguments(parser) -> None:
              "that matches the ST's --st_frozen. Requires a checkpoint.")
 
 
+def resolve_t_init_max(args, tanh_default: float = 40.0) -> None:
+    """Fill a None --t_init_max: ``tanh_default`` in tanh mode, t_clamp in
+    clamp mode. Called AFTER resolve_cgf_geometry so a checkpoint's value
+    wins, and BEFORE resolve_common so run_config.json records the number
+    that ran. The extractor refuses t_init_max > t_clamp in clamp mode; this
+    is what keeps a bare ``--t_param clamp`` run legal."""
+    if args.t_init_max is None:
+        args.t_init_max = (float(tanh_default) if args.t_param != "clamp"
+                           else float(args.t_clamp))
+
+
 def resolve_cgf_geometry(args, parser) -> None:
     """CLI > checkpoint config > default for the geometry flags, then size
     the readout if --match_params asks for it. Prints the resulting encoder
@@ -723,11 +734,13 @@ def main() -> None:
              "normalized units, 2/24.5 = 0.0816) ~ 2..4; 50 gives 4.1. The "
              "offline mode probe (oddeven.md 2026-09-05) was run out to +-50.")
     parser.add_argument(
-        "--t_init_max", type=float, default=40.0,
+        "--t_init_max", type=float, default=None,
         help="Largest |t| in the spread_1d init (log-spaced from 0.25). Must "
-             "be below t_bound in tanh mode. 40 with t_bound 50 covers the "
-             "mean/variance regime at small t and the support-edge regime at "
-             "large t. The exact3M runs used the legacy 2.0.")
+             "be below t_bound in tanh mode. Default: 40 in tanh mode (with "
+             "t_bound 50 that covers the mean/variance regime at small t and "
+             "the support-edge regime at large t) and t_clamp in clamp mode "
+             "(the exact3M value, 2.0) -- the extractor refuses a value above "
+             "the clamp, which would silently flatten every larger probe.")
     parser.add_argument(
         "--t_clamp", type=float, default=2.0,
         help="clamp mode only: the hard bound on each t component.")
@@ -780,6 +793,7 @@ def main() -> None:
             "RANDOM readout. Pass a checkpoint from 3_pretrain_st_belief.py "
             "--encoder cgf, or drop the flag (use --t_frozen alone to fix t).")
     resolve_cgf_geometry(args, parser)
+    resolve_t_init_max(args)
 
     (_run_dir, log_dir, model_save_path, run_subdir,
      particle_filter_class) = resolve_common(args, encoder)

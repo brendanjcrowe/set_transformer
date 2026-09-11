@@ -346,7 +346,9 @@ def main(argv=None):
     parser.add_argument("--t_init_scale", type=float, default=0.1)
     parser.add_argument("--t_param", default="tanh", choices=["clamp", "tanh"])
     parser.add_argument("--t_bound", type=float, default=50.0)
-    parser.add_argument("--t_init_max", type=float, default=40.0)
+    parser.add_argument("--t_init_max", type=float, default=None,
+                        help="Default 40 in tanh mode, t_clamp in clamp mode "
+                             "(4_train_rl_cgf.resolve_t_init_max).")
     parser.add_argument("--t_clamp", type=float, default=2.0)
     parser.add_argument("--t_frozen", action="store_true",
                         help="Fixed-t arm: t is a buffer, only the readout learns.")
@@ -383,6 +385,7 @@ def main(argv=None):
             parser.error("--pretrained_cgf_model_path / --cgf_frozen are RL-side flags; "
                          "this script PRODUCES the checkpoint.")
         _train_rl_cgf.resolve_cgf_geometry(args, parser)
+        _train_rl_cgf.resolve_t_init_max(args)
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
