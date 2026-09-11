@@ -16,7 +16,8 @@ class TrainingConfig:
 
     # Model selection
     model_type: Literal[
-        "pf_st", "set_vae", "set_vqvae", "ds_ae", "ds_vae", "ds_vqvae"
+        "pf_st", "set_vae", "set_vqvae", "ds_ae", "ds_vae", "ds_vqvae",
+        "cgf_arm_ae"
     ] = "pf_st"
 
     # Model parameters

@@ -895,8 +895,22 @@ class WeightedCGFFeaturesExtractor(BaseFeaturesExtractor):
         """
         return self._raw_cgf(obs_dict)
 
+    def cgf_block(self, particles: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+        """The encoder proper: ``readout(feature_norm(K / K'))`` for raw-frame
+        ``[B, N, D]`` particles and ``[B, N]`` weights -> ``[B, readout_dim]``.
+
+        Everything this extractor learns is in here; ``forward`` only
+        concatenates the result to the base observation. Exposed so the
+        reconstruction pretraining path (:class:`~set_transformer.models.CGFArmAutoencoder`,
+        ``3_train_st.py --encoder cgf``) trains exactly the block the policy
+        will call, with the same frame convention (particles are divided by
+        ``arena_scale`` inside).
+        """
+        return self.readout(self.feature_norm(
+            self._raw_cgf({"particles": particles, "weights": weights})))
+
     def _forward(self, obs_dict: dict[str, torch.Tensor]) -> torch.Tensor:
-        cgf = self.readout(self.feature_norm(self._raw_cgf(obs_dict)))
+        cgf = self.cgf_block(obs_dict["particles"], obs_dict["weights"])
         return torch.cat([obs_dict["obs"], cgf], dim=-1)
 
     def forward(self, obs_dict: dict[str, torch.Tensor]) -> torch.Tensor:  # noqa: F811

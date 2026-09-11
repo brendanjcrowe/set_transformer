@@ -7,6 +7,10 @@ Step 3 of the pipeline:
   3) Train Set Transformer     (this script)
   4) Train RL with the encoder (4_train_rl_st.py --pretrained_st_model_path)
 
+--encoder cgf pretrains the CGF arm's block instead (WeightedCGFFeaturesExtractor
+through a PFDecoder, same loss / alignment / frame) and exports
+checkpoints/checkpoint_best_cgf_arm.pt for 4_train_rl_cgf.py --pretrained_cgf_model_path.
+
 Nothing here is env-specific: the script consumes whatever
 2_collect_pf_dataset.py wrote, for any env + particle filter pair. The
 architecture flags must match what the RL feature extractor will build.
@@ -51,6 +55,11 @@ from set_transformer.data.dataset import get_data_loader
 from set_transformer.emd_matrix import dataset_sha256, read_sidecar
 from set_transformer.training.config import ExperimentConfig, TrainingConfig
 from set_transformer.training.trainer import Trainer
+from set_transformer.models.cgf_arm_ae import (  # noqa: E402
+    CGFArmAutoencoder,
+    export_arm_checkpoint,
+    make_arm_extractor,
+)
 
 
 def main() -> None:
@@ -173,6 +182,49 @@ def main() -> None:
     # Data loading
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--train_split", type=float, default=0.8)
+    # Encoder family. "st" is the historical path (PFSetTransformer). "cgf"
+    # pretrains the ARM's WeightedCGFFeaturesExtractor block through a PFDecoder
+    # under the same loss / alignment / checkpointing, and exports the file
+    # 4_train_rl_cgf.py --pretrained_cgf_model_path loads. Flags below are
+    # spelled exactly as in 4_train_rl_cgf.py; the RL side takes a flag left at
+    # its default from the checkpoint and refuses one that disagrees.
+    parser.add_argument(
+        "--encoder", type=str, default="st", choices=["st", "cgf"],
+        help="Which arm's encoder to pretrain by reconstruction. 'cgf' ignores "
+             "--num_inds/--dim_hidden/--num_heads/--no_layer_norm (ST geometry); "
+             "--num_encodings then sets the decoder's attention slots and "
+             "--dim_encoder is derived from the CGF block width.")
+    cgf = parser.add_argument_group("CGF encoder (--encoder cgf)")
+    cgf.add_argument("--num_cgf_features", type=int, default=64)
+    cgf.add_argument("--t_init_mode", type=str, default="spread",
+                     help="spread (2-D), spread_1d, linspace_all_dims, "
+                          "linspace_first_dim, random")
+    cgf.add_argument("--t_init_scale", type=float, default=0.1)
+    cgf.add_argument("--t_clamp", type=float, default=2.0)
+    cgf.add_argument("--t_frozen", action="store_true",
+                     help="Fix t; only the readout / embedding / norm learn.")
+    cgf.add_argument("--t_param", type=str, default="clamp", choices=["clamp", "tanh", "polar"],
+                     help="Probe parameterisation. polar (a ball of radius t_bound) is "
+                          "the recommended 2-D mode; PITFALLS.md section 9.")
+    cgf.add_argument("--t_bound", type=float, default=None,
+                     help="Required with tanh / polar. Size it by t_bound x (decision "
+                          "length in normalised units) ~ 2..4: smart 9.0, "
+                          "smart_mid_slow_v15 13.5, cdens_terminal 35 "
+                          "(variants.cgf_t_bound). There is no env here to read it from.")
+    cgf.add_argument("--t_init_max", type=float, default=None,
+                     help="Ceiling of the spread init. None: 2.8 under clamp (the "
+                          "recorded behaviour), 0.8 * t_bound under tanh / polar.")
+    cgf.add_argument("--feature_mode", type=str, default="K", choices=["K", "K_grad", "both"])
+    cgf.add_argument("--feature_norm", type=str, default="none",
+                     choices=["none", "running", "layernorm"],
+                     help="'running' updates its statistics every training batch here "
+                          "(no PPO cycle); the RL side loads them as fixed buffers.")
+    cgf.add_argument("--readout_hidden", type=int, default=0)
+    cgf.add_argument("--readout_depth", type=int, default=0)
+    cgf.add_argument("--readout_dim", type=int, default=None)
+    cgf.add_argument("--x_embed_dim", type=int, default=0)
+    cgf.add_argument("--x_embed_hidden", type=int, default=64)
+    cgf.add_argument("--x_embed_depth", type=int, default=1)
     parser.add_argument(
         "--seed", type=int, default=0,
         help="Seeds model init, the shuffle order and the train/val split. "
@@ -181,6 +233,16 @@ def main() -> None:
     )
 
     args = parser.parse_args()
+    if args.encoder == "cgf":
+        if args.t_param in ("tanh", "polar") and (args.t_bound is None or args.t_bound <= 0):
+            parser.error(f"--t_param {args.t_param} needs --t_bound > 0 (see its help "
+                         "for the sizing rule); this script has no env to read it from.")
+        if args.t_param == "clamp":
+            args.t_bound = None
+        elif args.t_init_max is None:
+            args.t_init_max = 0.8 * args.t_bound   # 4_train_rl_cgf.resolve_cgf_encoder_args
+        if args.emd_matrix_path is None and args.align_lambda > 0:
+            parser.error("--align_lambda > 0 needs --emd_matrix_path")
 
     # Seed before anything that draws: the split (via get_data_loader's
     # generator), the model init and the batch shuffle. Recorded in the
@@ -382,13 +444,77 @@ def main() -> None:
         print("Latent alignment: off")
 
     # Train
+    model = None
+    cgf_extractor = None
+    if args.encoder == "cgf":
+        # The block divides by arena_scale; the loader already divided by the
+        # dataset's particle_scale. They are the same number here (checked in
+        # the autoencoder) so the exported t are in the frame PPO uses.
+        cgf_kwargs = dict(
+            num_cgf_features=args.num_cgf_features, t_init_mode=args.t_init_mode,
+            t_init_scale=args.t_init_scale, t_clamp=args.t_clamp, t_frozen=args.t_frozen,
+            t_param=args.t_param, t_bound=args.t_bound, t_init_max=args.t_init_max,
+            feature_mode=args.feature_mode, feature_norm=args.feature_norm,
+            readout_hidden=args.readout_hidden, readout_depth=args.readout_depth,
+            readout_dim=args.readout_dim, x_embed_dim=args.x_embed_dim,
+            x_embed_hidden=args.x_embed_hidden, x_embed_depth=args.x_embed_depth)
+        cgf_extractor = make_arm_extractor(args.num_particles, args.dim_particles,
+                                           arena_scale=applied_scale, **cgf_kwargs)
+        model = CGFArmAutoencoder(
+            cgf_extractor, num_particles=args.num_particles,
+            dim_particles=args.dim_particles, particle_scale=applied_scale,
+            num_encodings=args.num_encodings, dim_hidden=args.dim_hidden,
+            weighted=weighted)
+        training_config.model_type = "cgf_arm_ae"
+        print(f"CGF arm encoder: {cgf_extractor._cgf_geometry}")
+        print(f"  block width {cgf_extractor.readout_dim} -> decoder code "
+              f"{model.num_encodings} x {model.dim_encoder}; "
+              f"{cgf_extractor.encoder_parameter_count()} encoder params, "
+              f"{sum(p.numel() for p in model.decoder.parameters())} decoder params")
     trainer = Trainer(
         training_config=training_config,
         experiment_config=experiment_config,
         train_loader=train_loader,
         val_loader=val_loader,
+        model=model,
     )
     trainer.train()
+
+    if args.encoder == "cgf":
+        # The RL loader wants the extractor's own keys and its geometry, not the
+        # whole autoencoder. Export best and latest, then prove the export loads
+        # into a fresh extractor with the CLI's geometry (strict keys + the
+        # loader's field-by-field geometry check).
+        objective = f"reconstruction_{args.loss_type}" + ("_aligned" if aligning else "")
+        exported = {}
+        for tag in ("best", "latest"):
+            src = experiment_config.checkpoint_dir / f"checkpoint_{tag}.pt"
+            if not src.exists():
+                continue
+            dst = experiment_config.checkpoint_dir / f"checkpoint_{tag}_cgf_arm.pt"
+            export_arm_checkpoint(
+                src, dst, cgf_extractor, particle_centre=applied_centre,
+                objective=objective, data_path=args.data_path,
+                extra_config={"weighted_pretraining": bool(weighted),
+                              "sinkhorn_blur": args.sinkhorn_blur,
+                              "sinkhorn_scaling": args.sinkhorn_scaling})
+            exported[tag] = dst
+        check = make_arm_extractor(args.num_particles, args.dim_particles,
+                                   arena_scale=applied_scale, **cgf_kwargs,
+                                   pretrained_cgf_model_path=str(exported["best"]))
+        ref = torch.load(exported["best"], map_location="cpu", weights_only=False)["model_state_dict"]
+        live = check.state_dict()
+        worst = max(float((ref[k].float() - live[k].float()).abs().max()) for k in ref)
+        if worst > 0.0:
+            raise RuntimeError(f"exported checkpoint does not round-trip (max |delta| {worst})")
+        print(f"Exported CGF arm encoder: {exported['best']}"
+              + (f" (and {exported['latest']})" if "latest" in exported else ""))
+        print("  loads strict into WeightedCGFFeaturesExtractor with this geometry. Use:\n"
+              f"    python3 4_train_rl_cgf.py --variant <variant> "
+              f"--pretrained_cgf_model_path {exported['best']} [--cgf_frozen | "
+              "--st_encoder_lr_scale 0.1]\n"
+              "  (flags left at default take the checkpoint's geometry; arena_scale must "
+              f"equal {applied_scale}).")
 
 
 if __name__ == "__main__":

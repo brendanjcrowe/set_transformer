@@ -59,6 +59,7 @@ class Trainer:
         train_loader: DataLoader,
         val_loader: DataLoader,
         logger: Optional[logging.Logger] = None,
+        model: Optional[nn.Module] = None,
     ):
         """Initialize trainer.
 
@@ -68,6 +69,14 @@ class Trainer:
             train_loader: Training data loader
             val_loader: Validation data loader
             logger: Logger instance (optional)
+            model: A prebuilt autoencoder to train instead of the one
+                ``config.model_type`` names. Must expose ``forward(X)`` ->
+                reconstruction (or a dict with ``recon``) and, for alignment,
+                ``encode(X)`` -> latent; in weighted mode ``X`` carries the
+                mass channel ``_model_input`` appends. Used by
+                ``3_train_st.py --encoder cgf`` for
+                :class:`~set_transformer.models.CGFArmAutoencoder`, whose
+                construction needs the CGF flags TrainingConfig does not carry.
         """
         self.config = training_config
         self.exp_config = experiment_config
@@ -89,7 +98,8 @@ class Trainer:
             np.random.seed(int(seed))
 
         # Initialize model, optimizer, scheduler, and losses
-        self.model = self._setup_model()
+        self.model = (model.to(self.config.device) if model is not None
+                      else self._setup_model())
         self.optimizer = self._setup_optimizer()
         self.scheduler = self._setup_scheduler()
         self.train_loss = self._setup_loss()
