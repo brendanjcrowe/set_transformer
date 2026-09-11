@@ -10,6 +10,9 @@ from set_transformer.rl.particle_filters.odd_even import (
     # Deprecated alias of the exact-support filter; see odd_even.py.
     OddEvenParticleFilter,
 )
+from set_transformer.rl.particle_filters.odd_even_parity import (
+    ParityAwareOddEvenParticleFilter,
+)
 
 __all__ = [
     "BaseParticleFilter",

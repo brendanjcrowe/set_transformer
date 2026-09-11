@@ -41,6 +41,10 @@ from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 
 from set_transformer.models import PFSetTransformer
+from set_transformer.rl.feature_extractors.statistical import (
+    _BasePFStatExtractor,
+    load_pretrained_state_dict,
+)
 
 
 class STFeatureLoggingCallback(BaseCallback):
@@ -324,3 +328,83 @@ class SetTransformerFeaturesExtractor(BaseFeaturesExtractor):
         st_features = encoded.reshape(encoded.size(0), -1)
         self.last_st_features = st_features.detach()
         return torch.cat([base_obs, st_features], dim=-1)
+
+
+# ---------------------------------------------------------------------------
+# Benchmark extractor. This file was an add/add conflict in merge 9488b78
+# (master into exp/PaperResults): both sides had created st.py, the resolution
+# kept the Ant-Tag/Odd-Even extractor above and dropped this class, which the
+# package __init__, rl/evaluate.py and rl/benchmark/registry.py import.
+# Restored verbatim from exp/PaperResults (638c74d).
+#
+# :class:`SetTransformerExtractor` covers all three benchmark ST method flavors:
+#   st_frozen    -- pretrained_model_path=<ckpt>, freeze=True
+#   st_finetune  -- pretrained_model_path=<ckpt>, freeze=False
+#   st_scratch   -- pretrained_model_path=None
+# It subclasses the same ``_BasePFStatExtractor`` plumbing as the statistical
+# baselines, so every benchmark method shares one obs-MLP + concat + projection
+# head and differs only in the particle-set statistic. The particle encoder is
+# the ``set_transformer`` half of a :class:`PFSetTransformer`, so pretraining
+# checkpoints from ``set_transformer.training`` load directly.
+# ---------------------------------------------------------------------------
+#: Backwards-compatible alias; checkpoint loading is now shared with the pooling encoders.
+load_pf_st_state_dict = load_pretrained_state_dict
+
+
+class SetTransformerExtractor(_BasePFStatExtractor):
+    """Set Transformer particle-set encoder (pretrained/frozen/fine-tuned/from-scratch).
+
+    ``num_particles`` and ``dim_particles`` are inferred from the ``particles`` entry of
+    the observation space; the remaining architecture args must match the pretraining
+    run when loading a checkpoint.
+    """
+
+    def __init__(
+        self,
+        observation_space: gym.spaces.Dict,
+        pretrained_model_path: str | None = None,
+        freeze: bool = False,
+        num_encodings: int = 8,
+        dim_encoder: int = 2,
+        num_inds: int = 32,
+        dim_hidden: int = 64,
+        num_heads: int = 4,
+        ln: bool = True,
+        obs_mlp_hidden_dims: list[int] = [64, 64],
+        features_dim: int = 128,
+    ):
+        self._check_freeze(pretrained_model_path, freeze)
+        self.pretrained_model_path = pretrained_model_path
+        self.freeze = freeze
+        self.num_encodings = num_encodings
+        self.dim_encoder = dim_encoder
+        self._st_arch = dict(
+            num_encodings=num_encodings,
+            dim_encoder=dim_encoder,
+            num_inds=num_inds,
+            dim_hidden=dim_hidden,
+            num_heads=num_heads,
+            ln=ln,
+        )
+        super().__init__(observation_space, obs_mlp_hidden_dims, features_dim)
+
+    def _build_particle_stat(self) -> None:
+        self.pf_st = self._apply_pretrained(
+            PFSetTransformer(
+                num_particles=self.num_particles,
+                dim_particles=self.particle_dim,
+                **self._st_arch,
+            ),
+            self.pretrained_model_path,
+            self.freeze,
+        )
+        # Only the encoder half is used for feature extraction; the decoder stays
+        # attached so checkpoints round-trip, but contributes nothing to forward.
+        self.encoder = self.pf_st.set_transformer
+
+    def _particle_stat_dim(self) -> int:
+        return self.num_encodings * self.dim_encoder
+
+    def _particle_features(self, particles: torch.Tensor) -> torch.Tensor:
+        enc = self.encoder(particles)  # [B, num_encodings, dim_encoder]
+        return enc.reshape(enc.size(0), -1)
