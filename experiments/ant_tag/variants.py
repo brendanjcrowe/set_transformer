@@ -60,6 +60,13 @@ class Variant:
     default_curriculum: str | None = None
     #: Evasion schedule that suits this env. None means the script's default.
     default_evasion_curriculum: str | None = None
+    #: Reward-shaping schedule 'frac:distance:entropy:tag_bonus,...' that is
+    #: THE recipe for this env, used when the caller passes no
+    #: --reward_schedule. None means the script's own default, which has
+    #: PF-entropy 0 throughout -- the pre-2026-07-31 no-search-incentive
+    #: configuration (domain_mds/smart_ant_tag.md). Set it only where a
+    #: recipe has been established on that variant.
+    default_reward_schedule: str | None = None
 
 
 VARIANTS: dict[str, Variant] = {
@@ -72,6 +79,19 @@ VARIANTS: dict[str, Variant] = {
         env_id="pdomains-ant-tag-smart-v0",
         particle_filter=SmartAntTagParticleFilter,
         notes="Unimodal; the target flees harder as the ant closes.",
+        # The schedules every July 2026 `smart` run recorded in its
+        # run_config.json (the CGF 79% / Gaussian 65% comparison). Stated here
+        # because the script fallback differs on both counts and neither
+        # difference raises: it breaks the ramp at 0.3/0.7 instead of 0.2/0.5,
+        # and a missing evasion default resolves to a CONSTANT scale 1.0, i.e.
+        # a full-strength evading target during the locomotion warm-start that
+        # the warm-start exists to avoid.
+        default_curriculum="0:100,0.2:100,0.5:3,1:3",
+        default_evasion_curriculum="0:0,0.2:0,0.5:1,1:1",
+        # entropy_flat: distance 1 -> 0.15, PF-entropy flat 2, tag 0 -> 50.
+        # The 2026-07-31 winner (CGF 79%, Gaussian 65%); every run behind a
+        # headline number on this variant used exactly this string.
+        default_reward_schedule="0:1:2:0,0.2:1:2:0,0.5:0.15:2:50,1:0.15:2:50",
     ),
     "smart_hard": Variant(
         env_id="pdomains-ant-tag-smart-hard-v0",
@@ -81,6 +101,47 @@ VARIANTS: dict[str, Variant] = {
                "Same 9x9 cage and 400-step cap as `smart`; unimodal belief."),
         default_curriculum="0:100,0.2:100,0.5:1.0,1:1.0",
         default_evasion_curriculum="0:0,0.2:0,0.5:1,1:1",
+    ),
+    "smart_mid": Variant(
+        env_id="pdomains-ant-tag-smart-mid-v0",
+        particle_filter=SmartAntTagParticleFilter,
+        notes=("SmartAntTag, tag_radius 1.0, visible_radius 2.0, target_step "
+               "0.5. Geometry sweep around smart_hard (visible 2.0 covers ~16% "
+               "of the 9x9 cage)."),
+        default_curriculum="0:100,0.2:100,0.5:2.0,1:2.0",
+        default_evasion_curriculum="0:0,0.2:0,0.5:1,1:1",
+    ),
+    "smart_hard_slow": Variant(
+        env_id="pdomains-ant-tag-smart-hard-slow-v0",
+        particle_filter=SmartAntTagParticleFilter,
+        notes=("smart_hard radii (tag 0.6, visible 1.0) with a slower target: "
+               "target_step 0.3 instead of 0.5. The filter reads target_step "
+               "off the env."),
+        default_curriculum="0:100,0.2:100,0.5:1.0,1:1.0",
+        default_evasion_curriculum="0:0,0.2:0,0.5:1,1:1",
+    ),
+    "smart_mid_slow": Variant(
+        env_id="pdomains-ant-tag-smart-mid-slow-v0",
+        particle_filter=SmartAntTagParticleFilter,
+        notes=("Both relaxations: tag 1.0, visible 2.0, target_step 0.3."),
+        default_curriculum="0:100,0.2:100,0.5:2.0,1:2.0",
+        default_evasion_curriculum="0:0,0.2:0,0.5:1,1:1",
+    ),
+    "smart_mid_slow_v15": Variant(
+        env_id="pdomains-ant-tag-smart-mid-slow-v15-v0",
+        particle_filter=SmartAntTagParticleFilter,
+        notes=("smart_mid_slow with visible_radius 1.5 instead of 2.0 (tag 1.0, "
+               "target_step 0.3). Smaller flee zone AND smaller visible area."),
+        # Reaches the real radius at 40%, not 50%: this is what all 57 ST runs
+        # in the 9-arm comparison passed via the driver's VIS_CURRICULUM. The
+        # registry said 0.5 until 2026-09-09, so a rerun that took the default
+        # would not have matched those results.
+        default_curriculum="0:100,0.2:100,0.4:1.5,1:1.5",
+        default_evasion_curriculum="0:0,0.2:0,0.5:1,1:1",
+        # The same entropy_flat recipe (RECIPE=entropy_flat in the driver);
+        # 39 of the 57 ST runs here, including the 9-arm comparison, used it.
+        # The fork ablation's dist0 variant is a paired arm, not the default.
+        default_reward_schedule="0:1:2:0,0.2:1:2:0,0.5:0.15:2:50,1:0.15:2:50",
     ),
     "ghost": Variant(
         env_id="pdomains-ant-tag-ghost-v0",
@@ -127,8 +188,9 @@ VARIANTS: dict[str, Variant] = {
 #: Variants whose target evades (SmartAntTagEnv and its subclasses). Only these
 #: respond to --evasion_curriculum and --target_speed_scale; set membership
 #: keyed on the registry, rather than a branch in every script.
-EVADING = {"smart", "smart_hard", "ghost", "dens", "cdens", "cdens_hard",
-           "cdens_terminal", "cdens_nospook"}
+EVADING = {"smart", "smart_hard", "smart_mid", "smart_hard_slow",
+           "smart_mid_slow", "smart_mid_slow_v15", "ghost", "dens", "cdens",
+           "cdens_hard", "cdens_terminal", "cdens_nospook"}
 
 
 def resolve(name: str) -> Variant:
@@ -152,6 +214,51 @@ def episode_cap(name: str) -> int:
         raise ValueError(
             f"{spec.id} registers no max_episode_steps; pass --max_steps")
     return int(spec.max_episode_steps)
+
+
+#: Target for ``t_bound * (tag_radius / arena half-width)``. The CGF only
+#: resolves structure at length L once t * L is of order 2..4 (oddeven.md
+#: 2026-09-04/05: at t * L = 0.16 every feature was a multiple of the
+#: posterior mean); 3 is the middle of that range. Frame-invariant: shifting
+#: every particle by a constant changes K by an additive term and K' by the
+#: shift, and leaves the tilted weights untouched.
+CGF_TILT_TARGET = 3.0
+
+
+def arena_scale(name: str) -> float:
+    """The CGF / ST particle normalisation: the cage half-width, read off the
+    live env (`cage_max_x`; the arena is square). Same derivation as
+    `4_train_rl_cgf.get_ant_tag_arena_scale`, exposed here so the registry can
+    size the CGF bound without importing a training script."""
+    env = gym.make(resolve(name).env_id, rendering=False)
+    try:
+        unwrapped = env.unwrapped
+        if not abs(float(unwrapped.cage_max_x) - float(unwrapped.cage_max_y)) < 1e-9:
+            raise ValueError(
+                f"{resolve(name).env_id} is not a square arena "
+                f"({unwrapped.cage_max_x} x {unwrapped.cage_max_y})")
+        return float(unwrapped.cage_max_x)
+    finally:
+        env.close()
+
+
+def cgf_t_bound(name: str, target: float = CGF_TILT_TARGET) -> float:
+    """The CGF probe bound for this variant: ``target / (tag_radius / arena_scale)``.
+
+    smart (tag 1.5 / 4.5) -> 9.0, smart_mid_slow_v15 (1.0 / 4.5) -> 13.5,
+    cdens_terminal (0.6 / 7.0) -> 35.0. The legacy clamp of 2.0 puts every
+    variant at t * L between 0.17 and 0.67, the mean regime. Used as the
+    default ``--t_bound`` of the CGF arm's tanh / polar modes; recorded in
+    run_config.json either way.
+    """
+    env = gym.make(resolve(name).env_id, rendering=False)
+    try:
+        tag_radius = float(env.unwrapped.tag_radius)
+    finally:
+        env.close()
+    if tag_radius <= 0:
+        raise ValueError(f"{resolve(name).env_id} reports tag_radius={tag_radius}")
+    return float(target) / (tag_radius / arena_scale(name))
 
 
 def run_subdir(encoder: str, name: str) -> str:

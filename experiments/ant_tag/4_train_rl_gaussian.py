@@ -247,6 +247,11 @@ def train_ant_tag_gaussian(
         save_freq=max(save_freq // n_envs, 1),
         save_path=os.path.join(model_dir, "checkpoints") if model_dir else "checkpoints",
         name_prefix="ant_tag_gaussian",
+        # Also snapshot VecNormalize with every checkpoint: without it the
+        # 100k-step checkpoints cannot be evaluated faithfully (the obs
+        # normalization is otherwise written once, at the end), and a run
+        # killed early is a total loss (PITFALLS.md section 7).
+        save_vecnormalize=True,
     )
     eval_cb = EvalCallback(
         eval_vec_env,
@@ -395,8 +400,10 @@ def main(encoder: str = "gaussian"):
     parser.add_argument(
         "--reward_schedule",
         type=str,
-        default="0:1:0:0,0.3:1:0:0,0.7:0:0:50,1:0:0:50",
-        help="Shaping schedule 'frac:distance:entropy[:tag_bonus],...', "
+        default=None,
+        help="Defaults to the variant's own recipe (variants.py default_reward_schedule), else "
+             "'0:1:0:0,0.3:1:0:0,0.7:0:0:50,1:0:0:50' (PF-entropy 0 throughout). "
+             "Shaping schedule 'frac:distance:entropy[:tag_bonus],...', "
              "interpolated over training progress and applied on every step. "
              "Pass 'none' to run on the constant --distance_coeff / "
              "--entropy_coeff values instead; giving both is an error.",
@@ -457,6 +464,11 @@ def main(encoder: str = "gaussian"):
     parser.add_argument("--n_eval_episodes", type=int, default=20)
 
     args = parser.parse_args()
+    # Before _resolve_reward_shaping: it reads an empty schedule as "use the
+    # constant flags", so a None default must be resolved first.
+    args.reward_schedule = variants.resolve_schedule(
+        args.variant, args.reward_schedule, "default_reward_schedule",
+        "0:1:0:0,0.3:1:0:0,0.7:0:0:50,1:0:0:50")
     _train_rl_cgf._resolve_reward_shaping(parser, args)
     if args.list_variants:
         variants.print_variants()

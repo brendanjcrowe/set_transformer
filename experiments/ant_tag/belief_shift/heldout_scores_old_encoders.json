@@ -1,0 +1,54 @@
+{
+ "args": {
+  "dataset": "data/smart_mid_slow_v15_pf_dataset.npz",
+  "n_dataset": 2000,
+  "beliefs": [
+   "belief_shift/beliefs_3M/*.npz",
+   "belief_shift/beliefs_final/*.npz"
+  ],
+  "exclude_from": "data/smart_mid_slow_v15_mixed10k10k_pf_dataset.npz",
+  "exclude_margin": 5,
+  "stride": 7,
+  "max_per_file": 300,
+  "ckpt": [
+   "old_plain=experiments/st_pretrain_smart_mid_slow_v15_plain/sinkhorn_2026-09-07_15-53-26/checkpoints/checkpoint_best.pt",
+   "old_aligned=experiments/st_pretrain_smart_mid_slow_v15_align/sinkhorn_2026-09-07_16-40-10/checkpoints/checkpoint_best.pt"
+  ],
+  "seed": 0,
+  "out_json": "belief_shift/heldout_scores_old_encoders.json"
+ },
+ "results": {
+  "old_plain": {
+   "ckpt": "experiments/st_pretrain_smart_mid_slow_v15_plain/sinkhorn_2026-09-07_15-53-26/checkpoints/checkpoint_best.pt",
+   "val_loss_recorded": 0.0025250630993396044,
+   "dataset": {
+    "loss_mean": 0.002472992055118084,
+    "collapsed_loss": 0.0002560721477493644,
+    "intermediate_loss": 0.0034779817797243595,
+    "diffuse_loss": 0.0047294399701058865
+   },
+   "policy_heldout": {
+    "loss_mean": 0.016180455684661865,
+    "collapsed_loss": 0.000541637244168669,
+    "intermediate_loss": 0.012289113365113735,
+    "diffuse_loss": 0.017073284834623337
+   }
+  },
+  "old_aligned": {
+   "ckpt": "experiments/st_pretrain_smart_mid_slow_v15_align/sinkhorn_2026-09-07_16-40-10/checkpoints/checkpoint_best.pt",
+   "val_loss_recorded": 0.0026382282935082913,
+   "dataset": {
+    "loss_mean": 0.0026054654736071825,
+    "collapsed_loss": 0.00026387747493572533,
+    "intermediate_loss": 0.0038281800225377083,
+    "diffuse_loss": 0.004773326683789492
+   },
+   "policy_heldout": {
+    "loss_mean": 0.01619148813188076,
+    "collapsed_loss": 0.000588174385484308,
+    "intermediate_loss": 0.01249944418668747,
+    "diffuse_loss": 0.01705295220017433
+   }
+  }
+ }
+}

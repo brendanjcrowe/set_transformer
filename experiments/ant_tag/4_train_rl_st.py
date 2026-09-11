@@ -73,6 +73,10 @@ from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 import pdomains  # noqa: F401 - registers pdomains-ant-tag-v0
 import variants  # noqa: E402 - env/filter/subdir registry
 from set_transformer.models import PFSetTransformer
+from set_transformer.rl.encoder_finetune import (  # noqa: E402 - shared with experiments/odd_even
+    EncoderLRLoggingCallback,
+    scale_encoder_learning_rate,
+)
 
 
 # Reuse the existing AntTag curriculum/PF/dict-obs utilities. The dict-obs env
@@ -173,7 +177,30 @@ def train_ant_tag_st(
     weight_channel: bool = True,
     pretrained_st_model_path: str | None = None,
     st_frozen: bool = False,
+    st_encoder_lr_scale: float = 1.0,
+    resume_from: str | None = None,
+    resume_vecnormalize: str | None = None,
 ):
+    if resume_from:
+        # Fork a run from one of its 100k-step checkpoints (2026-09-08, the
+        # smart_mid_slow_v15 second-half reward ablation): the policy, value
+        # head, encoder, Adam moments (when the zip has them; the 0.1x
+        # finetune arm's saves collapse the optimizer, encoder_finetune.py)
+        # and the step counter come from the zip, the obs-normalization
+        # statistics from the matching VecNormalize snapshot, and training
+        # continues to `total_timesteps` (the FULL horizon, e.g. 6M) with
+        # every progress-based schedule -- curriculum, reward, evasion, LR
+        # anneal -- evaluated at the resumed progress. Not restored: env RNG
+        # state, the rollout buffer, PPO's sampling RNG. A fork is therefore
+        # not a bit-exact continuation; compare forks with forks.
+        if algorithm.upper() != "PPO":
+            raise ValueError("--resume_from is implemented for PPO only")
+        if pretrained_st_model_path or st_frozen:
+            raise ValueError("--resume_from restores the encoder from the checkpoint; "
+                             "--pretrained_st_model_path / --st_frozen do not apply")
+        if use_vec_normalize and not resume_vecnormalize:
+            raise ValueError("--resume_from with VecNormalize needs the matching "
+                             "--resume_vecnormalize snapshot")
     resolved_arena_scale = (
         arena_scale if arena_scale is not None else get_ant_tag_arena_scale(env_id)
     )
@@ -227,11 +254,20 @@ def train_ant_tag_st(
     ]
     vec_env = _make_vec_env_from_fns(env_fns, n_envs)
     if use_vec_normalize:
-        vec_env = _make_vec_normalize(vec_env, training=True, norm_reward=True)
+        if resume_from:
+            vec_env = VecNormalize.load(resume_vecnormalize, vec_env)
+            vec_env.training = True
+            print(f"VecNormalize statistics RESUMED from {resume_vecnormalize} "
+                  f"(norm_obs_keys={vec_env.norm_obs_keys}, norm_reward={vec_env.norm_reward}, "
+                  f"obs count={float(vec_env.obs_rms['obs'].count):.0f})")
+        else:
+            vec_env = _make_vec_normalize(vec_env, training=True, norm_reward=True)
 
     # Eval envs — always evaluate at the env's real POMDP difficulty (its own
     # visible_radius) and on the true sparse reward (no shaping, so the metric
     # doesn't depend on where the training curriculum currently is).
+    # (EvalCallback syncs the training VecNormalize stats into this one before
+    # every eval, so a resumed run evaluates with the resumed statistics.)
     eval_env_kw = dict(env_kw)
     eval_env_kw["initial_visibility_radius"] = get_env_visible_radius(env_id)
     eval_env_kw["apply_reward_shaping"] = False
@@ -267,11 +303,40 @@ def train_ant_tag_st(
     if net_arch is not None:
         policy_kwargs["net_arch"] = net_arch
 
-    if algorithm.upper() == "PPO":
+    lr_arg = (lambda progress_remaining: learning_rate * progress_remaining) if lr_anneal else learning_rate
+    if resume_from:
+        model = PPO.load(
+            resume_from, env=vec_env, device=device, force_reset=True,
+            # The zip carries the source run's schedule object; rebuild it from
+            # THIS run's flags so run_config.json and the optimizer agree.
+            custom_objects={"learning_rate": lr_arg, "lr_schedule": lr_arg},
+        )
+        mismatched = {
+            k: (getattr(model, k), v)
+            for k, v in dict(n_steps=ppo_n_steps, batch_size=batch_size, n_epochs=n_epochs,
+                             target_kl=target_kl, seed=seed).items()
+            if getattr(model, k) != v
+        }
+        if mismatched:
+            raise ValueError(f"--resume_from checkpoint disagrees with the CLI on "
+                             f"{mismatched} (stored, given); pass the source run's values")
+        if model.num_timesteps >= total_timesteps:
+            raise ValueError(f"checkpoint is at {model.num_timesteps:,} steps, "
+                             f"--total_timesteps {total_timesteps:,} must be the FULL horizon beyond it")
+        # PPO.load restores the SOURCE run's tensorboard_log; point it here.
+        model.tensorboard_log = log_dir
+        progress = model.num_timesteps / total_timesteps
+        print(f"PPO RESUMED from {resume_from}: {model.num_timesteps:,} env steps done "
+              f"(progress {progress:.3f}), {model._n_updates} updates; training "
+              f"{total_timesteps - model.num_timesteps:,} more steps to {total_timesteps:,}; "
+              f"learning rate resumes at {model.lr_schedule(1.0 - progress):.2e}"
+              + ("" if model.policy.optimizer.state else
+                 " (optimizer moments were not in the zip: Adam restarts)"))
+    elif algorithm.upper() == "PPO":
         model = PPO(
             "MultiInputPolicy",
             vec_env,
-            learning_rate=(lambda progress_remaining: learning_rate * progress_remaining) if lr_anneal else learning_rate,
+            learning_rate=lr_arg,
             n_steps=ppo_n_steps,
             batch_size=batch_size,
             n_epochs=n_epochs,
@@ -344,10 +409,27 @@ def train_ant_tag_st(
         model.policy_kwargs["features_extractor_kwargs"][
             "pretrained_st_model_path"] = None
 
+    finetune_callbacks = []
+    if st_encoder_lr_scale != 1.0:
+        # Finetune-collapse fix 1 (oddeven.md 2026-09-06; on smart_hard the
+        # shared-rate finetune arms flipped between 0% and 10% by seed): the
+        # encoder gets its own param group at st_encoder_lr_scale x the head
+        # rate. Must run AFTER the reload above and after PPO construction --
+        # it rebuilds the optimizer over the live parameters.
+        if algorithm.upper() != "PPO":
+            raise ValueError("--st_encoder_lr_scale is implemented for PPO only")
+        scale_encoder_learning_rate(model, st_encoder_lr_scale)
+        finetune_callbacks.append(EncoderLRLoggingCallback())
+
     checkpoint_cb = CheckpointCallback(
         save_freq=max(save_freq // n_envs, 1),
         save_path=os.path.join(model_dir, "checkpoints") if model_dir else "checkpoints",
         name_prefix="ant_tag_st",
+        # Also snapshot VecNormalize with every checkpoint: without it the
+        # 100k-step checkpoints cannot be evaluated faithfully (the obs
+        # normalization is otherwise written once, at the end), and a run
+        # killed early is a total loss (PITFALLS.md section 7).
+        save_vecnormalize=True,
     )
     eval_cb = EvalCallback(
         eval_vec_env,
@@ -368,9 +450,15 @@ def train_ant_tag_st(
     )
 
     try:
+        # SB3 adds num_timesteps to the requested total when the counter is not
+        # reset, so a resumed run asks for the REMAINING steps and every
+        # progress_remaining-based schedule (LR anneal) continues from where
+        # the checkpoint left off; CurriculumCallback divides num_timesteps
+        # by the full horizon it was given above.
         model.learn(
-            total_timesteps=total_timesteps,
-            callback=[checkpoint_cb, eval_cb, curriculum_cb, st_log_cb],
+            total_timesteps=total_timesteps - (model.num_timesteps if resume_from else 0),
+            reset_num_timesteps=not resume_from,
+            callback=[checkpoint_cb, eval_cb, curriculum_cb, st_log_cb, *finetune_callbacks],
             progress_bar=progress_bar,
         )
     finally:
@@ -382,6 +470,23 @@ def train_ant_tag_st(
         print(f"Model saved to {model_save_path}")
         vec_env.close()
         eval_vec_env.close()
+
+
+def _default_resume_vecnormalize(resume_from: str) -> str:
+    """The VecNormalize snapshot saved alongside a checkpoint zip.
+
+    CheckpointCallback(save_vecnormalize=True) writes
+    ``<prefix>_<N>_steps.zip`` next to ``<prefix>_vecnormalize_<N>_steps.pkl``;
+    the final ``st_agent.zip`` sits next to ``vecnormalize.pkl``.
+    """
+    d, base = os.path.split(resume_from)
+    m = re.fullmatch(r"(.+)_(\d+)_steps\.zip", base)
+    if m:
+        return os.path.join(d, f"{m.group(1)}_vecnormalize_{m.group(2)}_steps.pkl")
+    if base == "st_agent.zip":
+        return os.path.join(d, "vecnormalize.pkl")
+    raise ValueError(f"cannot derive the VecNormalize snapshot for {resume_from}; "
+                     "pass --resume_vecnormalize")
 
 
 def _parse_curriculum(curriculum: str) -> list[tuple[float, float]]:
@@ -396,10 +501,13 @@ def _parse_reward_schedule(reward_schedule: str) -> list[tuple[float, ...]]:
     schedule = []
     for entry in reward_schedule.split(","):
         parts = [float(part) for part in entry.strip().split(":")]
-        if len(parts) == 3:
-            parts.append(0.0)
-        if len(parts) != 4:
-            raise ValueError("Each reward schedule entry must have 3 or 4 values")
+        # frac:distance:entropy[:tag_bonus[:spread_gain]] -- missing trailing
+        # fields are 0, so every pre-2026-09-08 schedule keeps its meaning.
+        if len(parts) in (3, 4):
+            parts.extend([0.0] * (5 - len(parts)))
+        if len(parts) != 5:
+            raise ValueError("Each reward schedule entry must have 3 to 5 values: "
+                             "frac:distance:entropy[:tag_bonus[:spread_gain]]")
         schedule.append(tuple(parts))
     return schedule
 
@@ -489,6 +597,12 @@ def main(encoder: str = "st"):
              "PPO, which is what the CGF baseline does.",
     )
     parser.add_argument(
+        "--st_encoder_lr_scale", type=float, default=1.0,
+        help="Finetune-collapse fix 1: multiply the pretrained encoder's "
+             "learning rate by this (heads keep --learning_rate; --lr_anneal "
+             "applies to both). 1.0 = off, i.e. the shared-rate finetune. "
+             "Requires --pretrained_st_model_path and not --st_frozen. PPO only.")
+    parser.add_argument(
         "--st_frozen", action="store_true",
         help="Freeze the ST encoder; only the policy/value MLP learns. The "
              "ST analogue of the CGF arm's --t_frozen. Only meaningful "
@@ -537,8 +651,10 @@ def main(encoder: str = "st"):
     parser.add_argument(
         "--reward_schedule",
         type=str,
-        default="0:1:0:0,0.3:1:0:0,0.7:0:0:50,1:0:0:50",
-        help="Shaping schedule 'frac:distance:entropy[:tag_bonus],...', "
+        default=None,
+        help="Defaults to the variant's own recipe (variants.py default_reward_schedule), else "
+             "'0:1:0:0,0.3:1:0:0,0.7:0:0:50,1:0:0:50' (PF-entropy 0 throughout). "
+             "Shaping schedule 'frac:distance:entropy[:tag_bonus[:spread_gain]],...' (spread_gain pays gain*(spread_{t-1}-spread_t) of the belief's weighted std; 0 when omitted), "
              "interpolated over training progress and applied on every step. "
              "Pass 'none' to run on the constant --distance_coeff / "
              "--entropy_coeff values instead; giving both is an error.",
@@ -597,7 +713,30 @@ def main(encoder: str = "st"):
     parser.add_argument("--n_epochs", type=int, default=10)
     parser.add_argument("--n_eval_episodes", type=int, default=20)
 
+    parser.add_argument(
+        "--resume_from", type=str, default=None,
+        help="Fork a run from one of its checkpoint zips (models/checkpoints/"
+             "ant_tag_st_<N>_steps.zip or models/st_agent.zip): policy, encoder, "
+             "optimizer state and step counter are restored and training continues "
+             "to --total_timesteps, which must be the FULL horizon (e.g. 6000000, "
+             "not the remainder). Every progress-based schedule (--curriculum, "
+             "--reward_schedule, --evasion_curriculum, --lr_anneal) is evaluated at "
+             "the resumed progress, so a schedule that differs from the source "
+             "run's only after the checkpoint's progress gives a clean second-half "
+             "ablation. PPO only; not with --pretrained_st_model_path / --st_frozen; "
+             "--st_encoder_lr_scale may be given (it rebuilds the encoder param group). "
+             "Env RNG and the rollout buffer are NOT restored: compare forks with forks.")
+    parser.add_argument(
+        "--resume_vecnormalize", type=str, default=None,
+        help="VecNormalize snapshot matching --resume_from. Default: the "
+             "ant_tag_st_vecnormalize_<N>_steps.pkl (or vecnormalize.pkl) beside it.")
+
     args = parser.parse_args()
+    # Before _resolve_reward_shaping: it reads an empty schedule as "use the
+    # constant flags", so a None default must be resolved first.
+    args.reward_schedule = variants.resolve_schedule(
+        args.variant, args.reward_schedule, "default_reward_schedule",
+        "0:1:0:0,0.3:1:0:0,0.7:0:0:50,1:0:0:50")
     _train_rl_cgf._resolve_reward_shaping(parser, args)
     if args.list_variants:
         variants.print_variants()
@@ -620,6 +759,27 @@ def main(encoder: str = "st"):
     net_arch = [int(x) for x in args.net_arch.split(",")] if args.net_arch else None
     obs_mask = [-2, -1] if args.mask_target_obs else None
 
+    if args.resume_from:
+        if args.pretrained_st_model_path or args.st_frozen:
+            parser.error("--resume_from takes the encoder from the checkpoint zip; "
+                         "drop --pretrained_st_model_path / --st_frozen")
+        if not os.path.isfile(args.resume_from):
+            parser.error(f"--resume_from {args.resume_from} does not exist")
+        if args.resume_vecnormalize is None and not args.no_vec_normalize:
+            args.resume_vecnormalize = _default_resume_vecnormalize(args.resume_from)
+        if args.resume_vecnormalize and not os.path.isfile(args.resume_vecnormalize):
+            parser.error(f"VecNormalize snapshot {args.resume_vecnormalize} does not exist")
+    if args.st_encoder_lr_scale <= 0:
+        parser.error("--st_encoder_lr_scale must be positive")
+    if args.st_encoder_lr_scale != 1.0 and not (args.pretrained_st_model_path or args.resume_from):
+        parser.error("--st_encoder_lr_scale is a finetune fix for a PRETRAINED "
+                     "encoder; pass --pretrained_st_model_path (an end-to-end "
+                     "encoder has no pretrained geometry to protect).")
+    if args.st_encoder_lr_scale != 1.0 and args.st_frozen:
+        parser.error("--st_frozen freezes the encoder for the whole run; "
+                     "--st_encoder_lr_scale has nothing to act on. Drop one.")
+    if args.st_encoder_lr_scale != 1.0 and args.algorithm.upper() != "PPO":
+        parser.error("--st_encoder_lr_scale is implemented for PPO only")
     if args.st_frozen and not args.pretrained_st_model_path:
         raise ValueError(
             "--st_frozen without --pretrained_st_model_path would freeze a "
@@ -695,6 +855,9 @@ def main(encoder: str = "st"):
         weight_channel=args.weight_channel,
         pretrained_st_model_path=args.pretrained_st_model_path,
         st_frozen=args.st_frozen,
+        st_encoder_lr_scale=args.st_encoder_lr_scale,
+        resume_from=args.resume_from,
+        resume_vecnormalize=args.resume_vecnormalize,
     )
 
 
