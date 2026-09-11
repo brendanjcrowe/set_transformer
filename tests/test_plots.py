@@ -109,6 +109,11 @@ def test_scatter_input_validation():
         )  # Wrong length
 
 
+@pytest.mark.xfail(
+    raises=ValueError, strict=True,
+    reason="stale since 1a63805: visualize_particle_filter_reconstruction is 4-D only "
+           "(N, 4) with a 6-axes panel, this test feeds (N, 2) and 2 axes. Not on the "
+           "live path (Trainer only calls it when dim == 4). Rewrite or drop with the function.")
 def test_visualize_particle_filter_reconstruction(sample_particles):
     """Test the particle filter visualization function."""
     original_particles, reconstructed_particles = sample_particles

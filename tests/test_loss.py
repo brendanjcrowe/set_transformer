@@ -224,6 +224,10 @@ def test_chamfer_rejects_weights(
         ChamferDistanceLoss()(predicted, target, None, weights)
 
 
+@pytest.mark.xfail(
+    raises=KeyError, strict=True,
+    reason="geomloss 0.2.6 hausdorff: SamplesLoss.forward -> kernel_samples KeyError: None "
+           "(upstream; CLAUDE.md 'Weighted particle sets'). The pipeline uses sinkhorn.")
 def test_hausdorff_loss(sample_sets: tuple[torch.Tensor, torch.Tensor]) -> None:
     predicted, target = sample_sets
     loss_fn = HausdorffLoss(p=2, blur=0.5)

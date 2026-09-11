@@ -1205,6 +1205,14 @@ _VARIANT_TABLE = {
     "smart": ("pdomains-ant-tag-smart-v0", "SmartAntTagParticleFilter", 400),
     "smart_hard": ("pdomains-ant-tag-smart-hard-v0",
                    "SmartAntTagParticleFilter", 400),
+    "smart_mid": ("pdomains-ant-tag-smart-mid-v0",
+                  "SmartAntTagParticleFilter", 400),
+    "smart_hard_slow": ("pdomains-ant-tag-smart-hard-slow-v0",
+                        "SmartAntTagParticleFilter", 400),
+    "smart_mid_slow": ("pdomains-ant-tag-smart-mid-slow-v0",
+                       "SmartAntTagParticleFilter", 400),
+    "smart_mid_slow_v15": ("pdomains-ant-tag-smart-mid-slow-v15-v0",
+                           "SmartAntTagParticleFilter", 400),
     "ghost": ("pdomains-ant-tag-ghost-v0", "GhostAntTagParticleFilter", 400),
     "dens": ("pdomains-ant-tag-dens-v0", "TwinDenAntTagParticleFilter", 200),
     "cdens": ("pdomains-ant-tag-cdens-v0",
@@ -1219,8 +1227,9 @@ _VARIANT_TABLE = {
 
 #: Variants whose target evades; only these respond to --evasion_curriculum
 #: and --target_speed_scale.
-_EVADING = {"smart", "smart_hard", "ghost", "dens", "cdens", "cdens_hard",
-            "cdens_terminal", "cdens_nospook"}
+_EVADING = {"smart", "smart_hard", "smart_mid", "smart_hard_slow",
+            "smart_mid_slow", "smart_mid_slow_v15", "ghost", "dens", "cdens",
+            "cdens_hard", "cdens_terminal", "cdens_nospook"}
 
 
 def test_variant_registry_has_exactly_the_known_variants(ant_tag):
@@ -1291,6 +1300,17 @@ def test_variant_schedule_precedence_is_cli_then_variant_then_script(ant_tag):
     assert variants.resolve_schedule(
         "cdens_terminal", None, "default_evasion_curriculum",
         "script") == "0:0,0.2:0,0.5:1,1:1"
+    # default_reward_schedule (2026-09-09): same precedence, same helper.
+    recipe = "0:1:2:0,0.2:1:2:0,0.5:0.15:2:50,1:0.15:2:50"
+    assert variants.resolve_schedule(
+        "smart", None, "default_reward_schedule", "script") == recipe
+    assert variants.resolve_schedule(
+        "smart_mid_slow_v15", None, "default_reward_schedule", "script") == recipe
+    assert variants.resolve_schedule(
+        "smart", "0:1:0:0,1:1:0:0", "default_reward_schedule", "script") == (
+        "0:1:0:0,1:1:0:0")
+    assert variants.resolve_schedule(
+        "base", None, "default_reward_schedule", "script") == "script"
 
 
 # --------------------------------------------------------------------------
@@ -1338,6 +1358,94 @@ _SMOKE_ARMS = {
            dict(num_encodings=2, dim_encoder=4, num_inds=4, dim_hidden=16,
                 num_heads=2, ln=True, weight_channel=True)),
 }
+
+
+_SCRIPT_DEFAULT_REWARD = "0:1:0:0,0.3:1:0:0,0.7:0:0:50,1:0:0:50"
+_ENTROPY_FLAT_RECIPE = "0:1:2:0,0.2:1:2:0,0.5:0.15:2:50,1:0.15:2:50"
+#: Variants that carry a default_reward_schedule. Listed here on purpose: a
+#: variant gaining a recipe changes what a bare `--variant <x>` trains, so the
+#: test fails until someone acknowledges it in this table.
+_VARIANTS_WITH_RECIPE = {"smart": _ENTROPY_FLAT_RECIPE,
+                         "smart_mid_slow_v15": _ENTROPY_FLAT_RECIPE}
+_TRAINERS = (("4_train_rl_cgf", "train_ant_tag_cgf"),
+             ("4_train_rl_gaussian", "train_ant_tag_gaussian"),
+             ("4_train_rl_st", "train_ant_tag_st"))
+
+
+def _drive_main(ant_tag, monkeypatch, tmp_path, module_name, train_name, argv):
+    """Run a trainer's main() through its real argparse path, intercepting
+    the run-dir, git and training calls so nothing is created under runs/
+    and no PPO starts. Returns (run_config kwargs, train kwargs)."""
+    module = ant_tag[module_name]
+    captured = {}
+    monkeypatch.setattr(module, "_default_run_dir",
+                        lambda *a, **k: str(tmp_path / "run"))
+    monkeypatch.setattr(module, "_git_provenance", lambda: {})
+    monkeypatch.setattr(module, "_write_run_config",
+                        lambda run_dir, **cfg: captured.setdefault("config", cfg))
+    monkeypatch.setattr(module, train_name,
+                        lambda **kw: captured.setdefault("train", kw))
+    monkeypatch.setattr(sys, "argv", [module_name + ".py"] + list(argv))
+    module.main()
+    return captured["config"], captured["train"]
+
+
+@pytest.mark.parametrize("module_name,train_name", _TRAINERS)
+@pytest.mark.parametrize("name", sorted(_VARIANT_TABLE))
+def test_reward_schedule_default_per_variant(ant_tag, monkeypatch, tmp_path,
+                                             module_name, train_name, name):
+    """A bare `--variant <x>` gets the variant's recipe if it has one, else
+    the historical script default -- byte-identical to what every run before
+    2026-09-09 recorded when no --reward_schedule was passed.
+
+    The argparse default is now None and is resolved BEFORE
+    _resolve_reward_shaping, which reads an empty schedule as "run on the
+    constant --distance_coeff/--entropy_coeff flags". If the order ever
+    flips, every no-flag run would silently train with PF-entropy 0 and a
+    constant distance term; this test catches that on all three arms.
+    """
+    config, train = _drive_main(ant_tag, monkeypatch, tmp_path, module_name,
+                                train_name, ["--variant", name])
+    expected = _VARIANTS_WITH_RECIPE.get(name, _SCRIPT_DEFAULT_REWARD)
+    assert config["reward_schedule"] == expected
+    first = train["reward_schedule"][0]
+    assert first[0] == 0.0
+    # run_config's constant fields mirror the schedule's first waypoint.
+    assert config["distance_coeff"] == first[1] == 1.0
+    assert config["entropy_coeff"] == first[2] == (
+        2.0 if name in _VARIANTS_WITH_RECIPE else 0.0)
+
+
+@pytest.mark.parametrize("module_name,train_name", _TRAINERS)
+def test_reward_schedule_cli_still_wins_and_none_still_means_constant(
+        ant_tag, monkeypatch, tmp_path, module_name, train_name):
+    """On a variant WITH a recipe: an explicit --reward_schedule overrides it
+    (so the Jul-30 `smart` runs recorded under the script default stay
+    reproducible by flag), 'none' still yields the constant-flag schedule,
+    and schedule + flag is still a parser error."""
+    config, _ = _drive_main(ant_tag, monkeypatch, tmp_path, module_name,
+                            train_name, ["--variant", "smart",
+                                         "--reward_schedule", _SCRIPT_DEFAULT_REWARD])
+    assert config["reward_schedule"] == _SCRIPT_DEFAULT_REWARD
+    config, _ = _drive_main(ant_tag, monkeypatch, tmp_path, module_name,
+                            train_name, ["--variant", "smart",
+                                         "--reward_schedule", "none",
+                                         "--entropy_coeff", "0.5"])
+    assert config["reward_schedule"] == "0:1.0:0.5:0,1:1.0:0.5:0"
+    with pytest.raises(SystemExit):
+        _drive_main(ant_tag, monkeypatch, tmp_path, module_name, train_name,
+                    ["--variant", "smart", "--reward_schedule", _ENTROPY_FLAT_RECIPE,
+                     "--entropy_coeff", "0.5"])
+
+
+def test_recipe_variants_are_exactly_the_pinned_set(ant_tag):
+    """Which variants carry a default_reward_schedule is pinned, with the
+    string. Adding one is a deliberate change to what `--variant <x>`
+    trains and must be acknowledged here."""
+    variants = ant_tag["variants"]
+    actual = {k: v.default_reward_schedule for k, v in variants.VARIANTS.items()
+              if v.default_reward_schedule is not None}
+    assert actual == _VARIANTS_WITH_RECIPE
 
 
 @pytest.mark.slow
