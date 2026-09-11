@@ -16,6 +16,22 @@ so every saved Ant-Tag checkpoint and the regression goldens are unchanged:
     arms used. Pick ``t_bound`` by the dimensionless rule
     ``t_bound * (decision-relevant length in normalized units) ~ 2..4``: on
     Odd-Even the same-parity spacing is 2 / 24.5 = 0.0816, so ``t_bound=50``.
+``t_param="polar"`` (2026-09-10, for particle_dim >= 2)
+    ``t_j = t_bound * sigmoid(raw_a_j) * raw_v_j / (||raw_v_j|| + 1e-8)``:
+    a free direction vector and a scalar magnitude per probe, so the bound
+    is a BALL of radius ``t_bound`` and direction and tilt strength get
+    separate gradients. The elementwise tanh is a box whose diagonal reaches
+    ``t_bound * sqrt(D)`` and mixes the two roles; ``t_bound`` in polar mode
+    is therefore the exact largest tilt, which is what the sizing rule above
+    assumes (personal_mds_hg/how_to_do_multidimensional_cgf_particle_rl_chatgpt.md
+    section 7). ``dr/da = r (1 - r / t_bound)``, so small probes move
+    multiplicatively and probes near the bound slow down; the spread init
+    caps at ``t_init_max`` below the bound for that reason. In 1-D the
+    direction is a sign that ``v / |v|`` cannot flip smoothly, so polar is
+    refused there and tanh (the same function in 1-D) is the mode to use.
+    The Ant-Tag frame is invariant under this: translating every particle by
+    a constant adds ``-t . c`` to K and ``-c`` to K' and leaves the tilted
+    weights unchanged, so the bound does not depend on agent-centring.
 ``feature_mode="K_grad"`` / ``"both"``
     Also (or only) emit K'(t_j) = sum_i softmax_i(<t_j, x_i> + log w_i) x_i,
     the tilted mean, read off the same score tensor. K' beat K on both
@@ -358,7 +374,8 @@ class EncoderDriftLoggingCallback(BaseCallback):
     Per rollout: ``cgf/drift_<name>`` = ||p - p_0|| / ||p_0|| (over ||p||
     when p_0 = 0, so an initially-zero buffer reads ~1 once set, not 1e12) for
     each top-level parameter group of the features extractor (``raw_t`` or
-    ``t_values``, ``readout``, ``x_embed``) and ``cgf/drift_feature_norm``
+    ``t_values``, or ``raw_v`` + ``raw_a`` in polar mode, ``readout``,
+    ``x_embed``) and ``cgf/drift_feature_norm``
     for the running-norm mean buffer (its variance and counter are skipped:
     the relative norm of a counter means nothing). A frozen encoder logs
     exactly 0 on every
@@ -537,17 +554,31 @@ class WeightedCGFFeaturesExtractor(BaseFeaturesExtractor):
         if feature_mode not in ("K", "K_grad", "both"):
             raise ValueError(
                 f"feature_mode must be 'K', 'K_grad' or 'both', got {feature_mode!r}")
-        if t_param not in ("clamp", "tanh"):
-            raise ValueError(f"t_param must be 'clamp' or 'tanh', got {t_param!r}")
+        if t_param not in ("clamp", "tanh", "polar"):
+            raise ValueError(
+                f"t_param must be 'clamp', 'tanh' or 'polar', got {t_param!r}")
         if feature_norm not in ("none", "running", "layernorm"):
             raise ValueError(
                 f"feature_norm must be 'none', 'running' or 'layernorm', "
                 f"got {feature_norm!r}")
-        if t_param == "tanh" and (t_bound is None or t_bound <= 0):
+        if t_param in ("tanh", "polar") and (t_bound is None or t_bound <= 0):
             raise ValueError(
-                "t_param='tanh' needs a positive t_bound. Pick it by "
+                f"t_param={t_param!r} needs a positive t_bound. Pick it by "
                 "t_bound * (decision-relevant length in normalized units) ~ 2..4; "
-                "Odd-Even oe50 (spacing 0.0816) -> 50, ClusterHunt (0.3) -> 10.")
+                "Odd-Even oe50 (spacing 0.0816) -> 50, ClusterHunt (0.3) -> 10, "
+                "Ant-Tag smart_mid_slow_v15 (tag radius 1.0 / 4.5 = 0.22) -> 13.")
+        if t_param == "polar" and t_dim < 2:
+            raise ValueError(
+                "t_param='polar' needs particle_dim >= 2: in 1-D the direction "
+                "is a sign that v / |v| cannot flip smoothly. Use t_param='tanh', "
+                "which is the same function in 1-D.")
+        if (t_param == "clamp" and t_init_max is not None
+                and float(t_init_max) > float(t_clamp)):
+            raise ValueError(
+                f"t_init_max={t_init_max} exceeds t_clamp={t_clamp} in clamp mode: "
+                "every probe beyond the clamp would be silently flattened to "
+                "+-t_clamp with zero gradient. Lower t_init_max, raise t_clamp, "
+                "or use t_param='tanh' / 'polar' with a t_bound.")
         num_encoded = cgf_raw_dim(num_cgf_features, t_dim, feature_mode)
         if readout_dim is None:
             # The ST arm emits num_encodings * dim_encoder = 64 features; a
@@ -642,11 +673,17 @@ class WeightedCGFFeaturesExtractor(BaseFeaturesExtractor):
         elif t_init_mode == "spread":
             # 8 directions x (num//8) log-spaced norms, matching the probe's
             # CGF_SPREAD64 feature geometry. rho_hi=2.8 ~ the max norm
-            # reachable under the elementwise t_clamp=2.0 (diagonal norm
-            # 2*sqrt(2)). The den diagonal (45 deg) is one of the 8
-            # directions exactly. Unlike the legacy 0.1-scale linspace init,
-            # this starts where the signal actually is, so no ~10x growth of
-            # ||t_j|| is required for the encoder to see it.
+            # reachable under the elementwise t_clamp=2.0 on the DIAGONAL
+            # (2*sqrt(2)). On the 4 axis-aligned directions a norm-2.8 probe
+            # has a component of 2.8, which clamp mode flattens to 2.0 in the
+            # forward pass, so 4 of 64 probes sit on the clamp with zero
+            # gradient and near-duplicate the norm-1.98 ring (measured
+            # 2026-09-09; pinned by tests/test_ant_tag_cgf_port.py). Every
+            # recorded Ant-Tag `spread` run has this; tanh / polar do not.
+            # The den diagonal (45 deg) is one of the 8 directions exactly.
+            # Unlike the legacy 0.1-scale linspace init, this starts where
+            # the signal actually is, so no ~10x growth of ||t_j|| is
+            # required for the encoder to see it.
             if particle_dim != 2:
                 raise ValueError("t_init_mode='spread' assumes 2D particles")
             num_dirs = 8
@@ -703,7 +740,36 @@ class WeightedCGFFeaturesExtractor(BaseFeaturesExtractor):
             raise ValueError(f"Unknown t_init_mode: {t_init_mode}")
 
         self.t_frozen = bool(t_frozen)
-        if self.t_param == "tanh":
+        if self.t_param == "polar":
+            # t_j = t_bound * sigmoid(a_j) * v_j / ||v_j||. Init from the
+            # requested t: v_j is its unit direction, a_j = logit(r_j /
+            # t_bound), so the first forward pass reproduces the init exactly
+            # (up to the 1e-5 saturation guard, as in tanh mode). A zero
+            # init row (linspace_* modes place one probe at t = 0) has no
+            # direction; it gets e_0 and the smallest representable
+            # magnitude, which sigmoid can grow.
+            radii = torch.linalg.norm(t_values, dim=1)                  # [T]
+            if float(radii.max()) >= self.t_bound:
+                raise ValueError(
+                    f"t init reaches norm {float(radii.max()):.3g} but t_bound "
+                    f"is {self.t_bound}; probes starting at the bound sit on "
+                    "sigmoid's flat region and never move. Lower t_init_max / "
+                    "t_init_scale or raise t_bound.")
+            degenerate = radii < 1e-8
+            directions = torch.where(
+                degenerate[:, None],
+                torch.nn.functional.one_hot(
+                    torch.zeros(len(radii), dtype=torch.long), particle_dim).float(),
+                t_values / radii.clamp(min=1e-8)[:, None])
+            frac = (radii / self.t_bound).clamp(1e-5, 1 - 1e-5)
+            raw_a = torch.log(frac) - torch.log1p(-frac)                # logit
+            if self.t_frozen:
+                self.register_buffer("raw_v", directions)
+                self.register_buffer("raw_a", raw_a)
+            else:
+                self.raw_v = nn.Parameter(directions)
+                self.raw_a = nn.Parameter(raw_a)
+        elif self.t_param == "tanh":
             # Store the pre-activation; effective_t() applies the bound. The
             # init is mapped through atanh so the FIRST forward pass sees
             # exactly the requested t (up to the 1e-5 saturation guard). An
@@ -724,8 +790,10 @@ class WeightedCGFFeaturesExtractor(BaseFeaturesExtractor):
         elif self.t_frozen:
             # A buffer gets no gradient (so PPO cannot move it) while still
             # saving/loading and moving across devices exactly like the
-            # Parameter. forward() is untouched: on the spread init the
-            # elementwise clamp is a no-op by construction.
+            # Parameter. forward() is untouched, so the elementwise clamp
+            # still applies to a frozen t: on the 2-D spread init that
+            # flattens the 4 axis-aligned norm-2.8 probes to 2.0 (see the
+            # spread init above); on spread_1d (rho_hi 2.0) it is a no-op.
             self.register_buffer("t_values", t_values)
         else:
             self.t_values = nn.Parameter(t_values)
@@ -747,6 +815,7 @@ class WeightedCGFFeaturesExtractor(BaseFeaturesExtractor):
             readout_dim=readout_dim,
             arena_scale=float(arena_scale),
             t_init_mode=t_init_mode,
+            t_init_max=self.t_init_max,
             x_embed_dim=self.x_embed_dim,
             x_embed_hidden=self.x_embed_hidden,
             x_embed_depth=self.x_embed_depth,
@@ -851,8 +920,14 @@ class WeightedCGFFeaturesExtractor(BaseFeaturesExtractor):
 
         ``clamp`` mode: ``clamp(t_values, -t_clamp, t_clamp)`` -- the legacy
         behaviour, gradient zero beyond the bound. ``tanh`` mode:
-        ``t_bound * tanh(raw_t)`` -- smooth, never reaches the bound.
+        ``t_bound * tanh(raw_t)`` -- smooth, never reaches the bound (a box).
+        ``polar`` mode: ``t_bound * sigmoid(raw_a) * raw_v / ||raw_v||`` --
+        smooth, never reaches the bound (a ball).
         """
+        if self.t_param == "polar":
+            direction = self.raw_v / (
+                torch.linalg.norm(self.raw_v, dim=1, keepdim=True) + 1e-8)
+            return self.t_bound * torch.sigmoid(self.raw_a)[:, None] * direction
         if self.t_param == "tanh":
             return self.t_bound * torch.tanh(self.raw_t)
         return torch.clamp(self.t_values, -self.t_clamp, self.t_clamp)

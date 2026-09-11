@@ -1,3 +1,10 @@
+"""STATUS (2026-09-10): LEGACY, not used by any live pipeline. Kept importable
+only because ``rl/wrappers/particle_filter.py`` and ``rl/evaluate.py`` still
+name ``CustomSetTransformerExtractor``. It is unweighted, has no arena scale and no geometry check;
+the live encoders are ``rl/feature_extractors/{cgf,gaussian,st}.py``. Do not
+build on it. (A hard-coded debug-log write to another user's home directory was
+removed the same day; it would have raised FileNotFoundError on first use.)
+"""
 import gymnasium as gym
 import torch
 import torch.nn as nn
