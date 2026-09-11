@@ -166,10 +166,17 @@ class _BasePFStatExtractor(BaseFeaturesExtractor):
 
 
 class GaussianExtractor(_BasePFStatExtractor):
-    """Gaussian approximation of the belief: empirical mean + covariance.
+    """Gaussian approximation of the belief: weighted mean + covariance.
 
     Features are ``[mean (d), flattened lower-triangular covariance (d(d+1)/2)]``. No
-    learned parameters on the particle side — this is the cheap analytic baseline.
+    learned parameters on the particle side -- this is the cheap analytic baseline.
+
+    The statistic is :func:`~set_transformer.rl.feature_extractors.gaussian.weighted_mean_cov`,
+    shared with the arms' ``WeightedGaussianFeaturesExtractor`` (2026-09-11). PF weights
+    are used when the wrapper provides them and uniform otherwise, which reproduces the
+    previous unweighted mean / biased covariance exactly. Before this the class ignored
+    weights, so on a weighted env (cdens median ESS ~ 11 of 100) it summarised ~90
+    near-dead particles as full contributors.
     """
 
     def _build_particle_stat(self) -> None:
@@ -183,11 +190,14 @@ class GaussianExtractor(_BasePFStatExtractor):
         return d + d * (d + 1) // 2
 
     def _particle_features(self, particles: torch.Tensor) -> torch.Tensor:
-        mean = particles.mean(dim=1)  # [B, d]
-        centered = particles - mean.unsqueeze(1)  # [B, N, d]
-        # Biased covariance (divide by N); symmetric so the lower triangle is sufficient.
-        cov = torch.einsum("bni,bnj->bij", centered, centered) / particles.shape[1]
-        cov_flat = cov[:, self._tril_rows, self._tril_cols]  # [B, d(d+1)/2]
+        from set_transformer.rl.feature_extractors.gaussian import weighted_mean_cov
+
+        weights = self._particle_weights
+        if weights is None:
+            batch, n = particles.shape[0], particles.shape[1]
+            weights = particles.new_full((batch, n), 1.0 / n)
+        mean, cov = weighted_mean_cov(particles, weights)             # [B, d], [B, d, d]
+        cov_flat = cov[:, self._tril_rows, self._tril_cols]            # [B, d(d+1)/2]
         return torch.cat([mean, cov_flat], dim=1)
 
 
@@ -226,21 +236,24 @@ class KMomentsExtractor(_BasePFStatExtractor):
 class CGFExtractor(_BasePFStatExtractor):
     """Empirical CGF of the particle set, sampled at ``num_t`` points.
 
-    The maths lives in :class:`~set_transformer.models.CGFEncoder`, shared verbatim with
+    The maths is :class:`~set_transformer.models.CGFEncoder`, shared verbatim with
     :class:`~set_transformer.models.CGFAutoencoder`, so a pretraining checkpoint loads
-    straight into the policy. See that class for what the sampling points mean.
+    straight into the policy. That encoder is itself an adapter over the ONE CGF kernel
+    in the repo, :func:`set_transformer.rl.feature_extractors.cgf.cgf_log_mgf` -- the
+    arms' ``WeightedCGFFeaturesExtractor`` computes K from the same function and starts
+    its probes from the same :func:`~set_transformer.rl.feature_extractors.cgf.init_t_values`
+    (2026-09-11; before that this class carried a July 2026 copy that clamped ``t . x``
+    to +-20 and was wrong for ``||t|| >~ 7``).
 
-    Ported from the collaborator's ``WeightedCGFFeaturesExtractor``: structured ``t``
-    inits, an elementwise clamp on ``t``, overflow-safe exponent clamping, optionally
-    frozen ``t``, and PF weights. Two deliberate divergences keep the benchmark's fairness
-    contract: ``num_t`` evaluations are projected to a matched ``stat_dim`` (so sampling
-    resolution and bottleneck width are independent knobs, where the original conflated
-    them), and the features go through the same obs-MLP + concat + head as every other
-    method rather than being concatenated raw to the observation.
+    What stays benchmark-specific, to keep its fairness contract: ``num_t`` evaluations
+    are projected to a matched ``stat_dim`` (so sampling resolution and bottleneck width
+    are independent knobs), and the features go through the same obs-MLP + concat + head
+    as every other method rather than being concatenated raw to the observation. Weights
+    are optional here (uniform when the wrapper supplies none) and required in the arm.
 
     Like the other learned encoders it covers scratch / frozen-pretrained /
     fine-tuned-pretrained behind one class, selected by ``pretrained_model_path`` and
-    ``freeze``.
+    ``freeze``. ``exp_arg_clamp`` is accepted for old configs and recorded, not applied.
     """
 
     def __init__(
@@ -254,7 +267,7 @@ class CGFExtractor(_BasePFStatExtractor):
         t_init_mode: str = "spread",
         t_init_scale: float = 0.1,
         t_clamp: float | None = 2.0,
-        exp_arg_clamp: float = 20.0,
+        exp_arg_clamp: float | None = None,
         t_frozen: bool = False,
         particle_scale: float = 1.0,
         dim_hidden: int = 128,

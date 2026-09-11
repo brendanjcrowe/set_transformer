@@ -1,16 +1,16 @@
-"""The two CGF implementations on master share a kernel and differ in contract.
+"""One CGF kernel, two adapters: the arm extractor and the benchmark encoder must agree.
 
-After PR #6 (2026-09-11) `rl/feature_extractors/cgf.py::WeightedCGFFeaturesExtractor`
-(the experiments/{ant_tag,odd_even} arms) and `models/cgf_encoder.py::CGFEncoder` (the
-benchmark, via `statistical.py::CGFExtractor`) both live on master. They compute the same
-K(t) = log sum_i w_i exp(t . x_i) from the same `spread` init, and then diverge in
-everything a result depends on: bottleneck, head, weight handling, pretraining objective
-and checkpoint layout. PITFALLS.md sec. 11 has the table.
+`rl/feature_extractors/cgf.py::WeightedCGFFeaturesExtractor` (the experiments/{ant_tag,
+odd_even} arms) and `models/cgf_encoder.py::CGFEncoder` (the benchmark, via
+`statistical.py::CGFExtractor`) compute K(t) = log sum_i w_i exp(t . x_i) through the
+same module-level functions (`init_t_values`, `cgf_log_mgf`) since 2026-09-11; before
+that the benchmark carried a July 2026 copy. They still differ in contract on purpose --
+bottleneck, head, weight handling, pretraining objective, checkpoint layout -- and
+PITFALLS.md sec. 11 has the table.
 
-These tests are the guard-rail for that table. The parity tests fail the moment either
-kernel or init is edited without the other; the contract tests fail if someone makes the
-two look interchangeable (or the benchmark Gaussian quietly starts reading weights) without
-updating the record. None of them says which implementation is right -- both are.
+These tests are the guard-rail for that table: the parity tests fail if either adapter
+stops routing through the shared kernel or init; the contract tests fail if someone
+makes the two look interchangeable without updating the record.
 """
 
 import contextlib
@@ -68,6 +68,14 @@ def _arm_kernel(**kw):
             _space(), num_cgf_features=NUM_T, arena_scale=SCALE, t_param="clamp",
             t_clamp=T_CLAMP, t_init_mode="spread", feature_mode="K",
             feature_norm="none", **kw)
+
+
+def _particle_features_with(self, batch):
+    self._particle_weights = batch.get("weights")
+    return self._particle_features(batch["particles"])
+
+
+GaussianExtractor._particle_features_with = _particle_features_with
 
 
 # --- parity: the shared kernel ------------------------------------------------------
@@ -143,16 +151,25 @@ def test_the_contracts_differ_where_pitfalls_says_they_do():
         mine({"obs": batch["obs"], "particles": batch["particles"]})
 
 
-def test_benchmark_gaussian_ignores_weights_and_ours_does_not():
-    """README claim 'extractors use weights when the wrapper provides it' holds for CGF
-    only. On a weighted env (cdens median ESS ~ 11/100) the benchmark Gaussian is the
-    wrong baseline; this pins that so a future fix on his side shows up here."""
+def test_both_gaussians_read_weights_and_agree():
+    """Since 2026-09-11 the benchmark GaussianExtractor computes the statistic through the
+    arm's `weighted_mean_cov`, so on a weighted env both summarise the same measure. The
+    feature layouts differ ([mean, tril(cov)] vs [mean, var, offdiag]) and the arm divides
+    by arena_scale, so compare the moments, not the vectors."""
     torch.manual_seed(0)
     batch = _batch()
     uniform = {**batch, "weights": torch.full((B, N), 1.0 / N)}
     with contextlib.redirect_stdout(io.StringIO()):
         his = GaussianExtractor(_space())
-        mine = WeightedGaussianFeaturesExtractor(_space(), arena_scale=SCALE)
-    assert torch.equal(his(batch), his(uniform)), "benchmark Gaussian started reading weights"
-    assert not torch.allclose(mine(batch), mine(uniform), atol=1e-4), \
-        "arm Gaussian stopped reading weights"
+        mine = WeightedGaussianFeaturesExtractor(_space(), arena_scale=1.0)
+    # both react to the weights ...
+    assert not torch.allclose(his._particle_features_with(batch), his._particle_features_with(uniform), atol=1e-4)
+    assert not torch.allclose(mine(batch), mine(uniform), atol=1e-4)
+    # ... and to the same moments: mean and the diagonal of the covariance
+    d = D
+    his_stat = his._particle_features_with(batch)
+    mine_stat = mine(batch)[:, 3:]                     # strip the 3 obs dims
+    assert torch.allclose(his_stat[:, :d], mine_stat[:, :d], atol=1e-5)          # mean
+    tril = torch.tril_indices(d, d)
+    diag_cols = [i for i, (r, c) in enumerate(zip(tril[0].tolist(), tril[1].tolist())) if r == c]
+    assert torch.allclose(his_stat[:, d:][:, diag_cols], mine_stat[:, d:2 * d], atol=1e-5)  # var

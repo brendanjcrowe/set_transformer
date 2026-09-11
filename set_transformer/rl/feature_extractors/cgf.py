@@ -110,6 +110,14 @@ import torch
 import torch.nn as nn
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+from set_transformer.cgf_kernel import (  # noqa: F401 -- re-exported; the kernel
+    DEAD_ROW_VALUE,                       # lives in a leaf module so that
+    cgf_log_mgf,                          # models/cgf_encoder.py can import it
+    cgf_scores,                           # without a models <-> rl cycle
+    init_t_values,
+    log_mgf_from_scores,
+    normalize_log_weights,
+)
 
 
 class TNormLoggingCallback(BaseCallback):
@@ -648,96 +656,8 @@ class WeightedCGFFeaturesExtractor(BaseFeaturesExtractor):
         # of ~1250 saved CGF checkpoints.
         self.exp_arg_clamp = exp_arg_clamp
 
-        if t_init_mode == "linspace_all_dims":
-            # Round-robin the linspace directions across every particle
-            # dimension so each coordinate (not just dim 0) gets a nontrivial
-            # initial CGF sensitivity.
-            t_values = torch.zeros(num_cgf_features, particle_dim)
-            linspace_vals = torch.linspace(-t_init_scale, t_init_scale, num_cgf_features)
-            dim_assignment = torch.arange(num_cgf_features) % particle_dim
-            for d in range(particle_dim):
-                mask = dim_assignment == d
-                t_values[mask, d] = linspace_vals[mask]
-        elif t_init_mode == "linspace_first_dim":
-            t_values = torch.zeros(num_cgf_features, particle_dim)
-            t_values[:, 0] = torch.linspace(
-                -t_init_scale,
-                t_init_scale,
-                num_cgf_features,
-            )
-            if particle_dim > 1:
-                t_values[:, 1:] = 0.01 * torch.randn(
-                    num_cgf_features,
-                    particle_dim - 1,
-                )
-        elif t_init_mode == "spread":
-            # 8 directions x (num//8) log-spaced norms, matching the probe's
-            # CGF_SPREAD64 feature geometry. rho_hi=2.8 ~ the max norm
-            # reachable under the elementwise t_clamp=2.0 on the DIAGONAL
-            # (2*sqrt(2)). On the 4 axis-aligned directions a norm-2.8 probe
-            # has a component of 2.8, which clamp mode flattens to 2.0 in the
-            # forward pass, so 4 of 64 probes sit on the clamp with zero
-            # gradient and near-duplicate the norm-1.98 ring (measured
-            # 2026-09-09; pinned by tests/test_ant_tag_cgf_port.py). Every
-            # recorded Ant-Tag `spread` run has this; tanh / polar do not.
-            # The den diagonal (45 deg) is one of the 8 directions exactly.
-            # Unlike the legacy 0.1-scale linspace init, this starts where
-            # the signal actually is, so no ~10x growth of ||t_j|| is
-            # required for the encoder to see it.
-            if particle_dim != 2:
-                raise ValueError("t_init_mode='spread' assumes 2D particles")
-            num_dirs = 8
-            if num_cgf_features % num_dirs != 0:
-                raise ValueError(
-                    "num_cgf_features must be divisible by 8 for 'spread'")
-            num_norms = num_cgf_features // num_dirs
-            angles = torch.arange(num_dirs, dtype=torch.float32) * (
-                2 * torch.pi / num_dirs)
-            dirs = torch.stack([torch.cos(angles), torch.sin(angles)], dim=1)
-            # t_init_max overrides the 2.8 (e.g. 0.8 * t_bound in tanh mode,
-            # so the init spans the range the bound allows).
-            rho_hi = 2.8 if t_init_max is None else float(t_init_max)
-            norms = torch.tensor(np.geomspace(0.25, rho_hi, num_norms),
-                                 dtype=torch.float32)
-            t_values = (norms[None, :, None] * dirs[:, None, :]).reshape(
-                -1, particle_dim)
-        elif t_init_mode == "spread_1d":
-            # The 1-D analogue of "spread", for a scalar state space such as
-            # the Odd-Even POMDP's integer hidden state. A SEPARATE mode
-            # rather than a widening of "spread": that mode's geometry is
-            # intrinsically planar (8 directions from angles 2*pi*k/8) and
-            # its rho_hi=2.8 is the largest norm the ELEMENTWISE t_clamp=2.0
-            # permits in 2-D (the diagonal, 2*sqrt(2)). In 1-D there are
-            # exactly two directions and that same clamp bounds ||t|| at
-            # 2.0, so neither number carries over. Overloading one flag name
-            # across two unrelated geometries would also make run_config.json
-            # ambiguous about what a run actually built, and would silently
-            # change a mode that hundreds of saved 2-D checkpoints were
-            # built with.
-            if particle_dim != 1:
-                raise ValueError(
-                    "t_init_mode='spread_1d' assumes 1D particles; use "
-                    "'spread' for the 2D case")
-            if num_cgf_features % 2 != 0:
-                raise ValueError(
-                    "num_cgf_features must be even for 'spread_1d' (the "
-                    "magnitudes are mirrored into both signs)")
-            num_norms = num_cgf_features // 2
-            # 2.0, not 2.8: in 1-D the elementwise clamp IS the norm bound.
-            # t_init_max overrides it (e.g. 40 with t_bound=50 in tanh mode:
-            # the log-spaced init then covers both the mean/variance regime
-            # at small t and the support-edge regime at large t).
-            rho_hi = 2.0 if t_init_max is None else float(t_init_max)
-            norms = torch.tensor(np.geomspace(0.25, rho_hi, num_norms),
-                                 dtype=torch.float32)
-            # Both signs, so the CGF sees the belief's mass on either side of
-            # the origin. Like "spread", this starts where the signal already
-            # is, so PPO needs no ~10x growth of ||t_j|| to resolve it.
-            t_values = torch.cat([norms, -norms]).reshape(-1, particle_dim)
-        elif t_init_mode == "random":
-            t_values = t_init_scale * torch.randn(num_cgf_features, particle_dim)
-        else:
-            raise ValueError(f"Unknown t_init_mode: {t_init_mode}")
+        t_values = init_t_values(num_cgf_features, particle_dim, t_init_mode,
+                                 t_init_scale=t_init_scale, t_init_max=t_init_max)
 
         self.t_frozen = bool(t_frozen)
         if self.t_param == "polar":
@@ -937,56 +857,25 @@ class WeightedCGFFeaturesExtractor(BaseFeaturesExtractor):
     #: forward produced for such rows through ``log(clamp(sum, min=1e-8))``;
     #: kept so the ``zero_mass`` golden in the Ant-Tag regression gate and the
     #: behaviour of every saved checkpoint on a dead filter are unchanged.
-    DEAD_ROW_VALUE = math.log(1e-8)
+    DEAD_ROW_VALUE = DEAD_ROW_VALUE
 
     def _raw_cgf(self, obs_dict: dict[str, torch.Tensor]) -> torch.Tensor:
         particles = obs_dict["particles"] / self.arena_scale
-        weights = obs_dict["weights"]
-
         particles = torch.nan_to_num(particles, nan=0.0, posinf=1.0, neginf=-1.0)
-        weights = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
-        weights = torch.clamp(weights, min=0.0)
-        mass = weights.sum(dim=1, keepdim=True)                       # [B, 1]
-        # The ``+ 1e-8`` is load-bearing: the regression gate pins its
-        # magnitude (``near_epsilon_mass``). Do not "tidy" it.
-        weights = weights / (mass + 1e-8)
-
-        # K(t_j) = log sum_i w_i exp(<t_j, x_i>), computed as
-        #
-        #     logsumexp_i ( <t_j, x_i> + log w_i )
-        #
-        # The same quantity as exp -> weighted sum -> log, but the maximum is
-        # subtracted before anything is exponentiated, so no exponent magnitude
-        # can overflow or underflow and the exponent needs no clamp. The old
-        # ``exp_arg_clamp`` silently flattened every feature once |<t, x>|
-        # passed 20 -- at |t| = 50 on [-1, 1] particles the two paths differed
-        # by 31.5 (domain_mds/oddeven.md, 2026-09-05) -- and is no longer
-        # applied. On the Ant-Tag ranges (|t| <= 2.8, |x| <= ~1.6) neither
-        # clamp ever bound, so the golden numerics are unchanged.
-        #
-        # log(0) = -inf for a zero-weight particle is correct and intended:
-        # exp(-inf) is exactly 0 inside logsumexp and its gradient is exactly
-        # 0, so a refuted particle contributes nothing, as before. The one case
-        # that must not reach logsumexp is a row with NO mass -- every entry
-        # -inf, and the backward pass is 0/0. Those rows get uniform weights
-        # for the computation (finite, so the gradient is finite) and the
-        # constant DEAD_ROW_VALUE as output, which is what the old floor gave.
-        dead = mass <= 0.0                                            # [B, 1]
-        num_particles = weights.shape[1]
-        safe_weights = torch.where(
-            dead, torch.full_like(weights, 1.0 / num_particles), weights)
-        log_w = safe_weights.log()                                    # [B, N]
+        # Mass rule, dead-row handling and the reasons for both live in
+        # normalize_log_weights(); the K formula in log_mgf_from_scores(). Both
+        # are module-level so the benchmark's CGFEncoder computes the identical
+        # quantity (tests/test_cgf_kernel_parity.py).
+        log_w, dead = normalize_log_weights(obs_dict["weights"])      # [B, N], [B, 1]
 
         t = self.effective_t()
         # Learned per-particle embedding, identity when x_embed_dim == 0.
         particles = self.x_embed(particles)                             # [B, N, t_dim]
         # One score tensor serves K and K': score_ij = <t_j, x_i> + log w_i.
-        scores = torch.matmul(particles, t.transpose(0, 1)) + log_w.unsqueeze(-1)  # [B, N, T]
+        scores = cgf_scores(particles, log_w, t)                        # [B, N, T]
         parts = []
         if self.feature_mode in ("K", "both"):
-            k = torch.logsumexp(scores, dim=1)                        # [B, T]
-            k = torch.where(dead, torch.full_like(k, self.DEAD_ROW_VALUE), k)
-            parts.append(k)
+            parts.append(log_mgf_from_scores(scores, dead, self.DEAD_ROW_VALUE))
         if self.feature_mode in ("K_grad", "both"):
             # K'(t_j) = sum_i softmax_i(score_ij) x_i: the belief's mean after
             # tilting it by exp(<t_j, x>). t = 0 gives the plain mean; large

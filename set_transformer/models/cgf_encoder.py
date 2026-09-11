@@ -1,7 +1,7 @@
-"""Shared CGF set encoder — used by both the RL feature extractor and the autoencoder.
+"""CGF set encoder for the benchmark and its autoencoder -- a thin adapter over the arm kernel.
 
-The empirical cumulant generating function of a particle set, evaluated at ``num_t``
-sampling points and projected to a fixed-width code:
+The empirical cumulant generating function of a particle set at ``num_t`` probes,
+projected to a fixed-width code:
 
     K(t_m) = log( sum_i w_i exp(t_m . x_i) )
 
@@ -10,20 +10,35 @@ small ``s`` makes the Taylor jet at the origin the cumulants (a reparameterisati
 k-moments baseline), while large ``s`` drives ``logsumexp`` toward ``max_i (u . x_i)`` --
 the support function of the set, i.e. the PointNet max-pool regime.
 
-This module exists so the CGF used for *pretraining* and the CGF used inside the *policy*
-are the same code. A separately written copy in either place would silently produce
-checkpoints whose weights no longer mean what the other expects.
+**There is one CGF in this repository (2026-09-11).** The probes' init, the mass rule and
+the log-MGF itself come from :mod:`set_transformer.rl.feature_extractors.cgf`
+(:func:`init_t_values`, :func:`cgf_log_mgf`), the implementation the
+``experiments/{ant_tag,odd_even}`` arms train with. This class adds only what the
+benchmark's contract needs on top: a per-env ``particle_scale``, uniform weights when
+the wrapper supplies none, the legacy elementwise ``t_clamp``, and the learned
+``Linear(num_t -> num_outputs * dim_output)`` readout that matches every benchmark
+method's bottleneck. The previous standalone copy (a July 2026 port of the arm
+extractor) additionally clamped ``t . x`` to ``+-exp_arg_clamp = 20``; that guard is
+unnecessary under logsumexp and made K wrong once ``||t||`` passed ~7 -- by 5 to 78
+nats at the probe bounds PITFALLS sec. 9 prescribes for Ant-Tag (9 / 13.5 / 35). At the
+legacy bound 2.0 the two implementations agree to float32 precision, so every
+recorded benchmark run is unaffected (``tests/test_cgf_encoder_matches_legacy.py``).
+
+Constructor signature and ``state_dict`` keys (``t_values``, ``cgf_proj.*``) are
+unchanged, so existing checkpoints load. ``exp_arg_clamp`` is still accepted and
+recorded, and ignored.
 """
 
 from __future__ import annotations
 
-import numpy as np
 import torch
 import torch.nn as nn
 
+from set_transformer.cgf_kernel import cgf_log_mgf, init_t_values
+
 
 class CGFEncoder(nn.Module):
-    """Particle set ``[B, N, d]`` -> code ``[B, num_encodings, dim_encoder]``.
+    """Particle set ``[B, N, d]`` -> code ``[B, num_outputs, dim_output]``.
 
     The output is reshaped to the same rank as the other set encoders in this repo
     (Set Transformer, DeepSet, PointNet) so a single ``PFDecoder`` and a single alignment
@@ -39,7 +54,7 @@ class CGFEncoder(nn.Module):
         t_init_mode: str = "spread",
         t_init_scale: float = 0.1,
         t_clamp: float | None = 2.0,
-        exp_arg_clamp: float = 20.0,
+        exp_arg_clamp: float | None = None,
         t_frozen: bool = False,
         particle_scale: float = 1.0,
         **_,
@@ -57,11 +72,19 @@ class CGFEncoder(nn.Module):
         self.t_init_mode = t_init_mode
         self.t_init_scale = t_init_scale
         self.t_clamp = t_clamp
+        #: Accepted for old configs and the run record; not applied (see module doc).
         self.exp_arg_clamp = exp_arg_clamp
         self.t_frozen = bool(t_frozen)
         self.particle_scale = particle_scale
 
-        t_values = self._init_t_values()
+        # The arm kernel spells the 1-D case ``spread_1d``; the benchmark has always
+        # accepted ``spread`` for 1-D particles with geomspace(0.25, 2.8) magnitudes
+        # mirrored into both signs, which is exactly ``spread_1d`` at that ceiling.
+        mode, t_init_max = t_init_mode, None
+        if mode == "spread" and dim_input == 1:
+            mode, t_init_max = "spread_1d", 2.8
+        t_values = init_t_values(num_t, dim_input, mode,
+                                 t_init_scale=t_init_scale, t_init_max=t_init_max)
         if self.t_frozen:
             # A buffer takes no gradient (so no optimizer can move it) while still
             # saving/loading and moving across devices exactly like a Parameter.
@@ -73,80 +96,24 @@ class CGFEncoder(nn.Module):
         self.cgf_proj = nn.Identity() if self.num_t == self.stat_dim \
             else nn.Linear(self.num_t, self.stat_dim)
 
-    def _init_t_values(self) -> torch.Tensor:
-        """Initial CGF sampling points ``[num_t, d]``.
-
-        ``spread`` starts where the signal is (log-spaced norms over evenly spread
-        directions) rather than requiring ``||t||`` to grow ~10x from a small init before
-        the encoder can see anything.
-        """
-        num_t, d, scale = self.num_t, self.particle_dim, self.t_init_scale
-        mode = self.t_init_mode
-
-        if mode == "spread":
-            if d < 2:
-                norms = torch.tensor(np.geomspace(0.25, 2.8, max(num_t // 2, 1)),
-                                     dtype=torch.float32)
-                signed = torch.cat([norms, -norms])[:num_t]
-                return signed.reshape(num_t, 1)
-            num_dirs = 8
-            if num_t % num_dirs != 0:
-                raise ValueError(
-                    f"t_init_mode='spread' needs num_t divisible by {num_dirs}, got {num_t}")
-            if d != 2:
-                raise ValueError("t_init_mode='spread' assumes 1-D or 2-D particles")
-            angles = torch.arange(num_dirs, dtype=torch.float32) * (2 * torch.pi / num_dirs)
-            dirs = torch.stack([torch.cos(angles), torch.sin(angles)], dim=1)
-            norms = torch.tensor(np.geomspace(0.25, 2.8, num_t // num_dirs),
-                                 dtype=torch.float32)
-            return (norms[None, :, None] * dirs[:, None, :]).reshape(-1, d)
-
-        if mode == "linspace_all_dims":
-            t_values = torch.zeros(num_t, d)
-            vals = torch.linspace(-scale, scale, num_t)
-            assignment = torch.arange(num_t) % d
-            for dim in range(d):
-                mask = assignment == dim
-                t_values[mask, dim] = vals[mask]
-            return t_values
-
-        if mode == "linspace_first_dim":
-            t_values = torch.zeros(num_t, d)
-            t_values[:, 0] = torch.linspace(-scale, scale, num_t)
-            if d > 1:
-                t_values[:, 1:] = 0.01 * torch.randn(num_t, d - 1)
-            return t_values
-
-        if mode == "random":
-            return scale * torch.randn(num_t, d)
-
-        raise ValueError(f"Unknown t_init_mode: {mode}")
+    def effective_t(self) -> torch.Tensor:
+        """The ``[num_t, d]`` probe matrix ``forward`` uses: ``t_values`` under the clamp."""
+        t = self.t_values
+        if self.t_clamp is not None:
+            t = torch.clamp(t, -self.t_clamp, self.t_clamp)
+        return t
 
     def forward(self, particles: torch.Tensor,
                 weights: torch.Tensor | None = None) -> torch.Tensor:
         particles = particles / self.particle_scale
-        particles = torch.nan_to_num(particles, nan=0.0, posinf=1.0, neginf=-1.0)
-
-        t = self.t_values
-        if self.t_clamp is not None:
-            t = torch.clamp(t, -self.t_clamp, self.t_clamp)
-        exp_arg = torch.einsum("md,bnd->bmn", t, particles)
-        exp_arg = torch.clamp(exp_arg, -self.exp_arg_clamp, self.exp_arg_clamp)
-
         if weights is None:
-            n = particles.shape[1]
-            cgf = torch.logsumexp(exp_arg, dim=2) - float(np.log(n))
-        else:
-            w = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0).clamp(min=0.0)
-            w = w / (w.sum(dim=1, keepdim=True) + 1e-8)
-            cgf = torch.logsumexp(exp_arg + torch.log(w + 1e-20).unsqueeze(1), dim=2)
+            batch, n = particles.shape[0], particles.shape[1]
+            weights = particles.new_full((batch, n), 1.0 / n)
+        cgf = cgf_log_mgf(particles, weights, self.effective_t())        # [B, num_t]
         code = self.cgf_proj(cgf)
         return code.reshape(code.shape[0], self.num_outputs, self.dim_output)
 
     @torch.no_grad()
     def t_value_norms(self) -> torch.Tensor:
-        """Per-point L2 norms ``||t_m||``, POST-clamp — what ``forward`` actually uses."""
-        t = self.t_values.detach()
-        if self.t_clamp is not None:
-            t = torch.clamp(t, -self.t_clamp, self.t_clamp)
-        return torch.linalg.norm(t, dim=1)
+        """Per-point L2 norms ``||t_m||``, POST-clamp -- what ``forward`` actually uses."""
+        return torch.linalg.norm(self.effective_t().detach(), dim=1)
