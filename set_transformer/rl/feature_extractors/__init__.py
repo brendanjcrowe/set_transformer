@@ -2,6 +2,16 @@ from set_transformer.rl.feature_extractors.pretrained import (
     PretrainedSetTransformerProcessor,
 )
 from set_transformer.rl.feature_extractors.e2e import CustomSetTransformerExtractor
+from set_transformer.rl.feature_extractors.statistical import (
+    CGFExtractor,
+    GaussianExtractor,
+    KMomentsExtractor,
+)
+from set_transformer.rl.feature_extractors.pooling import (
+    DeepSetExtractor,
+    PointNetExtractor,
+)
+from set_transformer.rl.feature_extractors.st import SetTransformerExtractor
 
 # The three belief encoders the cross-domain experiment compares. They were
 # moved out of experiments/ant_tag/4_train_rl_{cgf,st,gaussian}.py (which
@@ -24,6 +34,12 @@ from set_transformer.rl.feature_extractors.st import (
 __all__ = [
     "PretrainedSetTransformerProcessor",
     "CustomSetTransformerExtractor",
+    "GaussianExtractor",
+    "KMomentsExtractor",
+    "CGFExtractor",
+    "DeepSetExtractor",
+    "PointNetExtractor",
+    "SetTransformerExtractor",
     "STFeatureLoggingCallback",
     "SetTransformerFeaturesExtractor",
     "TNormLoggingCallback",

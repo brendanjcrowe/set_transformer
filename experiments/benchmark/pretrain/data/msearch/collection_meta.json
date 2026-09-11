@@ -1,0 +1,29 @@
+{
+  "env": "msearch",
+  "episodes": 250,
+  "max_steps": 42,
+  "seed": 0,
+  "policy_path": null,
+  "particle_filter": "MultimodalSearchParticleFilter",
+  "num_particles": 100,
+  "train": {
+    "num_samples": 9598,
+    "num_particles": 100,
+    "particle_dim": 2,
+    "spread_mean": 7.127564907073975,
+    "spread_std": 1.6028059720993042,
+    "spread_min": 5.960464477539063e-08,
+    "spread_max": 10.757196426391602,
+    "unique_spread_values": 1248
+  },
+  "eval": {
+    "num_samples": 1871,
+    "num_particles": 100,
+    "particle_dim": 2,
+    "spread_mean": 7.051656723022461,
+    "spread_std": 1.6519709825515747,
+    "spread_min": 1.6391277313232422e-07,
+    "spread_max": 10.420543670654297,
+    "unique_spread_values": 285
+  }
+}

@@ -1,0 +1,5 @@
+env,method,params_total,params_trainable,particle_stat_dim,features_dim,wall_clock_sec_mean,total_timesteps
+car_flag,cgf,14800,14800,16,128,1940.8453390598297,1000000
+car_flag,gaussian,12992,12992,2,128,1760.4658724546432,1000000
+car_flag,kmoments,13248,13248,4,128,1771.755501127243,1000000
+car_flag,st_scratch,442123,442123,16,128,4503.1207464933395,1000000

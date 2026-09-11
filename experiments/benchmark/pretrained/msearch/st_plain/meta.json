@@ -1,0 +1,16 @@
+{
+  "env": "msearch",
+  "encoder": "st",
+  "arm": "plain",
+  "seed": 0,
+  "encoder_params": 111106,
+  "num_epochs": 60,
+  "loss_type": "sinkhorn",
+  "blur": 0.05,
+  "best_val_emd": 3.064454277356466,
+  "wall_clock_sec": 279.3,
+  "align": null,
+  "best_epoch": 27,
+  "final_val_r": null,
+  "selected_val_r": null
+}

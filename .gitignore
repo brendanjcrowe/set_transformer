@@ -103,8 +103,13 @@ venv.bak/
 # mypy
 .mypy_cache/
 
-**/benchmark
-**/results
+# NOTE: this used to be `**/benchmark` + `**/results`, which silently untracked the whole
+# PF-belief encoder benchmark (experiments/benchmark/, set_transformer/rl/benchmark/) and
+# every run record it produces. Both are source / paper data and must be committed; only
+# the heavy per-run artifacts below are ignored.
+results/**/*.zip
+results/**/vecnormalize.pkl
+results/**/events.out.tfevents.*
 *.pkl
 *.log
 
@@ -150,6 +155,28 @@ trajectory_renders/
 *.zip
 *.png
 /*.npy
+
+# ...but benchmark run records and their aggregated tables/figures ARE the paper's data.
+# (Negations come after the broad rules above so they win; the models/tfevents ignored
+# near the top of this file keep the heavy artifacts out.)
+!results/**/evaluations.npz
+!results/**/meta.json
+!results/aggregated/*.csv
+!results/figures/*.png
+!results/figures/*.svg
+
+# Precomputed pairwise-EMD matrices for the latent-alignment loss. 1.6 GB each and fully
+# regenerable from the committed point splits via 8_precompute_emd_matrix.py. The small
+# .json sidecar (metric settings + histogram stats) is deliberately NOT ignored — it is
+# the provenance record for whichever matrix a run was aligned against.
+experiments/*/data*/emd_*.npy
+experiments/*/data*/emd_*.progress.json
+experiments/benchmark/pretrain/data/**/*.npy
+experiments/benchmark/pretrain/data/**/emd_*.progress.json
+# Pretrained encoder weights are large and regenerable from the committed pipeline; the
+# meta.json (arch, alignment settings, val EMD / val_r) is the provenance record.
+experiments/benchmark/pretrained/**/*.pt
+experiments/benchmark/pretrained/**/history.npz
 
 # ST experiment run artifacts (source lives in experiments/*/*.py,
 # outputs land in sibling data/, figures/, runs/ dirs).

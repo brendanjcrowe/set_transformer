@@ -50,7 +50,7 @@ from tqdm import tqdm
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
-
+    
 import pdomains  # noqa: F401,E402 - registers the pdomains-ant-tag-* envs
 import variants  # noqa: E402 - env/filter registry
 from set_transformer.rl import particle_filters as _pf_package  # noqa: E402

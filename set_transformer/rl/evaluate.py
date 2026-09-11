@@ -15,56 +15,15 @@ from set_transformer.rl.feature_extractors.e2e import (
 from set_transformer.rl.feature_extractors.pretrained import (
     PretrainedSetTransformerProcessor,
 )
+from set_transformer.rl.mappers import (
+    ant_tag_pf_interaction_mapper,
+    get_ant_tag_pf_kwargs,
+)
 from set_transformer.rl.particle_filters.base import BaseParticleFilter
 from set_transformer.rl.wrappers.particle_filter import (
     PFDictObservationWrapper,
     PFPlusFeaturesObservationWrapper,
 )
-
-
-def get_ant_tag_pf_kwargs(env) -> dict:
-    """Build AntTagParticleFilter kwargs from the live AntTag environment."""
-    unwrapped = env.unwrapped
-    cage_max_x = float(unwrapped.cage_max_x)
-    cage_max_y = float(unwrapped.cage_max_y)
-    if not np.isclose(cage_max_x, cage_max_y):
-        raise ValueError(
-            "AntTagParticleFilter currently assumes a square arena, but "
-            f"got cage_max_x={cage_max_x}, cage_max_y={cage_max_y}"
-        )
-    return {
-        "arena_limits": (-cage_max_x, cage_max_x),
-        "target_step": float(unwrapped.target_step),
-        "visibility_radius": float(unwrapped.visible_radius),
-        "min_initial_distance": float(unwrapped.min_distance),
-    }
-
-
-def ant_tag_pf_interaction_mapper(
-    base_env_obs,
-    base_env_info,
-    base_env_action=None,
-    unwrapped_env=None,
-    previous_base_env_obs=None,
-) -> dict:
-    """Bridge AntTag observations to AntTagParticleFilter predict/update args."""
-    ant_pos = base_env_obs[:2].copy()
-    ant_pos_for_prediction = (
-        previous_base_env_obs[:2].copy()
-        if previous_base_env_obs is not None
-        else ant_pos
-    )
-    target_in_obs = base_env_obs[-2:].copy()
-    visible = np.any(target_in_obs != 0.0)
-    observed_target = target_in_obs if visible else np.array([np.nan, np.nan])
-
-    return {
-        "predict_args": {"ant_current_pos_from_obs": ant_pos_for_prediction},
-        "update_args": {
-            "observed_target_pos": observed_target,
-            "ant_current_pos_from_obs": ant_pos,
-        },
-    }
 
 
 def get_env_module_and_pf(env_id_str: str):
