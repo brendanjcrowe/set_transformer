@@ -22,6 +22,7 @@ import os
 import re
 import subprocess
 import sys
+from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
 
@@ -207,3 +208,84 @@ def read_run_status(model_path: str) -> dict | None:
             with open(candidate) as handle:
                 return json.load(handle)
     return None
+
+
+# ---------------------------------------------------------------------------
+# Root-level output layout (plan section 2b). Not yet used by any script: the shared trainer
+# (change 4) will call run_dir(); default_run_dir() above is what the scripts still use.
+# ---------------------------------------------------------------------------
+
+
+#: Environment variable that overrides where new runs write (resolution step 2 below).
+OUTPUT_ROOT_ENV = "RL_BMDP_RUNS"
+
+
+def checkout_root() -> Path:
+    """The set_transformer checkout this package is imported from (parents[2] of this file:
+    set_transformer/set_transformer/rl/run_records.py -> set_transformer/)."""
+    return Path(__file__).resolve().parents[2]
+
+
+def parent_repo(checkout: "Path | None" = None) -> "Path | None":
+    """The repo that carries `checkout` as a git submodule, or None.
+
+    Detected from the parent directory's `.gitmodules`: one of its `path = ...` entries must
+    resolve to `checkout`. rl_for_beliefmdps lists set_transformer that way; a standalone
+    clone (Brendan's) has no such parent and gets None.
+    """
+    checkout = checkout_root() if checkout is None else Path(checkout).resolve()
+    gitmodules = checkout.parent / ".gitmodules"
+    if not gitmodules.is_file():
+        return None
+    for line in gitmodules.read_text().splitlines():
+        key, sep, value = line.strip().partition("=")
+        if sep and key.strip() == "path" and (checkout.parent / value.strip()).resolve() == checkout:
+            return checkout.parent
+    return None
+
+
+def output_root(explicit: "str | os.PathLike | None" = None, *,
+                environ: "Mapping[str, str] | None" = None,
+                checkout: "Path | None" = None) -> Path:
+    """The ONE folder new runs write under. Resolution order, first hit wins:
+
+    1. `explicit` -- the --output_root flag;
+    2. the RL_BMDP_RUNS environment variable;
+    3. `<parent repo>/runs` when this checkout is a submodule of a parent repo
+       (rl_for_beliefmdps/runs here);
+    4. `<this checkout>/runs` (a standalone clone writes under itself).
+
+    Never the current working directory: today's run dirs are cwd-relative, so a launch from
+    another folder scatters a `runs/` there. `environ` and `checkout` exist for tests.
+    """
+    if explicit:
+        return Path(explicit).expanduser().resolve()
+    environ = os.environ if environ is None else environ
+    if environ.get(OUTPUT_ROOT_ENV):
+        return Path(environ[OUTPUT_ROOT_ENV]).expanduser().resolve()
+    checkout = checkout_root() if checkout is None else Path(checkout).resolve()
+    parent = parent_repo(checkout)
+    return (parent if parent is not None else checkout) / "runs"
+
+
+def run_leaf(seed: int, run_tag: "str | None" = None, timestamp: "str | None" = None) -> str:
+    """`<timestamp>_seed<seed>[_<run_tag>]` -- the run-directory name every tool parses today,
+    with the same tag sanitising as `default_run_dir`. `timestamp` exists for tests."""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S") if timestamp is None else timestamp
+    suffix = f"_{re.sub(r'[^A-Za-z0-9._-]', '_', run_tag)}" if run_tag else ""
+    return f"{timestamp}_seed{seed}{suffix}"
+
+
+def run_dir(domain: str, variant: str, encoder: str, seed: int, run_tag: "str | None" = None, *,
+            kind: str = "rl", root: "str | os.PathLike | None" = None,
+            timestamp: "str | None" = None) -> Path:
+    """`<root>/<domain>/<variant>/<kind>/<encoder>/<timestamp>_seed<seed>[_<tag>]`.
+
+    Variant first, because the experiment records (`domain_mds/<variant>_<domain>.md`) are
+    per variant and that is how runs are looked up. `kind` is "rl" for training runs;
+    pretraining and eval output go under "pretrain" and "eval" of the same variant. `root`
+    defaults to `output_root()`. The leaf is unchanged from today's run dirs, so nothing that
+    parses those names breaks.
+    """
+    root = output_root() if root is None else Path(root)
+    return Path(root) / domain / variant / kind / encoder / run_leaf(seed, run_tag, timestamp)
