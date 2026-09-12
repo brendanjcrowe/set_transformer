@@ -23,6 +23,7 @@ Removed in the same change, not parked (they were glue for the files above):
 - the re-exports of `PretrainedSetTransformerProcessor`, `CustomSetTransformerExtractor` and
   `PFPlusFeaturesObservationWrapper` from the two `__init__.py` files.
 
-Kept, with a status banner: `experiments/ant_tag/4_train_rl_frozen.py`, now 561 lines of shared
-wrappers (was 1,057), no runnable arm. Its name is historical; moving those wrappers into the
-package is the next cleanup step.
+Kept, with a status banner: `experiments/ant_tag/4_train_rl_frozen.py`, no runnable arm. On
+2026-09-11 it held 561 lines of shared wrappers (was 1,057); on 2026-09-12 those moved into the
+package as `set_transformer/rl/domains/ant_tag.py` and the file became a forwarding file that
+re-exports them under its historical name (importers use the flat module name).
