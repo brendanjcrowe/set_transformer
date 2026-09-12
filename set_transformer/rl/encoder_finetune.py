@@ -4,7 +4,8 @@ Two fixes, each fighting an SB3 behaviour that would silently undo it
 (oddeven.md 2026-09-05/06; ported to Ant-Tag 2026-09-05 -- the smart_hard
 finetune arms flipped between 0% and 10% by seed at the shared rate):
 
-* :func:`scale_encoder_learning_rate` (fix 1) puts the encoder in its own
+* :func:`scale_encoder_learning_rate` (fix 1) puts the encoder (what the extractor's
+  ``encoder_parameters()`` returns; ST, CGF and the pooled arms alike) in its own
   optimizer param group at ``scale`` x the head rate. SB3 writes the scheduled
   rate into EVERY param group before each ``train()``, so a plain second
   group would be back at the head rate after the first update; the
@@ -86,7 +87,11 @@ def scale_encoder_learning_rate(model, scale: float) -> None:
     at ``scale`` x the rate).
     """
     policy = model.policy
-    encoder_params = list(policy.features_extractor.encoder.parameters())
+    # The shared encoder interface (change 2, 2026-09-12): every learned extractor says
+    # which of its parameters are the encoder. Before this the function reached for
+    # `.encoder.parameters()`, which the CGF extractor does not have (it IS the encoder),
+    # so a CGF finetune at a scaled rate could not be run.
+    encoder_params = list(policy.features_extractor.encoder_parameters())
     encoder_ids = {id(p) for p in encoder_params}
     other_params = [p for p in policy.parameters() if id(p) not in encoder_ids]
     base_lr = model.lr_schedule(1.0)
@@ -96,7 +101,7 @@ def scale_encoder_learning_rate(model, scale: float) -> None:
         [encoder_group, {"params": other_params, "lr": base_lr}],
         lr=base_lr, **policy.optimizer_kwargs)
     assert policy.optimizer.param_groups[0] is encoder_group
-    print(f"ST encoder learning rate scaled by {scale} "
+    print(f"{type(policy.features_extractor).__name__}: encoder learning rate scaled by {scale} "
           f"({len(encoder_params)} encoder tensors at {encoder_group['lr']:.2e}, "
           f"{len(other_params)} head tensors at {base_lr:.2e}; anneal applies to both)")
 

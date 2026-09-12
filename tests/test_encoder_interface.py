@@ -262,3 +262,30 @@ def test_policy_extractors_lists_the_shared_extractor_first_and_each_distinct_on
     found = pe.policy_extractors(model)
     assert found[0] is shared and {id(e) for e in found} == {id(shared), id(own)}
     assert all(e is own for e in found[1:])
+
+
+# ---------------------------------------------------------------------------
+# The learning-rate scaler on the interface (second commit of change 2)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("cls,kwargs,write_checkpoint", ARMS)
+def test_scale_encoder_learning_rate_partitions_by_encoder_parameters(cls, kwargs, write_checkpoint, tmp_path):
+    """Fix 1 of the finetune-collapse pair, now written against `encoder_parameters()`: the
+    encoder's tensors sit in the scaled group, every other tensor in the plain group, each
+    exactly once -- for the CGF extractor too, which has no `.encoder` attribute and so
+    could not be scaled before."""
+    from set_transformer.rl.encoder_finetune import scale_encoder_learning_rate
+    path = tmp_path / "ckpt.pt"
+    write_checkpoint(path)
+    model = _quiet(lambda: _tiny_ppo(cls, kwargs, path))
+    _quiet(lambda: pe.reload_pretrained(model, str(path), frozen=False))
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        scale_encoder_learning_rate(model, 0.1)
+    assert f"{cls.__name__}: encoder learning rate scaled by 0.1" in buf.getvalue()
+    groups = model.policy.optimizer.param_groups
+    assert len(groups) == 2
+    encoder_ids = {id(p) for p in model.policy.features_extractor.encoder_parameters()}
+    assert {id(p) for p in groups[0]["params"]} == encoder_ids
+    assert {id(p) for p in groups[1]["params"]} == {id(p) for p in model.policy.parameters()} - encoder_ids
+    assert groups[0]["lr"] == pytest.approx(0.1 * groups[1]["lr"]) and groups[1]["lr"] == pytest.approx(model.lr_schedule(1.0))
