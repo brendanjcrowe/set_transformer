@@ -277,16 +277,14 @@ def test_ant_tag_bare_run_resolves_variant_defaults_and_records_them(
     cgf = ant_tag["4_train_rl_cgf"]
     assert train["curriculum_schedule"] == cgf._parse_curriculum(smart.default_curriculum)
     assert train["evasion_schedule"] == cgf._parse_curriculum(smart.default_evasion_curriculum)
-    # KNOWN DRIFT (found 2026-09-12 while writing this pin): the Gaussian arm carries a
-    # pre-2026-09-08 copy of the parser that pads to FOUR fields and refuses a fifth
-    # (spread gain); CGF, ST and the pool arms pad to five. CurriculumCallback reads a
-    # missing gain as 0, so the two are equivalent for every recorded recipe. Pinned
-    # here as it is; unified deliberately in change 4 (refactor_plans.md).
+    # Until change 1d (2026-09-12) the Gaussian arm carried a pre-2026-09-08 copy of the
+    # parser that padded to FOUR fields and refused a fifth (spread gain), pinned here as
+    # a known drift. Every arm now uses set_transformer.rl.curriculum.parse_reward_schedule,
+    # so all four parse the recipe to the same five-field waypoints (a missing gain is 0,
+    # which is what CurriculumCallback read before, so recorded runs are unaffected).
     parsed = train["reward_schedule"]
-    padded = [tuple(list(e) + [0.0] * (5 - len(e))) for e in parsed]
-    assert padded == cgf._parse_reward_schedule(smart.default_reward_schedule)
-    width = 4 if encoder == "gaussian" else 5
-    assert all(len(entry) == width for entry in parsed)
+    assert parsed == cgf._parse_reward_schedule(smart.default_reward_schedule)
+    assert all(len(entry) == 5 for entry in parsed)
     # historical defaults every recorded run used
     assert train["obs_mask_indices"] == [-2, -1]
     assert train["total_timesteps"] == 3_000_000 and train["n_envs"] == 4
@@ -571,22 +569,25 @@ def test_reward_schedule_parser_pads_three_and_four_field_entries_with_zeros(ant
     assert cgf._parse_curriculum("0:100, 0.4:1.5") == [(0.0, 100.0), (0.4, 1.5)]
 
 
-def test_reward_schedule_parsers_agree_after_padding_but_the_gaussian_copy_lags(ant_tag):
-    """KNOWN DRIFT between copies of one function. cgf / st / pool parse
-    frac:distance:entropy[:tag_bonus[:spread_gain]] to five fields; the Gaussian arm's
-    own copy pads three to four and raises on five, so a spread-gain schedule cannot be
-    passed to the Gaussian arm today. Every recorded Gaussian run used a 3- or 4-field
-    recipe, so results are unaffected. When the one trainer replaces the copies this
-    test is flipped on purpose (the Gaussian arm gains the fifth field)."""
+def test_reward_schedule_parser_is_one_function_in_every_arm(ant_tag):
+    """Until 2026-09-12 this test pinned a KNOWN DRIFT: the Gaussian arm's own copy of the
+    reward-schedule parser padded three fields to four and raised on five, so a spread-gain
+    schedule could not be passed to that arm. Change 1d replaced every copy with
+    set_transformer.rl.curriculum.parse_reward_schedule, so the test is flipped on purpose:
+    all four arms expose the SAME function, and the Gaussian arm gains the fifth field.
+    Every three- and four-field schedule parses to the same coefficients as before (the
+    padding is zeros, and the callback read a missing spread gain as 0), so recorded
+    Gaussian runs are unaffected."""
+    from set_transformer.rl.curriculum import parse_reward_schedule
+
     five = "0:1:2:0:0,1:0.15:2:50:10"
     four = "0:1:2:0,1:0.15:2:50"
-    cgf, st, pool, gauss = (ant_tag[n] for n in
-                            ("4_train_rl_cgf", "4_train_rl_st", "4_train_rl_pool", "4_train_rl_gaussian"))
-    assert cgf._parse_reward_schedule(five) == st._parse_reward_schedule(five) \
-        == pool._parse_reward_schedule(five) == [(0.0, 1.0, 2.0, 0.0, 0.0), (1.0, 0.15, 2.0, 50.0, 10.0)]
-    assert gauss._parse_reward_schedule(four) == [(0.0, 1.0, 2.0, 0.0), (1.0, 0.15, 2.0, 50.0)]
+    arms = [ant_tag[n] for n in ("4_train_rl_cgf", "4_train_rl_st", "4_train_rl_pool", "4_train_rl_gaussian")]
+    assert all(arm._parse_reward_schedule is parse_reward_schedule for arm in arms)
+    assert parse_reward_schedule(five) == [(0.0, 1.0, 2.0, 0.0, 0.0), (1.0, 0.15, 2.0, 50.0, 10.0)]
+    assert parse_reward_schedule(four) == [(0.0, 1.0, 2.0, 0.0, 0.0), (1.0, 0.15, 2.0, 50.0, 0.0)]
     with pytest.raises(ValueError):
-        gauss._parse_reward_schedule(five)
+        parse_reward_schedule("0:1:2:0:0:7")
 
 
 # ==========================================================================

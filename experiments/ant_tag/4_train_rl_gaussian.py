@@ -62,6 +62,7 @@ _tee_stdout_stderr = _train_rl_cgf._tee_stdout_stderr
 _git_provenance = _train_rl_cgf._git_provenance
 _write_run_config = _train_rl_cgf._write_run_config
 _parse_curriculum = _train_rl_cgf._parse_curriculum
+_parse_reward_schedule = _train_rl_cgf._parse_reward_schedule
 from set_transformer.rl.run_records import default_run_dir as _shared_default_run_dir  # noqa: E402
 
 
@@ -267,18 +268,6 @@ def train_ant_tag_gaussian(
         print(f"Model saved to {model_save_path}")
         vec_env.close()
         eval_vec_env.close()
-
-
-def _parse_reward_schedule(reward_schedule: str) -> list[tuple[float, ...]]:
-    schedule = []
-    for entry in reward_schedule.split(","):
-        parts = [float(part) for part in entry.strip().split(":")]
-        if len(parts) == 3:
-            parts.append(0.0)
-        if len(parts) != 4:
-            raise ValueError("Each reward schedule entry must have 3 or 4 values")
-        schedule.append(tuple(parts))
-    return schedule
 
 
 def main(encoder: str = "gaussian"):
