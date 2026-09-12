@@ -1,11 +1,12 @@
-"""Ant-Tag domain for the RL harness: variant registry, reward shaping, curriculum, PF glue.
+"""Ant-Tag domain for the RL harness: variant registry, wrappers, curriculum, PF glue, env factory.
 
-Two moves built this module (harness centralisation, ``refactor_plans.md`` in the parent
-repo): 2026-09-12 change 1a brought the wrappers and particle-filter glue over from
-``experiments/ant_tag/4_train_rl_frozen.py``; change 1b brought the variant registry over
-from ``experiments/ant_tag/variants.py``. Both blocks are byte-identical to the originals,
-and both old files re-export these names under their historical flat module names, which
-the numbered scripts, eval scripts, diagnostics and tests import.
+Three moves built this module (harness centralisation, ``refactor_plans.md`` in the parent
+repo, 2026-09-12): change 1a brought the wrappers and particle-filter glue over from
+``experiments/ant_tag/4_train_rl_frozen.py``; change 1b the variant registry from
+``experiments/ant_tag/variants.py``; change 1c the env factory and its helpers from
+``experiments/ant_tag/4_train_rl_cgf.py``. Every block is byte-identical to its original, and
+each old file re-exports the names under its historical flat module name, which the numbered
+scripts, eval scripts, diagnostics and tests import.
 
 Variant registry
   Every script needs the same facts about a variant: the gym env id, the particle filter
@@ -32,15 +33,34 @@ Wrappers, curriculum, PF glue
                                 filter's predict / update kwargs (visibility, evasion, target
                                 speed, ghost ping, den and counterweighted-den geometry)
 
+Env factory
+  make_ant_tag_cgf_env          returns a thunk building one worker's env: gym.make ->
+                                CurriculumVisibilityWrapper -> PFDictWithWeightsObservationWrapper
+                                (filter seeded per worker and episode) -> PFRewardShapingWrapper
+                                (training only) -> Monitor -> _CurriculumRouter. Every arm and
+                                the eval build the env through it, so the belief the encoders
+                                see is the same everywhere.
+  get_ant_tag_arena_scale       cage half-width off a live env (the encoders' particle scale;
+                                same derivation as the registry's ``arena_scale``)
+  get_env_visible_radius        the real visibility radius off a live env (eval env)
+  _make_vec_normalize           VecNormalize over the base obs and reward only, never the
+                                PF weights (``norm_obs_keys=["obs"]``)
+  _make_vec_env_from_fns        SubprocVecEnv above one worker, DummyVecEnv at one
+
 ``import pdomains`` below registers the ``pdomains-ant-tag-*`` env ids the registry names;
 it does not load MuJoCo (that happens on ``gym.make``), so importing this module stays cheap.
+The factory thunk is pickled by reference to this module when SubprocVecEnv starts workers,
+and the child's import of it registers the envs there too.
 """
 
+import os
 from dataclasses import dataclass
 
 import gymnasium as gym
 import numpy as np
 from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize
 
 import pdomains  # noqa: F401 - registers the pdomains-ant-tag-* envs
 from set_transformer.rl.particle_filters.ant_tag import (
@@ -50,7 +70,7 @@ from set_transformer.rl.particle_filters.ant_tag import (
     SmartAntTagParticleFilter,
     TwinDenAntTagParticleFilter,
 )
-
+from set_transformer.rl.wrappers.particle_filter import PFDictWithWeightsObservationWrapper
 
 # ---------------------------------------------------------------------------
 # Variant registry (moved from experiments/ant_tag/variants.py)
@@ -881,3 +901,180 @@ def ant_tag_pf_interaction_mapper(
             "cden_spook_radius": cden_spook_radius,
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# Env factory and helpers (moved from experiments/ant_tag/4_train_rl_cgf.py)
+# ---------------------------------------------------------------------------
+
+
+def get_ant_tag_arena_scale(env_id: str = "pdomains-ant-tag-v0") -> float:
+    """Derive the CGF particle-normalization scale from the live AntTag arena.
+
+    Mirrors get_ant_tag_pf_kwargs's arena_limits derivation, so the CGF
+    extractor's particle normalization always matches the PF's actual
+    arena_limits instead of relying on a hardcoded default that would go
+    stale if the env's arena size ever changes.
+    """
+    env = gym.make(env_id, rendering=False)
+    try:
+        unwrapped = env.unwrapped
+        cage_max_x = float(unwrapped.cage_max_x)
+        cage_max_y = float(unwrapped.cage_max_y)
+        if not np.isclose(cage_max_x, cage_max_y):
+            raise ValueError(
+                "WeightedCGFFeaturesExtractor currently assumes a square arena, "
+                f"but got cage_max_x={cage_max_x}, cage_max_y={cage_max_y}"
+            )
+        return cage_max_x
+    finally:
+        env.close()
+
+
+def get_env_visible_radius(env_id: str = "pdomains-ant-tag-v0") -> float:
+    """Derive the evaluation visibility radius from the live env.
+
+    Mirror of get_ant_tag_arena_scale. Replaces the hardcoded 3.0 that used
+    to be baked into every eval-env construction: every legacy env reports
+    visible_radius == 3.0, so this is behavior-identical for them, while
+    arena-scaled variants (CounterweightedDenAntTagEnv, 1.8) are evaluated at
+    THEIR real POMDP difficulty instead of a stale constant.
+    """
+    env = gym.make(env_id, rendering=False)
+    try:
+        return float(env.unwrapped.visible_radius)
+    finally:
+        env.close()
+
+
+def _make_vec_normalize(vec_env, training: bool, norm_reward: bool):
+    """Normalize only base obs so PF weights remain valid probabilities."""
+    try:
+        return VecNormalize(
+            vec_env,
+            training=training,
+            norm_obs=True,
+            norm_reward=norm_reward,
+            norm_obs_keys=["obs"],
+        )
+    except TypeError:
+        print(
+            "Warning: this SB3 VecNormalize lacks norm_obs_keys; disabling "
+            "obs normalization to avoid corrupting PF weights."
+        )
+        return VecNormalize(
+            vec_env,
+            training=training,
+            norm_obs=False,
+            norm_reward=norm_reward,
+        )
+
+
+def make_ant_tag_cgf_env(
+    num_particles: int,
+    rank: int = 0,
+    seed: int = 0,
+    monitor_dir: str | None = None,
+    distance_coeff: float = 1.0,
+    entropy_coeff: float = 0.0,
+    tag_bonus_coeff: float = 0.0,
+    gain_coeff: float = 0.0,
+    initial_visibility_radius: float = 100.0,
+    obs_mask_indices: list[int] | None = None,
+    apply_reward_shaping: bool = True,
+    env_id: str = "pdomains-ant-tag-v0",
+    particle_filter_class: type = AntTagParticleFilter,
+    target_speed_scale: float | None = None,
+):
+    """Return a callable that creates a weighted-CGF AntTag env.
+
+    apply_reward_shaping=False skips PFRewardShapingWrapper entirely, so
+    Monitor sees the env's true sparse reward (-1/step, 0-and-terminate on
+    tag). Use this for the eval env: CurriculumCallback only ever updates
+    reward coefficients on the training env, so a shaped eval env would
+    report reward numbers stuck at their initial (dense) coefficients for
+    the entire run, making EvalCallback's "best_model" selection
+    meaningless. Eval envs already fix visibility at the real POMDP radius
+    regardless of training progress; this applies that same principle to
+    the reward too.
+
+    env_id / particle_filter_class default to the original dumb-target
+    AntTag env + its matching PF; pass "pdomains-ant-tag-smart-v0" +
+    SmartAntTagParticleFilter to train on the smart-target variant instead,
+    so belief propagation matches that env's true motion model.
+
+    target_speed_scale=None (default) leaves the env at its own default
+    (0.0 for SmartAntTagEnv: the target flees more OFTEN when cornered but
+    never faster). Pass a float to override; only SmartAntTagEnv has this
+    knob, so passing it with the base AntTag env is a hard error rather
+    than a silently ignored no-op. The PF is told the live value each step
+    by ant_tag_pf_interaction_mapper, so belief propagation always matches
+    whatever the env is actually doing.
+    """
+
+    def _init():
+        env_make_kwargs = {"rendering": False}
+        if target_speed_scale is not None:
+            env_make_kwargs["target_speed_scale"] = target_speed_scale
+        try:
+            env = gym.make(env_id, **env_make_kwargs)
+        except TypeError as exc:
+            if target_speed_scale is None or "target_speed_scale" not in str(exc):
+                raise
+            raise ValueError(
+                f"--target_speed_scale was given ({target_speed_scale}) but env_id="
+                f"{env_id!r} does not support it. Only SmartAntTagEnv "
+                "('pdomains-ant-tag-smart-v0') has a cornered-speed knob; the base "
+                "AntTag target always moves at a constant target_step. Either drop "
+                "the flag or train on the smart env."
+            ) from exc
+        if target_speed_scale is not None:
+            # Fail loudly if it didn't land: a silently-dropped kwarg here
+            # would train against a different target speed than requested,
+            # and the mapper would faithfully feed that wrong value to the PF.
+            actual = getattr(env.unwrapped, "target_speed_scale", None)
+            if actual is None or not np.isclose(actual, target_speed_scale):
+                raise ValueError(
+                    f"target_speed_scale={target_speed_scale} did not take effect on "
+                    f"env_id={env_id!r} (env reports {actual!r}). Only "
+                    "SmartAntTagEnv ('pdomains-ant-tag-smart-v0') supports this knob."
+                )
+        env.reset(seed=seed + rank)
+        particle_filter_kwargs = get_ant_tag_pf_kwargs(env)
+
+        env = CurriculumVisibilityWrapper(
+            env,
+            initial_visibility_radius=initial_visibility_radius,
+        )
+        env = PFDictWithWeightsObservationWrapper(
+            env=env,
+            particle_filter_class=particle_filter_class,
+            particle_filter_kwargs=particle_filter_kwargs,
+            num_particles=num_particles,
+            pf_interaction_mapper=ant_tag_pf_interaction_mapper,
+            obs_mask_indices=obs_mask_indices,
+            particle_filter_seed=seed + rank,
+        )
+        if apply_reward_shaping:
+            env = PFRewardShapingWrapper(
+                env,
+                distance_coeff=distance_coeff,
+                entropy_coeff=entropy_coeff,
+                tag_bonus_coeff=tag_bonus_coeff,
+                gain_coeff=gain_coeff,
+            )
+
+        if monitor_dir:
+            env = Monitor(env, os.path.join(monitor_dir, str(rank)))
+        else:
+            env = Monitor(env)
+        env = _CurriculumRouter(env)
+        return env
+
+    return _init
+
+
+def _make_vec_env_from_fns(env_fns, n_envs: int):
+    if n_envs > 1:
+        return SubprocVecEnv(env_fns)
+    return DummyVecEnv(env_fns)
