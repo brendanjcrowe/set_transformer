@@ -36,6 +36,10 @@ _HERE = Path(__file__).resolve().parent
 #: Package name the siblings are loaded UNDER, so their module keys are
 #: unambiguous across the two experiment directories.
 #:
+#: (2026-09-12: the wrappers and the factory now live in the package,
+#: `set_transformer.rl.domains.odd_even`, which a child imports by its real
+#: name, so the paragraph below no longer bites for them; the mechanism stays
+#: for the modules still loaded here, e.g. `4_train_rl_cgf`.)
 #: It must be a name a FRESH PROCESS can import, not just a synthetic
 #: sys.modules key. SubprocVecEnv cloudpickles the env-factory closures, and
 #: cloudpickle serializes a class defined in an importable module BY
