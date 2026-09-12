@@ -19,6 +19,7 @@ import numpy as np
 import pytest
 import torch
 
+from set_transformer.training.config import TrainingConfig
 from set_transformer.models.cgf_arm_ae import (
     CGFArmAutoencoder,
     export_arm_checkpoint,
@@ -106,11 +107,24 @@ def test_export_loads_strict_into_the_rl_extractor(tmp_path):
         ae.extractor.raw_a.add_(0.3)                       # move t off its init
     trainer_ckpt = tmp_path / "checkpoint_best.pt"
     torch.save({"model_state_dict": ae.state_dict(), "epoch": 3, "global_step": 99,
-                "best_val_loss": 0.123, "config": None, "alignment": None}, trainer_ckpt)
+                "best_val_loss": 0.123, "alignment": None,
+                "config": TrainingConfig(model_type="cgf_arm_ae", num_particles=N,
+                                         dim_particles=D)}, trainer_ckpt)
     out = export_arm_checkpoint(trainer_ckpt, tmp_path / "checkpoint_best_cgf_arm.pt",
                                 ae.extractor, particle_centre=0.0,
                                 objective="reconstruction_sinkhorn", data_path="x.npz")
     payload = torch.load(out, map_location="cpu", weights_only=False)
+    # The export must be pure Python + tensors: the Trainer's dataclass is flattened,
+    # so it unpickles in an interpreter that cannot import set_transformer (the
+    # 2026-09-11 smart wave died on exactly this, between pretraining and RL).
+    assert isinstance(payload["trainer_config"], dict)
+    assert payload["trainer_config"]["model_type"] == "cgf_arm_ae"
+    import pickletools, zipfile
+    with zipfile.ZipFile(out) as z:
+        pkl = z.read(next(n for n in z.namelist() if n.endswith("data.pkl")))
+    globals_used = {arg for op, arg, _ in pickletools.genops(pkl)
+                    if op.name in ("GLOBAL", "STACK_GLOBAL") and arg}
+    assert not any("set_transformer" in str(g) for g in globals_used), globals_used
     assert set(payload["model_state_dict"]) == set(ae.extractor.state_dict())
     assert payload["config"]["arena_scale"] == SCALE and payload["config"]["t_param"] == "polar"
     assert payload["particle_scale"] == SCALE

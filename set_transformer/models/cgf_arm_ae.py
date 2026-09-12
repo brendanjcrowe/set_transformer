@@ -31,6 +31,7 @@ provenance -- the same shape ``experiments/odd_even/3_pretrain_st_belief.py`` wr
 
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 
 import gymnasium as gym
@@ -140,6 +141,15 @@ class CGFArmAutoencoder(nn.Module):
         return {k: v.detach().cpu() for k, v in self.extractor.state_dict().items()}
 
 
+def _plain(obj):
+    """Dataclass / namespace -> dict so the export payload is pure Python + tensors."""
+    if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+        return dataclasses.asdict(obj)
+    if hasattr(obj, "__dict__") and not isinstance(obj, (dict, list, tuple, str, int, float)):
+        return dict(vars(obj))
+    return obj
+
+
 def export_arm_checkpoint(trainer_checkpoint: Path, out_path: Path,
                           extractor: WeightedCGFFeaturesExtractor,
                           particle_centre: float, objective: str,
@@ -184,7 +194,9 @@ def export_arm_checkpoint(trainer_checkpoint: Path, out_path: Path,
         "particle_scale": float(extractor.arena_scale),
         "particle_centre": float(particle_centre),
         "alignment": loaded.get("alignment"),
-        "trainer_config": loaded.get("config"),
+        # plain dict, not the TrainingConfig dataclass: the export must unpickle
+        # without the set_transformer package importable (driver snippets, other envs)
+        "trainer_config": _plain(loaded.get("config")),
         "source_checkpoint": str(trainer_checkpoint),
     }
     out_path = Path(out_path)

@@ -50,6 +50,15 @@ declare -A ARM_FLAGS=(
   [cgf_polar_Kgrad]="$POLAR --feature_mode K_grad"
   [cgf_polar_Kgrad_109k]="$POLAR --feature_mode K_grad --match_params 109448"
 )
+# Arms defined at launch time, for flags only known then (e.g. a pretraining
+# export path): ARM_DEFS="name1=<flags>;name2=<flags>". Unset -> the four
+# recorded arms above, unchanged (2026-09-11).
+if [ -n "${ARM_DEFS:-}" ]; then
+  IFS=';' read -r -a _arm_defs <<< "$ARM_DEFS"
+  for _def in "${_arm_defs[@]}"; do
+    [ -n "$_def" ] && ARM_FLAGS[${_def%%=*}]=${_def#*=}
+  done
+fi
 ARMS=${ARMS:-"cgf_legacy cgf_polar_K cgf_polar_Kgrad cgf_polar_Kgrad_109k"}
 
 read -r -a DEVICE_LIST <<< "$DEVICES"
