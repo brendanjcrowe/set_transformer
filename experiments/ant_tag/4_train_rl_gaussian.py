@@ -60,6 +60,16 @@ _make_vec_env_from_fns = _train_rl_cgf._make_vec_env_from_fns
 AntTagParticleFilter = _train_rl_cgf.AntTagParticleFilter
 _tee_stdout_stderr = _train_rl_cgf._tee_stdout_stderr
 _git_provenance = _train_rl_cgf._git_provenance
+_write_run_config = _train_rl_cgf._write_run_config
+_parse_curriculum = _train_rl_cgf._parse_curriculum
+from set_transformer.rl.run_records import default_run_dir as _shared_default_run_dir  # noqa: E402
+
+
+def _default_run_dir(seed: int, run_subdir: str = "ant_tag_gaussian",
+                      run_tag: str | None = None) -> str:
+    """run_records.default_run_dir with this script's historical default subfolder
+    (train_ant_tag_gaussian calls it with only a seed when no --log_dir is given)."""
+    return _shared_default_run_dir(seed, run_subdir, run_tag)
 
 # The Gaussian belief encoder now lives in the shared package so a second
 # domain can use it without importing an Ant-Tag script. It is re-exported
@@ -71,34 +81,6 @@ _git_provenance = _train_rl_cgf._git_provenance
 from set_transformer.rl.feature_extractors.gaussian import (  # noqa: E402
     WeightedGaussianFeaturesExtractor,
 )
-
-
-def _default_run_dir(seed: int, run_subdir: str = "ant_tag_gaussian",
-                      run_tag: str | None = None) -> str:
-    """runs/<run_subdir>/<timestamp>_seed<seed>[_<run_tag>]/, so parallel runs
-    with different seeds (and different env variants, via run_subdir) land in
-    distinct, sortable, self-describing folders instead of overwriting a
-    fixed sb3_ant_tag_gaussian_logs/ path.
-
-    run_tag is a free-form human label (e.g. "6M_vis0.2-0.5") for eyeballing
-    `ls runs/<run_subdir>/` without opening any files. It is NOT the source
-    of truth for what a run actually used — that's runs/<run_subdir>/<...>/
-    run_config.json, written alongside it with every CLI arg."""
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    suffix = f"_{re.sub(r'[^A-Za-z0-9._-]', '_', run_tag)}" if run_tag else ""
-    return os.path.join("runs", run_subdir, f"{timestamp}_seed{seed}{suffix}")
-
-
-def _write_run_config(run_dir: str, **config) -> None:
-    """Dump every CLI arg for this run to run_dir/run_config.json — the
-    unambiguous source of truth for what a run used (total_timesteps,
-    curriculum/reward/evasion schedules, env_id, etc.), since the run_tag in
-    the directory name is just a human-readable hint, not a full record."""
-    os.makedirs(run_dir, exist_ok=True)
-    path = os.path.join(run_dir, "run_config.json")
-    with open(path, "w") as f:
-        json.dump(config, f, indent=2, default=str, sort_keys=True)
-    print(f"Run config saved to {path}")
 
 
 def train_ant_tag_gaussian(
@@ -285,14 +267,6 @@ def train_ant_tag_gaussian(
         print(f"Model saved to {model_save_path}")
         vec_env.close()
         eval_vec_env.close()
-
-
-def _parse_curriculum(curriculum: str) -> list[tuple[float, float]]:
-    schedule = []
-    for pair in curriculum.split(","):
-        frac, radius = pair.strip().split(":")
-        schedule.append((float(frac), float(radius)))
-    return schedule
 
 
 def _parse_reward_schedule(reward_schedule: str) -> list[tuple[float, ...]]:

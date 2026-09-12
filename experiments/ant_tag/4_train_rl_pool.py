@@ -62,6 +62,8 @@ _tee_stdout_stderr = _train_rl_cgf._tee_stdout_stderr
 _git_provenance = _train_rl_cgf._git_provenance
 _parse_curriculum = _train_rl_cgf._parse_curriculum
 _parse_reward_schedule = _train_rl_cgf._parse_reward_schedule
+_write_run_config = _train_rl_cgf._write_run_config
+from set_transformer.rl.run_records import default_run_dir as _default_run_dir  # noqa: E402
 
 from set_transformer.rl.encoder_finetune import (  # noqa: E402
     EncoderLRLoggingCallback,
@@ -80,21 +82,6 @@ ENCODERS = {
     "pointnet": (PointNetFeaturesExtractor, True),
     "kmoments": (WeightedKMomentsFeaturesExtractor, False),
 }
-
-
-def _default_run_dir(seed: int, run_subdir: str, run_tag: str | None = None) -> str:
-    """runs/<run_subdir>/<timestamp>_seed<seed>[_<run_tag>]/ (see 4_train_rl_cgf.py)."""
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    suffix = f"_{re.sub(r'[^A-Za-z0-9._-]', '_', run_tag)}" if run_tag else ""
-    return os.path.join("runs", run_subdir, f"{timestamp}_seed{seed}{suffix}")
-
-
-def _write_run_config(run_dir: str, **config) -> None:
-    os.makedirs(run_dir, exist_ok=True)
-    path = os.path.join(run_dir, "run_config.json")
-    with open(path, "w") as f:
-        json.dump(config, f, indent=2, default=str, sort_keys=True)
-    print(f"Run config saved to {path}")
 
 
 def build_extractor_kwargs(encoder: str, arena_scale: float, *, num_encodings: int,

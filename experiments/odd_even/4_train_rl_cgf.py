@@ -102,6 +102,20 @@ make_odd_even_belief_env = _belief_env.make_odd_even_belief_env
 make_vec_env_from_fns = _belief_env.make_vec_env_from_fns
 make_vec_normalize = _belief_env.make_vec_normalize
 
+# Run bookkeeping lives in the package since 2026-09-12 (change 1d); imported back under the
+# names this script has always exposed (the ST / Gaussian arms, the eval and the tests read
+# them off this module).
+from set_transformer.rl.run_records import (  # noqa: E402
+    RUN_STATUS_FILENAME,
+    TeeStream as _TeeStream,
+    default_run_dir as _default_run_dir,
+    git_provenance as _git_provenance,
+    read_run_status,
+    tee_stdout_stderr as _tee_stdout_stderr,
+    write_run_config as _write_run_config,
+    write_run_status,
+)
+
 # The encoder pieces come FROM THE PACKAGE. Importing them from an Ant-Tag
 # script would pull in MuJoCo and, worse, `4_train_rl_cgf` is now an ambiguous
 # flat module name -- both experiment directories hold one (Gap 12).
@@ -114,110 +128,6 @@ from set_transformer.rl.feature_extractors.cgf import (  # noqa: E402
     matched_readout_hidden,
     non_readout_param_count,
 )
-
-
-def _default_run_dir(seed: int, run_subdir: str,
-                     run_tag: str | None = None) -> str:
-    """runs/<run_subdir>/<timestamp>_seed<seed>[_<run_tag>]/.
-
-    Parallel runs with different seeds and variants land in distinct,
-    sortable, self-describing folders. run_tag is a free-form human label for
-    eyeballing `ls`; it is NOT the source of truth for what a run used --
-    that is run_config.json, written alongside with every CLI arg.
-
-    Unlike the Ant-Tag scripts, run_subdir has no default here: it is always
-    passed. Those scripts' train_* functions accept a run_subdir and then
-    ignore it, so a programmatic call silently writes into the base variant's
-    directory. That wart is not reproduced.
-    """
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    suffix = f"_{re.sub(r'[^A-Za-z0-9._-]', '_', run_tag)}" if run_tag else ""
-    return os.path.join("runs", run_subdir, f"{timestamp}_seed{seed}{suffix}")
-
-
-def _write_run_config(run_dir: str, **config) -> None:
-    """Dump every CLI arg to run_dir/run_config.json.
-
-    The unambiguous record of what a run used. The run_tag in the directory
-    name is a hint, not a record.
-    """
-    os.makedirs(run_dir, exist_ok=True)
-    path = os.path.join(run_dir, "run_config.json")
-    with open(path, "w") as handle:
-        json.dump(config, handle, indent=2, default=str, sort_keys=True)
-    print(f"Run config saved to {path}")
-
-
-def _git_provenance() -> dict:
-    """Record WHICH CODE produced this run (PITFALLS.md section 6).
-
-    run_config.json pins every hyperparameter but not the source that read
-    them, and two runs with byte-identical configs have already given
-    different results in this project because the code changed between them.
-    HEAD alone does not close it -- both submodules are routinely dirty -- so
-    the SHA-256 of `git diff HEAD` gives an uncommitted tree a stable
-    identity. Never raises: a stripped checkout records an error string
-    rather than killing a multi-hour run.
-    """
-    repos = {
-        "set_transformer": Path(__file__).resolve().parents[2],
-        "pomdp-domains": Path(__file__).resolve().parents[3] / "pomdp-domains",
-    }
-
-    def _git(repo: Path, *args: str) -> str:
-        return subprocess.run(
-            ("git", "-C", str(repo)) + args,
-            capture_output=True, text=True, check=True, timeout=15,
-        ).stdout
-
-    provenance = {}
-    for name, repo in repos.items():
-        try:
-            head = _git(repo, "rev-parse", "HEAD").strip()
-            status = [line for line in
-                      _git(repo, "status", "--porcelain").splitlines() if line]
-            diff = _git(repo, "diff", "HEAD")
-            provenance[name] = {
-                "path": str(repo),
-                "head": head,
-                "dirty": bool(status),
-                "diff_sha256": (hashlib.sha256(diff.encode()).hexdigest()
-                                if diff else None),
-                "status": status,
-            }
-        except Exception as exc:  # noqa: BLE001 - never abort a run
-            provenance[name] = {"path": str(repo),
-                                "error": f"{type(exc).__name__}: {exc}"}
-    return provenance
-
-
-class _TeeStream:
-    """Duplicates writes to several streams (real stdout + a log file)."""
-
-    def __init__(self, *streams):
-        self._streams = streams
-
-    def write(self, data):
-        for stream in self._streams:
-            stream.write(data)
-            stream.flush()
-
-    def flush(self):
-        for stream in self._streams:
-            stream.flush()
-
-
-def _tee_stdout_stderr(log_path: str) -> None:
-    """Mirror stdout/stderr into log_path as well as the console.
-
-    A background (nohup) run's console output then lands next to that run's
-    TensorBoard and model output, instead of depending on the caller to
-    redirect into a path that has to be matched back to a run directory
-    later.
-    """
-    log_file = open(log_path, "a", buffering=1)
-    sys.stdout = _TeeStream(sys.stdout, log_file)
-    sys.stderr = _TeeStream(sys.stderr, log_file)
 
 
 def build_envs(
@@ -426,47 +336,6 @@ def train_odd_even(
             vec_env.close()
             eval_vec_env.close()
     return model
-
-
-RUN_STATUS_FILENAME = "run_status.json"
-
-
-def write_run_status(model_save_path: str, *, completed: bool, error,
-                     timesteps: int, total_timesteps: int) -> dict:
-    """Write <model dir>/run_status.json and return its contents.
-
-    "completed" means learn() returned. Anything else -- an exception, a
-    KeyboardInterrupt, a SIGTERM-driven SystemExit -- is "failed", with the
-    exception recorded, so no reader has to infer from stdout.log whether
-    the sibling <encoder>_agent.zip is a result or a crash artefact.
-    """
-    status = {
-        "status": "completed" if completed else "failed",
-        "timesteps": int(timesteps),
-        "total_timesteps": int(total_timesteps),
-        "error": None if error is None else f"{type(error).__name__}: {error}",
-        "finished_at": datetime.now().isoformat(timespec="seconds"),
-    }
-    model_dir = os.path.dirname(model_save_path)
-    path = os.path.join(model_dir, RUN_STATUS_FILENAME) if model_dir else RUN_STATUS_FILENAME
-    with open(path, "w") as handle:
-        json.dump(status, handle, indent=2)
-    return status
-
-
-def read_run_status(model_path: str) -> dict | None:
-    """run_status.json for a saved agent, or None if the run predates it.
-
-    Looks beside the model and one directory up, so best_model/best_model.zip
-    and checkpoints/*.zip resolve to the run's status as well.
-    """
-    here = Path(model_path).resolve().parent
-    for directory in (here, here.parent):
-        candidate = directory / RUN_STATUS_FILENAME
-        if candidate.exists():
-            with open(candidate) as handle:
-                return json.load(handle)
-    return None
 
 
 def add_common_arguments(parser, encoder: str) -> None:

@@ -69,6 +69,7 @@ import _sibling  # noqa: E402
 variants = _sibling.load("variants")
 make_odd_even_belief_env = _sibling.load(
     "odd_even_belief_env").make_odd_even_belief_env
+from set_transformer.rl.run_records import git_provenance as _git_provenance  # noqa: E402
 
 #: Steps below this still carry a genuinely BROAD belief. Measured at n=50:
 #: the share of snapshots with effective sample size above 3 (of 50) is 0.90,
@@ -82,53 +83,6 @@ EARLY_STEP = 3
 #: measured in domain_mds/oddeven.md. The transient/steady boundary everywhere
 #: in this pipeline, and the default rebalancing boundary here.
 COLLAPSE_STEP = 21
-
-
-def _git_provenance() -> dict:
-    """Record WHICH CODE produced this dataset (PITFALLS.md section 6).
-
-    Two datasets with byte-identical CLI args can come from different code,
-    and both submodules here are routinely dirty, so HEAD alone does not
-    identify a build. The SHA-256 of `git diff HEAD` gives an uncommitted
-    tree a stable identity: equal (head, diff_sha256) means the same code.
-    The porcelain lines are kept as a human-readable hint of WHICH files
-    were dirty.
-
-    Never raises. A missing git or a stripped checkout records an error
-    string rather than killing a long collection.
-    """
-    repos = {
-        "set_transformer": Path(__file__).resolve().parents[2],
-        "pomdp-domains": Path(__file__).resolve().parents[3] / "pomdp-domains",
-    }
-
-    def _git(repo: Path, *args: str) -> str:
-        return subprocess.run(
-            ("git", "-C", str(repo)) + args,
-            capture_output=True, text=True, check=True, timeout=15,
-        ).stdout
-
-    provenance = {}
-    for name, repo in repos.items():
-        try:
-            head = _git(repo, "rev-parse", "HEAD").strip()
-            status = [line for line in
-                      _git(repo, "status", "--porcelain").splitlines() if line]
-            diff = _git(repo, "diff", "HEAD")
-            provenance[name] = {
-                "path": str(repo),
-                "head": head,
-                "dirty": bool(status),
-                # Tracked modifications only; untracked content is not in
-                # `git diff HEAD`, which is why the status lines are kept.
-                "diff_sha256": (hashlib.sha256(diff.encode()).hexdigest()
-                                if diff else None),
-                "status": status,
-            }
-        except Exception as exc:  # noqa: BLE001 - provenance never aborts a run
-            provenance[name] = {"path": str(repo),
-                                "error": f"{type(exc).__name__}: {exc}"}
-    return provenance
 
 
 def _effective_sample_size(weights: np.ndarray) -> np.ndarray:

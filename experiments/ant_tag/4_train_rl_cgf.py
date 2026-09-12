@@ -90,86 +90,27 @@ from set_transformer.rl.domains.ant_tag import (  # noqa: E402
     make_ant_tag_cgf_env,
 )
 
+# Run bookkeeping and the schedule parsers live in the package since 2026-09-12 (change 1d);
+# imported back under the names this script has always exposed, because the other arms and
+# the tests read (and monkeypatch) them off this module.
+from set_transformer.rl.curriculum import (  # noqa: E402
+    parse_curriculum as _parse_curriculum,
+    parse_reward_schedule as _parse_reward_schedule,
+)
+from set_transformer.rl.run_records import (  # noqa: E402
+    TeeStream as _TeeStream,
+    default_run_dir as _shared_default_run_dir,
+    git_provenance as _git_provenance,
+    tee_stdout_stderr as _tee_stdout_stderr,
+    write_run_config as _write_run_config,
+)
+
 
 def _default_run_dir(seed: int, run_subdir: str = "ant_tag_cgf",
                       run_tag: str | None = None) -> str:
-    """runs/<run_subdir>/<timestamp>_seed<seed>[_<run_tag>]/, so parallel runs
-    with different seeds (and different env variants, via run_subdir) land in
-    distinct, sortable, self-describing folders instead of overwriting a
-    fixed sb3_ant_tag_cgf_logs/ path.
-
-    run_tag is a free-form human label (e.g. "6M_vis0.2-0.5") for eyeballing
-    `ls runs/<run_subdir>/` without opening any files. It is NOT the source
-    of truth for what a run actually used — that's runs/<run_subdir>/<...>/
-    run_config.json, written alongside it with every CLI arg."""
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    suffix = f"_{re.sub(r'[^A-Za-z0-9._-]', '_', run_tag)}" if run_tag else ""
-    return os.path.join("runs", run_subdir, f"{timestamp}_seed{seed}{suffix}")
-
-
-def _write_run_config(run_dir: str, **config) -> None:
-    """Dump every CLI arg for this run to run_dir/run_config.json — the
-    unambiguous source of truth for what a run used (total_timesteps,
-    curriculum/reward/evasion schedules, env_id, etc.), since the run_tag in
-    the directory name is just a human-readable hint, not a full record."""
-    os.makedirs(run_dir, exist_ok=True)
-    path = os.path.join(run_dir, "run_config.json")
-    with open(path, "w") as f:
-        json.dump(config, f, indent=2, default=str, sort_keys=True)
-    print(f"Run config saved to {path}")
-
-
-def _git_provenance() -> dict:
-    """Record WHICH CODE produced this run, for run_config.json.
-
-    run_config.json pins every hyperparameter but not the source that read
-    them, and that gap has already bitten this project: the
-    ant_tag_cgf_cdens_terminal runs of 2026-08-26 finished at 17:30, and
-    4_train_rl_cgf.py gained deterministic per-episode PF seeding at 18:39.
-    Their run_config.json is byte-identical either side of that change, so
-    nothing on disk says which behavior those checkpoints were trained with.
-
-    HEAD alone would not close it — both submodules are routinely dirty — so
-    the SHA-256 of `git diff HEAD` gives an uncommitted working tree a stable
-    identity. Equal (head, diff_sha256) means the same code; a different
-    diff_sha256 means something moved between two runs, even when both say
-    "dirty". The porcelain status lines are kept as a human-readable hint of
-    WHICH files were dirty.
-
-    Never raises: a missing git, a detached worktree or a stripped checkout
-    records an "error" string rather than killing a multi-hour training run.
-    """
-    repos = {
-        "set_transformer": Path(__file__).resolve().parents[2],
-        "pomdp-domains": Path(__file__).resolve().parents[3] / "pomdp-domains",
-    }
-
-    def _git(repo: Path, *args: str) -> str:
-        return subprocess.run(
-            ("git", "-C", str(repo)) + args,
-            capture_output=True, text=True, check=True, timeout=15,
-        ).stdout
-
-    provenance = {}
-    for name, repo in repos.items():
-        try:
-            head = _git(repo, "rev-parse", "HEAD").strip()
-            status = [line for line in
-                      _git(repo, "status", "--porcelain").splitlines() if line]
-            diff = _git(repo, "diff", "HEAD")
-            provenance[name] = {
-                "path": str(repo),
-                "head": head,
-                "dirty": bool(status),
-                # Tracked-file modifications only; untracked content is not in
-                # `git diff HEAD`, which is why the status lines are kept too.
-                "diff_sha256": (hashlib.sha256(diff.encode()).hexdigest()
-                                if diff else None),
-                "status": status,
-            }
-        except Exception as exc:  # noqa: BLE001 - provenance must never abort a run
-            provenance[name] = {"path": str(repo), "error": f"{type(exc).__name__}: {exc}"}
-    return provenance
+    """run_records.default_run_dir with this script's historical default subfolder
+    (train_ant_tag_cgf calls it with only a seed when no --log_dir is given)."""
+    return _shared_default_run_dir(seed, run_subdir, run_tag)
 
 
 def train_ant_tag_cgf(
@@ -423,29 +364,6 @@ def train_ant_tag_cgf(
         eval_vec_env.close()
 
 
-def _parse_curriculum(curriculum: str) -> list[tuple[float, float]]:
-    schedule = []
-    for pair in curriculum.split(","):
-        frac, radius = pair.strip().split(":")
-        schedule.append((float(frac), float(radius)))
-    return schedule
-
-
-def _parse_reward_schedule(reward_schedule: str) -> list[tuple[float, ...]]:
-    schedule = []
-    for entry in reward_schedule.split(","):
-        parts = [float(part) for part in entry.strip().split(":")]
-        # frac:distance:entropy[:tag_bonus[:spread_gain]] -- missing trailing
-        # fields are 0, so every pre-2026-09-08 schedule keeps its meaning.
-        if len(parts) in (3, 4):
-            parts.extend([0.0] * (5 - len(parts)))
-        if len(parts) != 5:
-            raise ValueError("Each reward schedule entry must have 3 to 5 values: "
-                             "frac:distance:entropy[:tag_bonus[:spread_gain]]")
-        schedule.append(tuple(parts))
-    return schedule
-
-
 def _resolve_reward_shaping(parser, args) -> None:
     """Reconcile --distance_coeff/--entropy_coeff with --reward_schedule, in place.
 
@@ -486,35 +404,6 @@ def _resolve_reward_shaping(parser, args) -> None:
         distance, entropy = float(first[1]), float(first[2])
     args.distance_coeff = distance
     args.entropy_coeff = entropy
-
-
-class _TeeStream:
-    """Duplicates writes to multiple streams (e.g. the real stdout + a log file)."""
-
-    def __init__(self, *streams):
-        self._streams = streams
-
-    def write(self, data):
-        for stream in self._streams:
-            stream.write(data)
-            stream.flush()
-
-    def flush(self):
-        for stream in self._streams:
-            stream.flush()
-
-
-def _tee_stdout_stderr(log_path: str) -> None:
-    """Mirror stdout/stderr into log_path, in addition to the console.
-
-    Lets a background (nohup) run's console output land in a log file that
-    lives next to that same run's TensorBoard/model output (both under
-    log_dir), instead of depending on the caller to redirect stdout by hand
-    into a path that has to be matched back up to a run directory later.
-    """
-    log_file = open(log_path, "a", buffering=1)
-    sys.stdout = _TeeStream(sys.stdout, log_file)
-    sys.stderr = _TeeStream(sys.stderr, log_file)
 
 
 #: Ant-Tag particles are the target's (x, y): 2-D by construction of every

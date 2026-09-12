@@ -98,6 +98,17 @@ _make_vec_env_from_fns = _train_rl_cgf._make_vec_env_from_fns
 AntTagParticleFilter = _train_rl_cgf.AntTagParticleFilter
 _tee_stdout_stderr = _train_rl_cgf._tee_stdout_stderr
 _git_provenance = _train_rl_cgf._git_provenance
+_write_run_config = _train_rl_cgf._write_run_config
+_parse_curriculum = _train_rl_cgf._parse_curriculum
+_parse_reward_schedule = _train_rl_cgf._parse_reward_schedule
+from set_transformer.rl.run_records import default_run_dir as _shared_default_run_dir  # noqa: E402
+
+
+def _default_run_dir(seed: int, run_subdir: str = "ant_tag_st",
+                      run_tag: str | None = None) -> str:
+    """run_records.default_run_dir with this script's historical default subfolder
+    (train_ant_tag_st calls it with only a seed when no --log_dir is given)."""
+    return _shared_default_run_dir(seed, run_subdir, run_tag)
 
 # The Set Transformer encoder and its logging callback now live in the shared
 # package so a second domain can use them without importing an Ant-Tag script.
@@ -109,32 +120,6 @@ from set_transformer.rl.feature_extractors.st import (  # noqa: E402
     STFeatureLoggingCallback,
     SetTransformerFeaturesExtractor,
 )
-
-
-def _default_run_dir(seed: int, run_subdir: str = "ant_tag_st",
-                      run_tag: str | None = None) -> str:
-    """runs/<run_subdir>/<timestamp>_seed<seed>[_<run_tag>]/, so parallel runs
-    with different seeds (and different env variants, via run_subdir) land in
-    distinct, sortable, self-describing folders.
-
-    run_tag is a free-form human label (e.g. "terminal_v1_dist0_noent") for
-    eyeballing `ls runs/<run_subdir>/` without opening any files. It is NOT
-    the source of truth for what a run actually used — that's
-    runs/<run_subdir>/<...>/run_config.json, written alongside it with every
-    CLI arg."""
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    suffix = f"_{re.sub(r'[^A-Za-z0-9._-]', '_', run_tag)}" if run_tag else ""
-    return os.path.join("runs", run_subdir, f"{timestamp}_seed{seed}{suffix}")
-
-
-def _write_run_config(run_dir: str, **config) -> None:
-    """Dump every CLI arg for this run to run_dir/run_config.json — the
-    unambiguous source of truth for what a run used."""
-    os.makedirs(run_dir, exist_ok=True)
-    path = os.path.join(run_dir, "run_config.json")
-    with open(path, "w") as f:
-        json.dump(config, f, indent=2, default=str, sort_keys=True)
-    print(f"Run config saved to {path}")
 
 
 def train_ant_tag_st(
@@ -487,29 +472,6 @@ def _default_resume_vecnormalize(resume_from: str) -> str:
         return os.path.join(d, "vecnormalize.pkl")
     raise ValueError(f"cannot derive the VecNormalize snapshot for {resume_from}; "
                      "pass --resume_vecnormalize")
-
-
-def _parse_curriculum(curriculum: str) -> list[tuple[float, float]]:
-    schedule = []
-    for pair in curriculum.split(","):
-        frac, radius = pair.strip().split(":")
-        schedule.append((float(frac), float(radius)))
-    return schedule
-
-
-def _parse_reward_schedule(reward_schedule: str) -> list[tuple[float, ...]]:
-    schedule = []
-    for entry in reward_schedule.split(","):
-        parts = [float(part) for part in entry.strip().split(":")]
-        # frac:distance:entropy[:tag_bonus[:spread_gain]] -- missing trailing
-        # fields are 0, so every pre-2026-09-08 schedule keeps its meaning.
-        if len(parts) in (3, 4):
-            parts.extend([0.0] * (5 - len(parts)))
-        if len(parts) != 5:
-            raise ValueError("Each reward schedule entry must have 3 to 5 values: "
-                             "frac:distance:entropy[:tag_bonus[:spread_gain]]")
-        schedule.append(tuple(parts))
-    return schedule
 
 
 def main(encoder: str = "st"):
