@@ -23,11 +23,15 @@ Wrappers, curriculum, PF glue
   PFRewardShapingWrapper        dense shaping from the PF belief (distance, weight entropy,
                                 tag bonus, spread gain); coefficients settable mid-run
   CurriculumVisibilityWrapper   visibility radius and evasion scale settable mid-run
-  CurriculumCallback            SB3 callback: interpolates the visibility, reward and evasion
-                                schedules over training progress and pushes the values into
-                                every worker (DummyVecEnv directly, SubprocVecEnv via env_method)
-  _CurriculumRouter             outermost wrapper exposing the three setters to env_method
-  _set_*_recursive              walk a wrapper stack and set one thing
+  ANT_TAG_SCHEDULES             the three annealed quantities (visibility radius, four reward
+                                coefficients, evasion scale) as rl/curriculum.Schedule
+                                descriptions: setter name, values per waypoint, script default
+  CurriculumCallback            adapter with the historical three-schedule signature over
+                                rl/curriculum.ScheduleCallback (goes with the scripts, change 5)
+  _CurriculumRouter             rl/curriculum.ScheduleRouter over the three setters, so
+                                SubprocVecEnv.env_method reaches the inner wrappers
+  _set_*_recursive              older per-wrapper setters, no longer called (kept for the
+                                forwarding file until change 5)
   get_ant_tag_pf_kwargs         AntTagParticleFilter constructor kwargs read off the live env
   ant_tag_pf_interaction_mapper bridge from one step's observation and env state to the
                                 filter's predict / update kwargs (visibility, evasion, target
@@ -54,7 +58,7 @@ and the child's import of it registers the envs there too.
 """
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import gymnasium as gym
 import numpy as np
@@ -63,6 +67,7 @@ from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize
 
 import pdomains  # noqa: F401 - registers the pdomains-ant-tag-* envs
+from set_transformer.rl.curriculum import Schedule, ScheduleCallback, ScheduleRouter, interpolate
 from set_transformer.rl.particle_filters.ant_tag import (
     AntTagParticleFilter,
     CounterweightedDenAntTagParticleFilter,
@@ -392,6 +397,26 @@ def print_variants() -> None:
 # ---------------------------------------------------------------------------
 
 
+#: The three quantities the Ant-Tag curriculum anneals (change 3, 2026-09-12): where each
+#: goes (the setter on the wrapper below), how many values a waypoint carries, the status-line
+#: labels, and the historical SCRIPT default (a variant's own defaults, `Variant.default_*`,
+#: take precedence over these; the CLI over both). rl/curriculum.ScheduleCallback runs them;
+#: the shared trainer (change 4) reads this tuple to build the callback and the CLI flags.
+ANT_TAG_SCHEDULES = (
+    Schedule("visibility", target="set_curriculum_radius", n_values=1,
+             waypoints=((0.0, 100.0), (0.3, 100.0), (0.7, 3.0), (1.0, 3.0)),
+             labels=(("vis_radius", ".2f"),)),
+    Schedule("reward", target="set_reward_coeffs", n_values=4,
+             waypoints=((0.0, 1.0, 0.0, 0.0), (0.3, 1.0, 0.0, 0.0),
+                        (0.7, 0.0, 0.0, 50.0), (1.0, 0.0, 0.0, 50.0)),
+             labels=(("dist_coeff", ".3f"), ("ent_coeff", ".3f"),
+                     ("tag_bonus", ".1f"), ("gain_coeff", ".2f"))),
+    Schedule("evasion", target="set_evasion_scale", n_values=1,
+             waypoints=((0.0, 1.0), (1.0, 1.0)),
+             labels=(("evasion_scale", ".2f"),)),
+)
+
+
 class PFRewardShapingWrapper(gym.Wrapper):
     """
     Dense reward shaping using the particle filter belief state.
@@ -583,7 +608,7 @@ class CurriculumVisibilityWrapper(gym.Wrapper):
         return self._apply_curriculum_visibility(obs), reward, terminated, truncated, info
 
 
-class CurriculumCallback(BaseCallback):
+class CurriculumCallback(ScheduleCallback):
     """
     SB3 callback that anneals visibility_radius and reward coefficients.
 
@@ -593,13 +618,21 @@ class CurriculumCallback(BaseCallback):
 
     Default visibility schedule:
       - 0-30%: radius=100 (fully observed)
-      - 30-70%: linear decrease 100 → 3.0
+      - 30-70%: linear decrease 100 -> 3.0
       - 70-100%: radius=3.0 (real POMDP)
 
     Default reward schedule (frac, distance_coeff, entropy_coeff, tag_bonus):
       - 0-30%: distance=1.0, entropy=0.0, tag=0 (pure distance while fully visible)
-      - 30-70%: distance 1.0→0.0, entropy 0→0, tag 0→50 (phase in tag bonus)
+      - 30-70%: distance 1.0->0.0, entropy 0->0, tag 0->50 (phase in tag bonus)
       - 70-100%: distance=0.0, entropy=0.0, tag=50 (sparse tag reward at real POMDP)
+
+    Since change 3 (2026-09-12) this is an ADAPTER: the historical three-schedule signature
+    and defaults (ANT_TAG_SCHEDULES) over rl/curriculum.ScheduleCallback, which does the
+    interpolation, the pushing and the status line for any domain. The four Ant-Tag scripts
+    and several tests construct it this way; the shared trainer (change 4) builds
+    ScheduleCallback from ANT_TAG_SCHEDULES directly, after which this class goes (change 5).
+    `schedule` / `reward_schedule` / `evasion_schedule` / `_interpolate_schedule` are kept
+    because tests read them.
     """
 
     def __init__(
@@ -610,95 +643,34 @@ class CurriculumCallback(BaseCallback):
         evasion_schedule: list[tuple[float, float]] | None = None,
         verbose: int = 0,
     ):
-        super().__init__(verbose)
-        self.total_timesteps = total_timesteps
+        by_name = {s.name: s for s in ANT_TAG_SCHEDULES}
         if schedule is None:
-            schedule = [(0.0, 100.0), (0.3, 100.0), (0.7, 3.0), (1.0, 3.0)]
+            schedule = list(by_name["visibility"].waypoints)
         self.schedule = sorted(schedule, key=lambda x: x[0])
-
         if reward_schedule is None:
-            reward_schedule = [
-                (0.0, 1.0, 0.0, 0.0),
-                (0.3, 1.0, 0.0, 0.0),
-                (0.7, 0.0, 0.0, 50.0),
-                (1.0, 0.0, 0.0, 50.0),
-            ]
+            reward_schedule = list(by_name["reward"].waypoints)
         self.reward_schedule = sorted(reward_schedule, key=lambda x: x[0])
-
         # Constant scale=1.0 (full smart-target strength throughout) is a
         # no-op that matches SmartAntTagEnv's own default, so omitting this
         # arg preserves today's behavior exactly. Only meaningful for the
         # smart target env; harmlessly ignored by the base AntTagEnv.
         if evasion_schedule is None:
-            evasion_schedule = [(0.0, 1.0), (1.0, 1.0)]
+            evasion_schedule = list(by_name["evasion"].waypoints)
         self.evasion_schedule = sorted(evasion_schedule, key=lambda x: x[0])
+        super().__init__(total_timesteps, (
+            replace(by_name["visibility"], waypoints=tuple(self.schedule)),
+            replace(by_name["reward"], waypoints=tuple(self.reward_schedule)),
+            replace(by_name["evasion"], waypoints=tuple(self.evasion_schedule)),
+        ), verbose=verbose)
 
     def _interpolate_schedule(self, schedule, progress: float):
         """Linearly interpolate a schedule. Returns all values after the fraction."""
-        if progress <= schedule[0][0]:
-            return schedule[0][1:]
-        if progress >= schedule[-1][0]:
-            return schedule[-1][1:]
-        for i in range(len(schedule) - 1):
-            frac_lo = schedule[i][0]
-            frac_hi = schedule[i + 1][0]
-            if frac_lo <= progress <= frac_hi:
-                t = (progress - frac_lo) / (frac_hi - frac_lo) if frac_hi > frac_lo else 1.0
-                vals_lo = schedule[i][1:]
-                vals_hi = schedule[i + 1][1:]
-                return tuple(lo + t * (hi - lo) for lo, hi in zip(vals_lo, vals_hi))
-        return schedule[-1][1:]
-
-    def _on_training_start(self) -> None:
-        # Apply the schedule at the CURRENT progress before the first env step.
-        # For a fresh run progress is 0 and this repeats the constructor's
-        # values; for a run resumed from a mid-run checkpoint (4_train_rl_st.py
-        # --resume_from, 2026-09-08) the envs were just built with the
-        # progress-0 radius and coefficients, and without this the first
-        # n_envs steps of the fork would be rewarded under the wrong schedule.
-        self._apply(self.num_timesteps / self.total_timesteps, announce=True)
-
-    def _on_step(self) -> bool:
-        self._apply(self.num_timesteps / self.total_timesteps)
-        return True
-
-    def _apply(self, progress: float, announce: bool = False) -> None:
-        (radius,) = self._interpolate_schedule(self.schedule, progress)
-        reward_vals = self._interpolate_schedule(self.reward_schedule, progress)
-        dist_coeff, ent_coeff = reward_vals[0], reward_vals[1]
-        tag_bonus_coeff = reward_vals[2] if len(reward_vals) > 2 else 0.0
-        gain_coeff = reward_vals[3] if len(reward_vals) > 3 else 0.0
-        (evasion_scale,) = self._interpolate_schedule(self.evasion_schedule, progress)
-
-        # Update all training envs (works through VecNormalize → SubprocVecEnv)
-        vec_env = self.training_env
-        # Unwrap VecNormalize if present
-        while hasattr(vec_env, "venv"):
-            vec_env = vec_env.venv
-
-        # For both SubprocVecEnv and DummyVecEnv, walk wrapper stacks
-        if hasattr(vec_env, "envs"):
-            # DummyVecEnv — direct access
-            for env in vec_env.envs:
-                _set_radius_recursive(env, radius)
-                _set_reward_coeffs_recursive(env, dist_coeff, ent_coeff, tag_bonus_coeff, gain_coeff)
-                _set_evasion_scale_recursive(env, evasion_scale)
-        elif hasattr(vec_env, "env_method"):
-            # SubprocVecEnv — call into subprocesses
-            vec_env.env_method("set_curriculum_radius", radius)
-            vec_env.env_method("set_reward_coeffs", dist_coeff, ent_coeff, tag_bonus_coeff, gain_coeff)
-            vec_env.env_method("set_evasion_scale", evasion_scale)
-
-        if self.verbose > 0 and (announce or self.num_timesteps % 10000 < (self.training_env.num_envs if self.training_env else 1)):
-            print(
-                f"[Curriculum] step={self.num_timesteps}, progress={progress:.2f}, "
-                f"vis_radius={radius:.2f}, dist_coeff={dist_coeff:.3f}, "
-                f"ent_coeff={ent_coeff:.3f}, tag_bonus={tag_bonus_coeff:.1f}, "
-                f"gain_coeff={gain_coeff:.2f}, evasion_scale={evasion_scale:.2f}"
-                + (" (applied at training start)" if announce else "")
-            )
+        return interpolate(schedule, progress)
 
 
+#: The three per-wrapper setters below predate ScheduleRouter and are no longer called by
+#: the package (the router now finds the setter by name); kept for the forwarding file
+#: `experiments/ant_tag/4_train_rl_frozen.py`, which re-exports them, until change 5.
 def _set_radius_recursive(env, radius: float):
     """Walk the wrapper stack and set visibility_radius on CurriculumVisibilityWrapper."""
     e = env
@@ -730,19 +702,18 @@ def _set_reward_coeffs_recursive(env, distance_coeff: float, entropy_coeff: floa
         e = getattr(e, "env", None)
 
 
-class _CurriculumRouter(gym.Wrapper):
-    """Thin outermost wrapper so SubprocVecEnv.env_method can reach inner wrappers."""
+class _CurriculumRouter(ScheduleRouter):
+    """Thin outermost wrapper so SubprocVecEnv.env_method can reach inner wrappers.
 
-    def set_curriculum_radius(self, radius: float):
-        _set_radius_recursive(self.env, radius)
+    Since change 3 (2026-09-12) a rl/curriculum.ScheduleRouter over the three Ant-Tag
+    setters (the targets of ANT_TAG_SCHEDULES): `set_curriculum_radius`,
+    `set_reward_coeffs`, `set_evasion_scale` each reach the first wrapper below that has
+    them. Kept under this name, constructed as before with the env only, for the factory,
+    the eval / render scripts and the tests.
+    """
 
-    def set_reward_coeffs(self, distance_coeff: float, entropy_coeff: float,
-                          tag_bonus_coeff: float, gain_coeff: float | None = None):
-        _set_reward_coeffs_recursive(self.env, distance_coeff, entropy_coeff,
-                                     tag_bonus_coeff, gain_coeff)
-
-    def set_evasion_scale(self, scale: float):
-        _set_evasion_scale_recursive(self.env, scale)
+    def __init__(self, env: gym.Env):
+        super().__init__(env, targets=tuple(s.target for s in ANT_TAG_SCHEDULES))
 
 
 # ---------------------------------------------------------------------------
