@@ -1,7 +1,6 @@
 from set_transformer.rl.wrappers.particle_filter import (
     PFDictObservationWrapper,
     PFDictWithWeightsObservationWrapper,
-    PFPlusFeaturesObservationWrapper,
 )
 from set_transformer.rl.wrappers.shaping import (
     PotentialBasedShapingWrapper,
@@ -12,7 +11,6 @@ from set_transformer.rl.wrappers.shaping import (
 __all__ = [
     "PFDictObservationWrapper",
     "PFDictWithWeightsObservationWrapper",
-    "PFPlusFeaturesObservationWrapper",
     "PotentialBasedShapingWrapper",
     "pf_belief_expected_distance_potential",
     "find_particle_filter",

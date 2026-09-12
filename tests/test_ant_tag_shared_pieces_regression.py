@@ -92,7 +92,8 @@ def _sys_path(*directories):
 #: digit, so `import` cannot spell them and importlib is required
 #: (PITFALLS.md section 7).
 _MODULE_NAMES = ("variants", "4_train_rl_frozen", "4_train_rl_cgf",
-                 "4_train_rl_st", "4_train_rl_gaussian")
+                 "4_train_rl_st", "4_train_rl_gaussian", "4_train_rl_pool",
+                 "4_train_rl_deepset", "4_train_rl_pointnet", "4_train_rl_kmoments")
 
 
 @pytest.fixture(scope="module")
@@ -187,6 +188,22 @@ _REQUIRED_SURFACE = {
         "make_ant_tag_belief_env",
         "train_ant_tag_gaussian",
     ),
+    # The pooling arms (2026-09-11): one trainer, three two-line entry scripts
+    # that re-export their extractor by name like the other arms.
+    "4_train_rl_pool": (
+        "ENCODERS",
+        "PFDictWithWeightsObservationWrapper",
+        "PointNetFeaturesExtractor",
+        "WeightedDeepSetFeaturesExtractor",
+        "WeightedKMomentsFeaturesExtractor",
+        "build_extractor_kwargs",
+        "main",
+        "make_ant_tag_belief_env",
+        "train_ant_tag_pool",
+    ),
+    "4_train_rl_deepset": ("WeightedDeepSetFeaturesExtractor", "main", "train_ant_tag_pool"),
+    "4_train_rl_pointnet": ("PointNetFeaturesExtractor", "main", "train_ant_tag_pool"),
+    "4_train_rl_kmoments": ("WeightedKMomentsFeaturesExtractor", "main", "train_ant_tag_pool"),
     "variants": (
         "EVADING",
         "VARIANTS",

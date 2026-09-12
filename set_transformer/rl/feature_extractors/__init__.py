@@ -1,7 +1,3 @@
-from set_transformer.rl.feature_extractors.pretrained import (
-    PretrainedSetTransformerProcessor,
-)
-from set_transformer.rl.feature_extractors.e2e import CustomSetTransformerExtractor
 from set_transformer.rl.feature_extractors.statistical import (
     CGFExtractor,
     GaussianExtractor,
@@ -30,10 +26,14 @@ from set_transformer.rl.feature_extractors.st import (
     STFeatureLoggingCallback,
     SetTransformerFeaturesExtractor,
 )
+from set_transformer.rl.feature_extractors.pooled import (
+    PointNetFeaturesExtractor,
+    WeightedDeepSetFeaturesExtractor,
+    WeightedKMomentsFeaturesExtractor,
+    reload_pretrained_pooled,
+)
 
 __all__ = [
-    "PretrainedSetTransformerProcessor",
-    "CustomSetTransformerExtractor",
     "GaussianExtractor",
     "KMomentsExtractor",
     "CGFExtractor",
@@ -45,4 +45,8 @@ __all__ = [
     "TNormLoggingCallback",
     "WeightedCGFFeaturesExtractor",
     "WeightedGaussianFeaturesExtractor",
+    "WeightedDeepSetFeaturesExtractor",
+    "PointNetFeaturesExtractor",
+    "WeightedKMomentsFeaturesExtractor",
+    "reload_pretrained_pooled",
 ]
