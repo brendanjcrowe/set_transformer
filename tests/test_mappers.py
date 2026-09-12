@@ -2,12 +2,18 @@
 
 The Ant-Tag mapper is pure numpy (no MuJoCo needed); the env-derived PF kwargs are
 checked against a stub env, plus a MuJoCo-gated check against the real Ant-Tag.
+
+2026-09-12: the functions under test are the ones the Ant-Tag arm scripts use
+(``set_transformer.rl.domains.ant_tag``); the stripped copy in ``rl/mappers.py`` was
+retired. The arm version also reads ``tag_radius`` off the env and forwards the live
+visibility radius (and the evasion / target-speed / den knobs when the env has them), so
+the mapper is called with the env and the kwargs carry one more key.
 """
 
 import numpy as np
 import pytest
 
-from set_transformer.rl.mappers import (
+from set_transformer.rl.domains.ant_tag import (
     ant_tag_pf_interaction_mapper,
     get_ant_tag_pf_kwargs,
 )
@@ -30,6 +36,7 @@ def test_predict_uses_previous_ant_position_update_uses_current():
     args = ant_tag_pf_interaction_mapper(
         base_env_obs=current,
         base_env_info={},
+        unwrapped_env=_StubAntTagEnv(),
         previous_base_env_obs=previous,
     )
 
@@ -40,21 +47,24 @@ def test_predict_uses_previous_ant_position_update_uses_current():
 
 def test_first_step_falls_back_to_current_position():
     current = _obs([1.5, 2.5], [3.0, 4.0])
-    args = ant_tag_pf_interaction_mapper(base_env_obs=current, base_env_info={})
+    args = ant_tag_pf_interaction_mapper(base_env_obs=current, base_env_info={},
+                                         unwrapped_env=_StubAntTagEnv())
     assert args["predict_args"]["ant_current_pos_from_obs"] == pytest.approx([1.5, 2.5])
 
 
 def test_zero_target_reads_as_not_visible():
     # The env zeros obs[-2:] when the target is out of visual range.
     args = ant_tag_pf_interaction_mapper(
-        base_env_obs=_obs([1.0, 1.0], [0.0, 0.0]), base_env_info={}
+        base_env_obs=_obs([1.0, 1.0], [0.0, 0.0]), base_env_info={},
+        unwrapped_env=_StubAntTagEnv(),
     )
     assert np.all(np.isnan(args["update_args"]["observed_target_pos"]))
 
 
 def test_mapper_does_not_alias_the_observation():
     current = _obs([1.5, 2.5], [3.0, 4.0])
-    args = ant_tag_pf_interaction_mapper(base_env_obs=current, base_env_info={})
+    args = ant_tag_pf_interaction_mapper(base_env_obs=current, base_env_info={},
+                                         unwrapped_env=_StubAntTagEnv())
     current[:2] = 99.0
     assert args["update_args"]["ant_current_pos_from_obs"] == pytest.approx([1.5, 2.5])
 
@@ -65,6 +75,7 @@ class _StubAntTagEnv:
     target_step = 0.25
     visible_radius = 2.0
     min_distance = 4.0
+    tag_radius = 1.0
 
     @property
     def unwrapped(self):
@@ -78,6 +89,7 @@ def test_pf_kwargs_read_off_the_env():
         "target_step": 0.25,
         "visibility_radius": 2.0,
         "min_initial_distance": 4.0,
+        "tag_radius": 1.0,
     }
 
 
@@ -107,6 +119,7 @@ def test_registry_ant_tag_pf_kwargs_match_the_live_env():
         assert kwargs["target_step"] == u.target_step
         assert kwargs["visibility_radius"] == u.visible_radius
         assert kwargs["min_initial_distance"] == u.min_distance
+        assert kwargs["tag_radius"] == u.tag_radius
     finally:
         env.close()
 

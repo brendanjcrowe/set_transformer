@@ -21,7 +21,7 @@ from set_transformer.rl.feature_extractors import (
     PointNetExtractor,
     SetTransformerExtractor,
 )
-from set_transformer.rl.mappers import (
+from set_transformer.rl.domains.ant_tag import (
     ant_tag_pf_interaction_mapper,
     get_ant_tag_pf_kwargs,
 )
