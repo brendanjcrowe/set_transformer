@@ -104,56 +104,12 @@ OddEvenSTFeatureSentinel = _sibling.load(
     "st_feature_sentinel").OddEvenSTFeatureSentinel
 
 
-def reload_pretrained_encoder(model, path: str, frozen: bool,
-                              verify: bool = True) -> None:
-    """Reload the pretrained encoder AFTER PPO construction, and verify it.
-
-    See this module's docstring and PITFALLS.md section 1. Three steps, all
-    required:
-
-    1. Reload. The extractor's own __init__ already loaded these weights and
-       SB3's _build then overwrote them with orthogonal-init noise. Nothing
-       re-initializes the policy after this point.
-    2. Re-freeze. requires_grad does survive apply(), but re-setting it keeps
-       the freeze and the load in one place.
-    3. Verify max|delta| == 0 against the checkpoint. Without this the two
-       states -- correctly loaded, and frozen noise -- are indistinguishable
-       in the logs, which is exactly how two 6M-step runs were lost.
-    """
-    extractor = model.policy.features_extractor
-    extractor._load_pretrained_encoder(path, extractor.dim_input)
-    if frozen:
-        extractor.encoder.eval()
-        for param in extractor.encoder.parameters():
-            param.requires_grad_(False)
-    print("SetTransformerFeaturesExtractor: encoder RE-loaded after PPO "
-          "construction (SB3 init_weights would otherwise overwrite it)"
-          + (" and re-frozen" if frozen else ""))
-
-    # SAC-style policies build critics that may hold their own extractor.
-    # PPO does not, but the loop costs nothing and the omission would be
-    # silent.
-    for attr in ("actor", "critic", "critic_target"):
-        module = getattr(model.policy, attr, None)
-        other = getattr(module, "features_extractor", None)
-        if other is not None and other is not extractor:
-            other._load_pretrained_encoder(path, other.dim_input)
-            if frozen:
-                other.encoder.eval()
-                for param in other.encoder.parameters():
-                    param.requires_grad_(False)
-
-    if verify:
-        assert_encoder_matches_checkpoint(model, path)
-
-    # The pretrained path has done its job. Leaving it in policy_kwargs would
-    # bake an ABSOLUTE path to the pretraining checkpoint into every saved
-    # policy, and SB3 re-runs the extractor constructor on load -- so
-    # evaluating the trained agent would die with FileNotFoundError once the
-    # pretraining directory moved, even though the trained weights are in the
-    # zip (PITFALLS.md section 7).
-    model.policy_kwargs["features_extractor_kwargs"][
-        "pretrained_st_model_path"] = None
+# Since change 2 of the harness centralisation (2026-09-12) the reload-after-PPO step is
+# the shared set_transformer.rl.pretrained_encoder.reload_pretrained: reload every extractor
+# on the policy, re-freeze, ASSERT max|delta| == 0 against the checkpoint, blank the
+# checkpoint path in policy_kwargs (PITFALLS.md sections 1 and 7). Kept under this module's
+# historical name for the tests and the ST-side callers.
+reload_pretrained_encoder = _pretrained.reload_pretrained
 
 
 # The finetune-collapse fixes live in set_transformer/rl/encoder_finetune.py
@@ -198,20 +154,10 @@ def assert_encoder_matches_checkpoint(model, path: str) -> None:
     that the reload landed. The comparison itself lives in
     pretrained_encoder.py, shared with the CGF arm.
     """
-    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
-    state = (checkpoint["model_state_dict"]
-             if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint
-             else checkpoint)
-    prefix = "set_transformer."
-    reference = {key[len(prefix):]: value for key, value in state.items()
-                 if key.startswith(prefix)}
-    if not reference:
-        reference = {key: value for key, value in state.items()
-                     if not key.startswith("decoder.")}
-    live = {key[len("features_extractor.encoder."):]: value
-            for key, value in model.policy.state_dict().items()
-            if key.startswith("features_extractor.encoder.")}
-    _pretrained.verify_matches_checkpoint(reference, live, path, label="ST encoder")
+    extractor = model.policy.features_extractor
+    _pretrained.verify_matches_checkpoint(extractor.reference_state(path),
+                                          extractor.encoder_state_dict(), path,
+                                          label="ST encoder")
 
 
 def main() -> None:

@@ -510,6 +510,10 @@ class WeightedCGFFeaturesExtractor(BaseFeaturesExtractor):
     #: Readout output width when none is given: the ST arm's 8 x 8 = 64.
     DEFAULT_READOUT_DIM = 64
 
+    #: Constructor argument carrying the pretraining checkpoint path; blanked in
+    #: policy_kwargs by the shared reload (PITFALLS.md section 7).
+    PRETRAINED_PATH_KWARG = "pretrained_cgf_model_path"
+
     CHECKED_GEOMETRY = ("num_cgf_features", "particle_dim", "feature_mode",
                         "t_param", "t_bound", "t_clamp", "feature_norm",
                         "readout_hidden", "readout_depth", "readout_dim",
@@ -834,6 +838,27 @@ class WeightedCGFFeaturesExtractor(BaseFeaturesExtractor):
                 f"match this run's ({self._cgf_geometry}).\nOriginal error: {exc}"
             ) from exc
         print(f"WeightedCGFFeaturesExtractor: loaded encoder from {path}")
+
+    # -- The shared encoder interface (change 2, 2026-09-12); the contract is spelled out in
+    # -- st.py. The whole extractor IS the encoder here (t, norm statistics, readout).
+
+    def encoder_parameters(self) -> list[torch.nn.Parameter]:
+        return list(self.parameters())
+
+    def load_pretrained(self, path: str) -> None:
+        self._load_pretrained_encoder(path)
+
+    def freeze(self) -> None:
+        self.freeze_encoder()
+
+    def encoder_state_dict(self) -> dict:
+        return self.state_dict()
+
+    def reference_state(self, path: str) -> dict:
+        """The checkpoint's whole ``model_state_dict`` (or the bare dict), keyed like
+        ``self.state_dict()``."""
+        from set_transformer.rl.pretrained_encoder import _cgf_reference_state
+        return _cgf_reference_state(path)
 
     def effective_t(self) -> torch.Tensor:
         """The [T, D] probe matrix the forward pass uses.

@@ -10,8 +10,11 @@ every existing import working.
 from set_transformer.rl.pretrained_encoder import (  # noqa: F401
     _cgf_reference_state,
     max_abs_delta,
+    policy_extractors,
+    reload_pretrained,
     reload_pretrained_cgf,
     verify_matches_checkpoint,
 )
 
-__all__ = ["max_abs_delta", "verify_matches_checkpoint", "reload_pretrained_cgf"]
+__all__ = ["max_abs_delta", "verify_matches_checkpoint", "reload_pretrained",
+           "reload_pretrained_cgf", "policy_extractors"]

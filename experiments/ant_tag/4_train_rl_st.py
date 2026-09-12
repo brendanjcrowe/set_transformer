@@ -77,6 +77,7 @@ from set_transformer.rl.encoder_finetune import (  # noqa: E402 - shared with ex
     EncoderLRLoggingCallback,
     scale_encoder_learning_rate,
 )
+from set_transformer.rl.pretrained_encoder import reload_pretrained  # noqa: E402
 
 
 # Reuse the existing AntTag curriculum/PF/dict-obs utilities. The dict-obs env
@@ -363,36 +364,13 @@ def train_ant_tag_st(
         # policy afterwards. The freeze is re-applied for the same reason --
         # requires_grad survives apply(), but re-setting it keeps the two
         # facts in one place.
-        extractor = model.policy.features_extractor
-        extractor._load_pretrained_encoder(
-            pretrained_st_model_path, extractor.dim_input)
-        if st_frozen:
-            extractor.encoder.eval()
-            for param in extractor.encoder.parameters():
-                param.requires_grad_(False)
-        print("SetTransformerFeaturesExtractor: encoder RE-loaded after PPO "
-              "construction (SB3 init_weights would otherwise overwrite it)"
-              + (" and re-frozen" if st_frozen else ""))
-        # SAC builds critics that may hold their own extractor instance.
-        for attr in ("actor", "critic", "critic_target"):
-            module = getattr(model.policy, attr, None)
-            fe = getattr(module, "features_extractor", None)
-            if fe is not None and fe is not extractor:
-                fe._load_pretrained_encoder(
-                    pretrained_st_model_path, fe.dim_input)
-                if st_frozen:
-                    fe.encoder.eval()
-                    for param in fe.encoder.parameters():
-                        param.requires_grad_(False)
-
-        # The pretrained path has done its job: the encoder is initialized.
-        # Leaving it in policy_kwargs would embed an absolute path to the
-        # pretraining checkpoint in every saved policy, and SB3 re-runs the
-        # extractor constructor on load -- so evaluating the trained agent
-        # would fail with FileNotFoundError once the pretraining directory is
-        # moved or cleaned up, even though the trained weights are in the zip.
-        model.policy_kwargs["features_extractor_kwargs"][
-            "pretrained_st_model_path"] = None
+        # Since change 2 of the harness centralisation (2026-09-12) the shared reload does
+        # the same steps for every learned extractor -- reload every extractor on the
+        # policy (SAC critics may hold their own), re-freeze, blank the checkpoint path in
+        # policy_kwargs so no absolute path is baked into the saved zip -- and ADDS the one
+        # this arm never had: assert max|delta| == 0 against the checkpoint (PITFALLS.md
+        # section 1), the only positive evidence in the logs that the reload landed.
+        reload_pretrained(model, pretrained_st_model_path, st_frozen)
 
     finetune_callbacks = []
     if st_encoder_lr_scale != 1.0:

@@ -79,6 +79,9 @@ class _PooledFeaturesExtractor(BaseFeaturesExtractor):
     ENCODER_CLS: type
     ENCODER_NAME: str
     POOLINGS: tuple[str, ...]
+    #: Constructor argument carrying the pretraining checkpoint path; blanked in
+    #: policy_kwargs by the shared reload (PITFALLS.md section 7).
+    PRETRAINED_PATH_KWARG = "pretrained_model_path"
 
     def __init__(
         self,
@@ -220,6 +223,23 @@ class _PooledFeaturesExtractor(BaseFeaturesExtractor):
                                f"\nOriginal error: {exc}") from exc
         print(f"{type(self).__name__}: loaded encoder from {path}")
 
+    # -- The shared encoder interface (change 2, 2026-09-12); the contract is spelled out in st.py.
+
+    def encoder_parameters(self) -> list[torch.nn.Parameter]:
+        return list(self.encoder.parameters())
+
+    def load_pretrained(self, path: str) -> None:
+        self._load_pretrained_encoder(path)
+
+    def freeze(self) -> None:
+        self.freeze_encoder()
+
+    def encoder_state_dict(self) -> dict:
+        return self.encoder.state_dict()
+
+    def reference_state(self, path: str) -> dict:
+        return self.pretrained_reference_state(path)
+
 
 class WeightedDeepSetFeaturesExtractor(_PooledFeaturesExtractor):
     """DeepSet with a weighted-mean pool (``pooling="weighted"``) or plain mean (``"mean"``)."""
@@ -285,28 +305,11 @@ class WeightedKMomentsFeaturesExtractor(BaseFeaturesExtractor):
 
 
 def reload_pretrained_pooled(model, path: str, frozen: bool, verify: bool = True) -> None:
-    """Post-PPO-construction reload for the pooling arms (PITFALLS.md section 1: SB3's
-    ``init_weights`` overwrites an encoder loaded in ``__init__``). Reloads every
-    features extractor on the policy, re-freezes if asked, and asserts the live encoder
-    equals the checkpoint. Mirrors ``reload_pretrained_cgf``."""
-    from set_transformer.rl.pretrained_encoder import verify_matches_checkpoint
+    """Post-PPO-construction reload for the pooling arms (PITFALLS.md section 1). Since
+    change 2 (2026-09-12) a forwarder to the shared
+    :func:`set_transformer.rl.pretrained_encoder.reload_pretrained`, which does the same four
+    steps for every learned extractor; kept under this name for the pool script and
+    ``feature_extractors.__init__``."""
+    from set_transformer.rl.pretrained_encoder import reload_pretrained
 
-    extractors = [model.policy.features_extractor]
-    for attr in ("actor", "critic", "critic_target"):
-        module = getattr(model.policy, attr, None)
-        other = getattr(module, "features_extractor", None)
-        if other is not None and other is not extractors[0]:
-            extractors.append(other)
-    for extractor in extractors:
-        extractor._load_pretrained_encoder(path)
-        if frozen:
-            extractor.freeze_encoder()
-    name = type(extractors[0]).__name__
-    print(f"{name}: encoder RE-loaded after PPO construction (SB3 init_weights would "
-          "otherwise overwrite it)" + (" and re-frozen" if frozen else ""))
-    if verify:
-        verify_matches_checkpoint(extractors[0].pretrained_reference_state(path),
-                                  extractors[0].encoder.state_dict(), path, label=f"{name} encoder")
-    kwargs = model.policy_kwargs.get("features_extractor_kwargs", {})
-    if "pretrained_model_path" in kwargs:
-        kwargs["pretrained_model_path"] = None      # PITFALLS section 7: no absolute paths in the zip
+    reload_pretrained(model, path, frozen, verify=verify)

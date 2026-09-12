@@ -12,11 +12,15 @@ logs that the reload landed.
 
 Domain-independent, so it lives in the package (moved here from
 ``experiments/odd_even/pretrained_encoder.py`` on 2026-09-10, which now
-re-exports these names). Both domains' ``4_train_rl_st.py`` keep their own
-``reload_pretrained_encoder`` (the ST reference and live dicts need the
-``set_transformer.`` / ``features_extractor.encoder.`` prefix handling) and
-call :func:`verify_matches_checkpoint` here for the comparison; both CGF arms
-use :func:`reload_pretrained_cgf` end to end.
+re-exports these names).
+
+Since change 2 of the harness centralisation (2026-09-12) there is ONE reload,
+:func:`reload_pretrained`, written against the shared encoder interface every learned
+extractor exposes (``load_pretrained``, ``freeze``, ``reference_state``,
+``encoder_state_dict``, ``PRETRAINED_PATH_KWARG``; see ``feature_extractors/st.py``).
+:func:`reload_pretrained_cgf`, ``feature_extractors.pooled.reload_pretrained_pooled`` and
+both ST scripts' ``reload_pretrained_encoder`` forward to it. Before that the step was
+written four times, and the Ant-Tag ST copy never verified.
 """
 
 from __future__ import annotations
@@ -63,34 +67,50 @@ def _cgf_reference_state(path: str) -> dict:
     return loaded["model_state_dict"] if "model_state_dict" in loaded else loaded
 
 
-def reload_pretrained_cgf(model, path: str, frozen: bool, verify: bool = True) -> None:
-    """The CGF arm's post-construction reload. Mirrors the ST arm's steps.
-
-    The extractor IS the encoder (t, norm statistics, readout), so the
-    reference is the checkpoint's whole ``model_state_dict`` and the live
-    side is the extractor's whole ``state_dict``. ``frozen`` calls
-    ``freeze_encoder()``, which also pins the module in eval mode so the
-    running norm stops updating.
-    """
+def policy_extractors(model) -> list:
+    """Every features extractor on the policy: the shared one first, then any an actor /
+    critic / critic_target holds of its own (SAC-style policies build those; PPO has one)."""
     extractors = [model.policy.features_extractor]
     for attr in ("actor", "critic", "critic_target"):
         module = getattr(model.policy, attr, None)
         other = getattr(module, "features_extractor", None)
         if other is not None and other is not extractors[0]:
             extractors.append(other)
+    return extractors
+
+
+def reload_pretrained(model, path: str, frozen: bool, verify: bool = True) -> None:
+    """The one post-construction reload, for every learned extractor (change 2, 2026-09-12).
+
+    Four steps, all required (PITFALLS.md sections 1 and 7): reload every extractor on the
+    policy from ``path``; re-freeze if ``frozen``; ASSERT the live encoder equals the
+    checkpoint (max|delta| == 0 -- the only positive evidence in the logs that the reload
+    landed); blank the checkpoint path in ``policy_kwargs`` so no absolute path is baked into
+    the saved zip. Uses only the shared encoder interface, so the ST, CGF and pooled
+    extractors go through exactly the same code.
+    """
+    extractors = policy_extractors(model)
     for extractor in extractors:
-        extractor._load_pretrained_encoder(path)
+        extractor.load_pretrained(path)
         if frozen:
-            extractor.freeze_encoder()
-    print("WeightedCGFFeaturesExtractor: encoder RE-loaded after PPO construction "
+            extractor.freeze()
+    name = type(extractors[0]).__name__
+    print(f"{name}: encoder RE-loaded after PPO construction "
           "(SB3 init_weights would otherwise overwrite it)"
           + (" and re-frozen" if frozen else ""))
     if verify:
-        verify_matches_checkpoint(_cgf_reference_state(path),
-                                  model.policy.features_extractor.state_dict(),
-                                  path, label="CGF encoder")
-    # Do not bake an absolute pretraining path into the saved policy
-    # (PITFALLS.md section 7): SB3 re-runs the constructor on load.
+        verify_matches_checkpoint(extractors[0].reference_state(path),
+                                  extractors[0].encoder_state_dict(), path,
+                                  label=f"{name} encoder")
     kwargs = model.policy_kwargs.get("features_extractor_kwargs", {})
-    if "pretrained_cgf_model_path" in kwargs:
-        kwargs["pretrained_cgf_model_path"] = None
+    key = getattr(extractors[0], "PRETRAINED_PATH_KWARG", None)
+    if key is not None and key in kwargs:
+        kwargs[key] = None
+
+
+def reload_pretrained_cgf(model, path: str, frozen: bool, verify: bool = True) -> None:
+    """The CGF arm's post-construction reload. Since change 2 a forwarder to
+    :func:`reload_pretrained`; kept under this name for both CGF scripts, the Odd-Even
+    ``pretrained_encoder.py`` shim and the tests.
+    """
+    reload_pretrained(model, path, frozen, verify=verify)

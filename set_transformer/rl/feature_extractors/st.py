@@ -87,6 +87,11 @@ class SetTransformerFeaturesExtractor(BaseFeaturesExtractor):
     for the CGF arm works unchanged on an ST checkpoint.
     """
 
+    #: Constructor argument that carries the pretraining checkpoint path. The shared
+    #: reload (rl/pretrained_encoder.reload_pretrained) blanks it in policy_kwargs after
+    #: the reload, so no absolute path is baked into the saved zip (PITFALLS.md section 7).
+    PRETRAINED_PATH_KWARG = "pretrained_st_model_path"
+
     def __init__(
         self,
         observation_space: gym.spaces.Dict,
@@ -298,6 +303,54 @@ class SetTransformerFeaturesExtractor(BaseFeaturesExtractor):
                 f"Original error: {exc}"
             ) from exc
         print(f"SetTransformerFeaturesExtractor: loaded encoder from {path}")
+
+    # -- The shared encoder interface (change 2 of the harness centralisation, 2026-09-12).
+    # -- Every learned extractor exposes these five names with one signature, plus the
+    # -- PRETRAINED_PATH_KWARG class attribute; rl/pretrained_encoder.reload_pretrained and
+    # -- rl/encoder_finetune.scale_encoder_learning_rate use nothing else. The methods above
+    # -- are unchanged; these forward to them.
+
+    def encoder_parameters(self) -> list[torch.nn.Parameter]:
+        """The parameters a pretraining checkpoint provides and `freeze()` fixes."""
+        return list(self.encoder.parameters())
+
+    def load_pretrained(self, path: str) -> None:
+        """Load the encoder from a 3_train_st.py checkpoint (geometry and frame checked)."""
+        self._load_pretrained_encoder(path, self.dim_input)
+
+    def freeze(self) -> None:
+        """Fix the encoder: no gradient reaches it and forward runs under no_grad.
+
+        Sets the same ``st_frozen`` flag the constructor takes, so a freeze applied after
+        construction (the reload-after-PPO path) behaves exactly like ``--st_frozen`` from
+        the start; UnfreezeEncoderCallback clears that flag again. Idempotent.
+        """
+        self.st_frozen = True
+        self.encoder.eval()
+        for param in self.encoder.parameters():
+            param.requires_grad_(False)
+
+    def encoder_state_dict(self) -> dict:
+        """The live encoder tensors, keyed like `reference_state()`."""
+        return self.encoder.state_dict()
+
+    def reference_state(self, path: str) -> dict:
+        """The encoder tensors a checkpoint holds, keyed like `encoder_state_dict()`.
+
+        Accepts the same shapes as `_load_pretrained_encoder`: a Trainer checkpoint
+        (``model_state_dict`` with ``set_transformer.`` / ``decoder.`` prefixes), a full
+        PFSetTransformer state_dict, or a bare encoder state_dict.
+        """
+        loaded = torch.load(path, map_location="cpu", weights_only=False)
+        state = (loaded["model_state_dict"]
+                 if isinstance(loaded, dict) and "model_state_dict" in loaded else loaded)
+        prefix = "set_transformer."
+        reference = {key[len(prefix):]: value for key, value in state.items()
+                     if key.startswith(prefix)}
+        if not reference:
+            reference = {key: value for key, value in state.items()
+                         if not key.startswith("decoder.")}
+        return reference
 
     def forward(self, obs_dict: dict[str, torch.Tensor]) -> torch.Tensor:
         base_obs = obs_dict["obs"]
