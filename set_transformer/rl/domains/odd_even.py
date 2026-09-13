@@ -96,18 +96,33 @@ extractors only divide. `variants.state_scale` / `variants.state_centre` are
 the single source of both numbers, and 2_collect_pf_dataset.py records the
 scale in the dataset so pretraining and RL agree (PITFALLS.md section 4).
 
+EXACT-POSTERIOR PRETRAINING (batch 7.3, 2026-09-13). The supervised pretraining that was
+``experiments/odd_even/3_pretrain_st_belief.py`` lives here as three ``Objective`` records
+(``belief_kl`` / ``mode_ce`` / ``state_ce``, declared on the Domain record's ``pretraining``),
+together with the mode-readout probe pieces its end-of-run report uses; see the block's
+own header below. Only this problem can compute the target (the env's exact posterior),
+which is why the objective is declared here and not in ``rl/pretrain_objectives/``.
+
 ``import pdomains`` below registers the ``pdomains-odd-even-*`` env ids. The factory thunk is
 pickled by reference to this module when SubprocVecEnv starts workers; the child's import of
 it (and the ``import pdomains`` inside the thunk) registers the envs there too.
 """
 
+import argparse
+import json
+import math
 import os
+import time
 from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
 from types import SimpleNamespace
 
 import gymnasium as gym
 import numpy as np
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize
@@ -120,7 +135,14 @@ from set_transformer.rl.particle_filters.odd_even import (
 from set_transformer.rl.wrappers.particle_filter import (
     PFDictWithWeightsObservationWrapper,
 )
-from set_transformer.rl.domains.base import Domain, Evaluation
+from set_transformer.rl.domains.base import (
+    Domain,
+    Evaluation,
+    Objective,
+    PretrainContext,
+    PretrainResult,
+    Pretraining,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1203,6 +1225,733 @@ def _eval_report(episodes, references, args, variant, cap) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# The mode-readout probe's shared pieces (moved from
+# experiments/odd_even/diagnostics/probe_cgf_mode_readout.py, batch 7.3, 2026-09-13; the
+# diagnostic imports them back). Used by the exact-posterior pretraining's end-of-run report
+# below, which is why they live in the package rather than in a diagnostic loaded by path.
+# ---------------------------------------------------------------------------
+
+
+#: The transient/steady split. Steps 1..21 are the transient -- the belief is
+#: still sharpening and the encodings provably differ there; 22..cap is the
+#: steady state. domain_mds/oddeven.md uses this same boundary for every
+#: reward number, so a probe on a different one is not comparable to them.
+#: (The same number as COLLAPSE_STEP below, kept under the probe's own name.)
+TRANSIENT_MAX_STEP = 21
+
+
+def collect_rollouts(variant: str, n_episodes: int, seed: int):
+    """Roll the RL arms' own belief env, recording one snapshot per decision.
+
+    Rolls `make_odd_even_belief_env` -- the same factory every arm and the
+    eval build -- so the belief distribution probed is the one the policy
+    sees, including the float32 cast of the weights and the wrapper's
+    centring of the particles.
+
+    THE TIMING, which is the one thing here that is easy to get silently
+    wrong. `step()` fixes the prediction BEFORE drawing that step's
+    observations, so the belief available when choosing the action for step t
+    holds o_0 .. o_{t-1}. The reset observation is therefore the snapshot for
+    step 1, and the obs returned by step t is the snapshot for step t+1. The
+    obs after the final step is never acted on and is dropped. Recording the
+    post-step belief against step t instead would hand every encoding one
+    extra observation and inflate every number in the table.
+
+    Labels come from the SAME info dict that produced the snapshot:
+        target A  info['true_state']         -- s*, constant within an episode
+        target B  info['optimal_prediction'] -- argmax_s P(s | o_0..o_{t-1})
+    Both are read off the env's float64 posterior rather than recomputed from
+    the float32 weights in the observation, so an argmax tie broken
+    differently by the cast cannot mislabel a row.
+
+    Returns particles/weights as the extractors will receive them, plus
+    labels, episode groups and 1-based step indices.
+    """
+    resolved = variants.resolve(variant)
+    num_states = resolved.n_dist_size
+    cap = variants.episode_cap(variant)
+
+    env = make_odd_even_belief_env(
+        variant=variant, num_particles=num_states, rank=0, seed=seed)()
+
+    particles, weights, base_obs = [], [], []
+    true_states, modes, groups, steps = [], [], [], []
+
+    for episode in range(n_episodes):
+        # seed + episode, never a constant seed: the hidden state is drawn at
+        # reset, so one seed IS one episode replayed N times (PITFALLS.md #2
+        # and the Gap 4 seeding trap).
+        obs, info = env.reset(seed=seed + episode)
+        for step in range(1, cap + 1):
+            particles.append(np.asarray(obs["particles"], dtype=np.float32))
+            weights.append(np.asarray(obs["weights"], dtype=np.float32))
+            base_obs.append(np.asarray(obs["obs"], dtype=np.float32))
+            true_states.append(int(info["true_state"]))
+            modes.append(int(info["optimal_prediction"]))
+            groups.append(episode)
+            steps.append(step)
+            # The action is irrelevant to the belief trajectory: it is a
+            # prediction and touches neither the hidden state nor the
+            # observation model, so the posterior evolves identically under
+            # any policy (domain_mds/oddeven.md, 2026-09-03 visualisation).
+            obs, _reward, terminated, truncated, info = env.step(0)
+            if terminated or truncated:
+                break
+    env.close()
+
+    return {
+        "particles": np.stack(particles),
+        "weights": np.stack(weights),
+        "base_obs": np.stack(base_obs),
+        "true_state": np.asarray(true_states, dtype=np.int64),
+        "mode": np.asarray(modes, dtype=np.int64),
+        "group": np.asarray(groups, dtype=np.int64),
+        "step": np.asarray(steps, dtype=np.int64),
+        "num_states": num_states,
+        "cap": cap,
+    }
+
+
+def _run_extractor(extractor, data, batch_size=1024) -> np.ndarray:
+    """Features from a real SB3 extractor, dropping the base-obs passthrough.
+
+    Column 0 of every extractor's output is `obs_dict["obs"]` -- here the
+    normalized step index, which is not part of the belief encoding and which
+    a 50-way readout would otherwise use as a strong prior over the mode
+    (later steps concentrate). The probe must measure the ENCODING, so the
+    passthrough is dropped.
+    """
+    extractor.eval()
+    out = []
+    with torch.no_grad():
+        for i in range(0, len(data["particles"]), batch_size):
+            sl = slice(i, i + batch_size)
+            out.append(extractor({
+                "obs": torch.from_numpy(data["base_obs"][sl]),
+                "particles": torch.from_numpy(data["particles"][sl]),
+                "weights": torch.from_numpy(data["weights"][sl]),
+            })[:, 1:].numpy())
+    return np.concatenate(out).astype(np.float64)
+
+
+def geometry(features: np.ndarray, posterior_mean: np.ndarray) -> dict:
+    """How many DIRECTIONS the encoding actually varies along, and along what.
+
+    This is the mechanism behind the accuracy table and the reason a 64-wide
+    encoding can score like a 1-wide one. Three numbers, all scale-free:
+
+        eff_rank      exp(entropy of the normalized singular-value spectrum)
+                      of the centred features. 1.0 means one direction
+                      carries the variance however many columns there are.
+        pc1_var_frac  variance fraction in the leading direction.
+        pc1_corr_mean |corr| between that direction and the POSTERIOR MEAN.
+                      If this is ~1, the encoding is a reparameterisation of
+                      the mean and cannot carry more than the mean does.
+        min_pair_corr smallest |corr| between any two features. Near 1 means
+                      every column is a monotone restatement of one number;
+                      GAUSS2 reads ~0.02 here because mean and variance are
+                      genuinely independent, which is the useful contrast.
+
+    Computed in float64 on the same features the classifiers get. Note the
+    numerical rank can still be full while eff_rank is 1.0 -- the tail
+    directions exist but at a magnitude the standardised/unstandardised
+    contrast is exactly about.
+    """
+    # Absolute per-feature spread, reported ALONGSIDE the relative one because
+    # the relative measure divides by the GLOBAL mean magnitude and so cannot
+    # separate "small signal" from "large constant offset". ST_E2E is exactly
+    # that case: relative spread 9.5e-4 but absolute per-column std 9.1e-5 on
+    # features whose mean magnitude is 0.096.
+    abs_std = float(features.std(axis=0).mean())
+
+    centred = features - features.mean(axis=0)
+    singular = np.linalg.svd(centred, compute_uv=False)
+    total = (singular ** 2).sum()
+    if total <= 0:
+        return {"eff_rank": 1.0, "pc1_var_frac": 1.0, "abs_std": abs_std,
+                "pc1_corr_mean": float("nan"), "min_pair_corr": float("nan")}
+    spectrum = singular ** 2 / total
+    eff_rank = float(np.exp(-(spectrum * np.log(spectrum + 1e-300)).sum()))
+
+    left, values, _ = np.linalg.svd(centred, full_matrices=False)
+    pc1 = left[:, 0] * values[0]
+    pc1_corr = abs(float(np.corrcoef(pc1, posterior_mean)[0, 1]))
+
+    if features.shape[1] > 1:
+        corr = np.corrcoef(features.T)
+        off_diagonal = corr[~np.eye(features.shape[1], dtype=bool)]
+        min_pair = float(np.abs(off_diagonal).min())
+    else:
+        min_pair = float("nan")
+
+    return {"eff_rank": eff_rank, "pc1_var_frac": float(spectrum[0]),
+            "abs_std": abs_std,
+            "pc1_corr_mean": pc1_corr, "min_pair_corr": min_pair}
+
+
+def _fit_predict(features, labels, groups, n_splits, classifier, standardise,
+                 seed):
+    """Grouped-CV out-of-fold predictions for one (classifier, scaling) pair.
+
+    GroupKFold by episode: every step of one episode shares s*, so an
+    ungrouped split puts the same label on both sides and the score measures
+    memorisation. Scaling statistics are fitted on the TRAINING fold only --
+    fitting them on everything leaks the test fold's distribution into the
+    amplification the whole standardised/unstandardised contrast is about.
+    """
+    # 7.3: imported here, not at module top -- this module is on every RL run's import path
+    # and scikit-learn is needed only by the probe.
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.model_selection import GroupKFold
+    from sklearn.neural_network import MLPClassifier
+
+    preds = np.empty_like(labels)
+    for train, test in GroupKFold(n_splits=n_splits).split(
+            features, labels, groups):
+        x_train, x_test = features[train], features[test]
+        if standardise:
+            mu = x_train.mean(axis=0)
+            sd = x_train.std(axis=0)
+            sd = np.where(sd < 1e-12, 1.0, sd)
+            x_train = (x_train - mu) / sd
+            x_test = (x_test - mu) / sd
+        if classifier == "logreg":
+            # Multinomial (softmax over all 50 classes), which is
+            # LogisticRegression's only behaviour from sklearn 1.7 -- the
+            # `multi_class` argument that used to select it was removed in
+            # 1.9, so passing it raises rather than being ignored.
+            model = LogisticRegression(max_iter=3000, C=1.0)
+        elif classifier == "mlp":
+            model = MLPClassifier(hidden_layer_sizes=(128,), max_iter=600,
+                                  random_state=seed, early_stopping=False)
+        else:
+            raise ValueError(f"unknown classifier {classifier!r}")
+        model.fit(x_train, labels[train])
+        preds[test] = model.predict(x_test)
+    return preds
+
+
+def _split_accuracy(preds, labels, steps):
+    """Top-1 accuracy in the transient, the steady state, and pooled."""
+    correct = preds == labels
+    transient = steps <= TRANSIENT_MAX_STEP
+    steady = ~transient
+    return {
+        "transient": float(correct[transient].mean()) if transient.any()
+        else float("nan"),
+        "steady": float(correct[steady].mean()) if steady.any()
+        else float("nan"),
+        "pooled": float(correct.mean()),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Supervised pretraining on the exact posterior (moved from
+# experiments/odd_even/3_pretrain_st_belief.py, batch 7.3, 2026-09-13; that script is now an
+# entry point of rl/pretrain.py). Three objectives, declared on the Domain record below and
+# offered by `rl/pretrain.py --domain odd_even --objective belief_kl|mode_ce|state_ce`:
+#
+#     belief_kl   soft cross-entropy against the exact posterior. DEFAULT.
+#                 Asks for the whole belief, which subsumes both targets.
+#     mode_ce     hard cross-entropy against the posterior argmax (target B).
+#     state_ce    hard cross-entropy against the true state (target A). The
+#                 Bayes-optimal predictor of s* IS the posterior mode, so this
+#                 is a noisier version of mode_ce.
+#
+# WHY (domain_mds/oddeven.md, 2026-09-04/05): every encoder the pipeline had produced was a
+# reparameterisation of the posterior MEAN (Sinkhorn decoders collapsed to a point mass at
+# the weighted mean; the end-to-end ST collapsed under a sparse reward), so the training
+# signal never asked the encoder for the belief. This asks for it directly: the encoder is the
+# RL arm's own extractor (same geometry, weight channel and normalisation), a linear head maps
+# its features to n logits, and the loss is the cross-entropy against the exact posterior from
+# `info['belief']` (= KL(posterior || model) up to a constant). The checkpoint is saved in the
+# format `rl/train.py --pretrained_path` loads (geometry `config` included).
+#
+# PROTOCOL. Data is rolled from the raw env with `data_seed + episode`, one snapshot per
+# decision, BEFORE that step's observation (the same timing as the readout probe and the RL
+# arms). Particles are the states centred on (n + 1) / 2, weights are the exact posterior --
+# identical to what the exact-support filter hands the RL arm (oddeven.md Gap 5). Train and
+# validation episodes come from disjoint seed ranges. The end-of-run report (`--skip_probe`
+# turns it off) probes the FROZEN best checkpoint with the mode-readout protocol above on its
+# default seed (9000), so the rows join that table.
+#
+# ENCODERS: `st` and `cgf`. For cgf the same objective, data and head fit t (unless
+# --t_frozen), the running feature norm's statistics and a readout MLP sized with
+# --match_params to the ST's parameter count -- the size- and supervision-matched pretraining
+# test the RL comparison needs.
+# ---------------------------------------------------------------------------
+
+
+#: Encoders the exact-posterior objectives can pretrain.
+EXACT_POSTERIOR_ENCODERS = ("st", "cgf")
+
+
+# -- data ----------------------------------------------------------------------------------
+
+def collect_posterior_snapshots(variant: str, n_episodes: int, seed: int) -> dict:
+    """One snapshot per decision: exact posterior, true state, mode, step."""
+    resolved = variants.resolve(variant)
+    cap = variants.episode_cap(variant)
+    env = gym.make(resolved.env_id)
+    beliefs, true_states, modes, steps, groups = [], [], [], [], []
+    for episode in range(n_episodes):
+        _obs, info = env.reset(seed=seed + episode)
+        for step in range(1, cap + 1):
+            beliefs.append(np.asarray(info["belief"], dtype=np.float32))
+            true_states.append(int(info["true_state"]))
+            modes.append(int(info["optimal_prediction"]))
+            steps.append(step)
+            groups.append(episode)
+            _obs, _r, terminated, truncated, info = env.step(0)
+            if terminated or truncated:
+                break
+    env.close()
+    return {
+        "weights": np.stack(beliefs),
+        "true_state": np.asarray(true_states, dtype=np.int64),
+        "mode": np.asarray(modes, dtype=np.int64),
+        "step": np.asarray(steps, dtype=np.int64),
+        "group": np.asarray(groups, dtype=np.int64),
+        "n": int(resolved.n_dist_size),
+        "cap": cap,
+    }
+
+
+class BeliefBatches:
+    """Tensors on the device; particles are the centred states, shared."""
+
+    def __init__(self, data: dict, centre: float, device: torch.device):
+        n = data["n"]
+        self.n_rows = len(data["weights"])
+        self.weights = torch.from_numpy(data["weights"]).to(device)
+        self.true_state = torch.from_numpy(data["true_state"] - 1).to(device)
+        self.mode = torch.from_numpy(data["mode"] - 1).to(device)
+        self.step = data["step"]
+        self.group = data["group"]
+        states = torch.arange(1, n + 1, dtype=torch.float32) - float(centre)
+        self.particles = states.reshape(1, n, 1).to(device)      # [1, N, 1]
+        self.device = device
+
+    def obs(self, index: torch.Tensor) -> dict:
+        b = len(index)
+        return {
+            "obs": torch.zeros(b, 1, device=self.device),
+            "particles": self.particles.expand(b, -1, -1),
+            "weights": self.weights[index],
+        }
+
+
+# -- model ---------------------------------------------------------------------------------
+
+def _belief_space(n_states: int) -> gym.spaces.Dict:
+    """The observation space the extractor is constructed against (n centred states, 1-D)."""
+    return gym.spaces.Dict({
+        "obs": gym.spaces.Box(0.0, 1.0, (1,), np.float32),
+        "particles": gym.spaces.Box(-np.inf, np.inf, (n_states, 1), np.float32),
+        "weights": gym.spaces.Box(0.0, 1.0, (n_states,), np.float32),
+    })
+
+
+def build_extractor(args, space, scale: float, pretrained_path: str | None = None):
+    """The encoder under test, as the RL arm's own SB3 extractor class, built from the flags
+    THROUGH THE SHARED ENCODER TABLE (rl/encoders.py) -- the same construction
+    `rl/train.py --encoder <name>` performs, so a checkpoint pretrained here loads there
+    without translation. ``args.encoder`` names the arm; ``scale`` is the arena scale;
+    ``pretrained_path`` (the ST's --init_from, or a finished checkpoint for the probe) is
+    loaded by the extractor's own loader."""
+    # Imported here: rl/encoders.py imports rl/domains/base.py, and this module is imported
+    # by rl/domains/__init__.py's lookup, so a top-level import would be a cycle.
+    from set_transformer.rl import encoders as _encoders
+    encoder = _encoders.get(args.encoder)
+    kwargs = encoder.extractor_kwargs(args)
+    kwargs["arena_scale"] = float(scale)
+    kwargs[encoder.extractor_class.PRETRAINED_PATH_KWARG] = pretrained_path
+    return encoder.extractor_class(space, **kwargs)
+
+
+def extractor_geometry(extractor) -> dict:
+    return dict(extractor._st_geometry if hasattr(extractor, "_st_geometry")
+                else extractor._cgf_geometry)
+
+
+class BeliefEncoderWithHead(nn.Module):
+    def __init__(self, extractor: nn.Module, n_states: int):
+        super().__init__()
+        self.extractor = extractor
+        st_dim = extractor.features_dim - 1                        # drop the obs passthrough
+        self.head = nn.Linear(st_dim, n_states)
+
+    def features(self, obs: dict) -> torch.Tensor:
+        return self.extractor(obs)[:, 1:]
+
+    def forward(self, obs: dict) -> torch.Tensor:
+        return self.head(self.features(obs))
+
+
+def belief_loss(logits: torch.Tensor, batches: BeliefBatches, index: torch.Tensor,
+                objective: str) -> torch.Tensor:
+    if objective == "belief_kl":
+        target = batches.weights[index]
+        return -(target * F.log_softmax(logits, dim=-1)).sum(dim=-1).mean()
+    if objective == "mode_ce":
+        return F.cross_entropy(logits, batches.mode[index])
+    if objective == "state_ce":
+        return F.cross_entropy(logits, batches.true_state[index])
+    raise ValueError(objective)
+
+
+@torch.no_grad()
+def evaluate_belief_head(model, batches: BeliefBatches, objective: str, batch_size: int,
+                         transient_max_step: int) -> dict:
+    model.eval()
+    losses, preds, feats = [], [], []
+    for start in range(0, batches.n_rows, batch_size):
+        index = torch.arange(start, min(start + batch_size, batches.n_rows),
+                             device=batches.device)
+        obs = batches.obs(index)
+        f = model.features(obs)
+        logits = model.head(f)
+        losses.append(belief_loss(logits, batches, index, objective).item() * len(index))
+        preds.append(logits.argmax(dim=-1))
+        feats.append(f)
+    preds = torch.cat(preds)
+    feats = torch.cat(feats).double()
+    transient = torch.from_numpy(batches.step <= transient_max_step).to(batches.device)
+
+    def _split(hit):
+        return (float(hit[transient].float().mean()),
+                float(hit[~transient].float().mean()))
+
+    mode_tr, mode_st = _split(preds == batches.mode)
+    state_tr, state_st = _split(preds == batches.true_state)
+    centred = feats - feats.mean(dim=0)
+    singular = torch.linalg.svdvals(centred)
+    spectrum = singular ** 2 / (singular ** 2).sum().clamp_min(1e-300)
+    eff_rank = float(torch.exp(-(spectrum * torch.log(spectrum + 1e-300)).sum()))
+    return {
+        "loss": sum(losses) / batches.n_rows,
+        "head_mode_acc": {"transient": mode_tr, "steady": mode_st},
+        "head_true_state_acc": {"transient": state_tr, "steady": state_st},
+        "feature_abs_std": float(feats.std(dim=0).mean()),
+        "feature_eff_rank": eff_rank,
+    }
+
+
+def save_belief_checkpoint(model: BeliefEncoderWithHead, path: Path, args, epoch: int,
+                           val: dict, geometry: dict) -> None:
+    """The format the RL arm's extractor loads: a dict with `model_state_dict`
+    and a `config` carrying the geometry fields the loader checks.
+
+    ST: encoder keys under `set_transformer.` (what SetTransformerFeaturesExtractor
+    strips). CGF: the extractor's whole state_dict, unprefixed -- t, the norm
+    statistics and the readout ARE the encoder."""
+    if args.encoder == "st":
+        encoder_state = {f"set_transformer.{k}": v.detach().cpu()
+                         for k, v in model.extractor.encoder.state_dict().items()}
+    else:
+        encoder_state = {k: v.detach().cpu()
+                         for k, v in model.extractor.state_dict().items()}
+    torch.save({
+        "model_state_dict": encoder_state,
+        "head_state_dict": {k: v.detach().cpu() for k, v in model.head.state_dict().items()},
+        "config": {**geometry, "objective": args.objective, "variant": args.variant,
+                   "arena_scale": float(model.extractor.arena_scale),
+                   "encoder": args.encoder,
+                   "encoder_params": int(getattr(args, "encoder_params", 0)),
+                   # The producer's historical name, kept so checkpoints stay byte-identical
+                   # with the recorded ones; the unified config block is batch 7.5's.
+                   "pretraining": "3_pretrain_st_belief.py"},
+        "epoch": epoch,
+        "val": val,
+        "args": vars(args),
+    }, path)
+
+
+# -- the Objective hooks (rl/domains/base.py::Objective) -------------------------------------
+
+def _belief_add_arguments(parser: argparse.ArgumentParser, domain=None) -> None:
+    """The objective's flags, spelled as the package command spells them (decision 2 of plan
+    section 7: --num_epochs / --learning_rate; the entry point maps --epochs / --lr)."""
+    g = parser.add_argument_group("exact-posterior objective: data")
+    g.add_argument("--n_train_episodes", type=int, default=4000)
+    g.add_argument("--n_val_episodes", type=int, default=400)
+    g.add_argument("--data_seed", type=int, default=100000,
+                   help="Train episodes use data_seed + e; validation "
+                        "episodes data_seed + 10_000_000 + e. Both are far "
+                        "from the probe's 9000 + e.")
+    t = parser.add_argument_group("exact-posterior objective: training")
+    t.add_argument("--num_epochs", type=int, default=40)
+    t.add_argument("--batch_size", type=int, default=512)
+    t.add_argument("--learning_rate", type=float, default=1e-3)
+    t.add_argument("--weight_decay", type=float, default=0.0)
+    t.add_argument("--init_from", default=None,
+                   help="ST only: warm-start the encoder from a reconstruction (Sinkhorn) "
+                        "checkpoint instead of random init. Geometry must match the flags.")
+    t.add_argument("--freeze_encoder", action="store_true",
+                   help="Train only the linear head; the encoder (random or --init_from) "
+                        "is held fixed. The linear-readout anchor for --init_from.")
+    p = parser.add_argument_group("exact-posterior objective: end-of-run probe")
+    p.add_argument("--probe_episodes", type=int, default=300)
+    p.add_argument("--probe_seed", type=int, default=9000,
+                   help="probe_cgf_mode_readout.py's default, so rows join its table")
+    p.add_argument("--probe_splits", type=int, default=5)
+    p.add_argument("--skip_probe", action="store_true")
+
+
+def _belief_resolve_arguments(parser, args, domain, encoder) -> None:
+    if encoder.name not in EXACT_POSTERIOR_ENCODERS:
+        parser.error(f"exact-posterior pretraining is implemented for --encoder "
+                     f"{' | '.join(EXACT_POSTERIOR_ENCODERS)}, not {encoder.name!r}")
+    if args.variant is None:
+        parser.error("exact-posterior pretraining rolls the env itself: pass --variant "
+                     "<registry key> (--list_variants shows them)")
+    if args.init_from and encoder.name != "st":
+        raise SystemExit("--init_from is implemented for --encoder st only")
+
+
+def _belief_prepare(parser, args, domain, encoder, device):
+    """The geometry the encoder's own resolution needs: n states, 1-D, the state scale. The
+    episodes themselves are rolled in `run` (they draw nothing from torch's RNG, so the
+    checkpoints are unchanged by the order; a --dry_run then costs nothing)."""
+    resolved = variants.resolve(args.variant)
+    args.num_particles = int(resolved.n_dist_size)
+    args.dim_particles = 1
+    args.arena_scale = float(variants.state_scale(args.variant))
+    return None
+
+
+def _belief_run_name(args, now: datetime, target: str) -> str:
+    """`<stamp>_<objective>_seed<n>`, with the encoder's name inserted for every arm but the
+    ST (the script's naming; the run tag is appended by the command)."""
+    stamp = now.strftime("%Y%m%d_%H%M%S")
+    if args.encoder != "st":
+        return f"{stamp}_{args.encoder}_{target}_seed{args.seed}"
+    return f"{stamp}_{target}_seed{args.seed}"
+
+
+def _belief_run(args, ctx: PretrainContext, target: str) -> PretrainResult:
+    """The training loop of `3_pretrain_st_belief.py::main`, moved: roll the episodes, fit the
+    encoder + linear head, keep the best checkpoint by validation loss."""
+    # The command's parse guarantees these; recorded in args.json as the run's truth.
+    args.objective = target
+    args.encoder = ctx.encoder.name
+    device = torch.device(ctx.device)
+    resolved = variants.resolve(args.variant)
+    centre, scale = variants.state_centre(args.variant), variants.state_scale(args.variant)
+    n_states = resolved.n_dist_size
+    transient_max_step = TRANSIENT_MAX_STEP
+
+    run_dir = Path(ctx.run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "args.json").write_text(json.dumps(vars(args), indent=2))
+    print(f"run dir: {run_dir}")
+    print(f"variant {args.variant} | env {resolved.env_id} | n={n_states} | "
+          f"cap {variants.episode_cap(args.variant)} | normalisation (s - {centre}) / {scale} | "
+          f"device {device}")
+
+    # ---- data ----------------------------------------------------------------
+    t0 = time.time()
+    train = collect_posterior_snapshots(args.variant, args.n_train_episodes, args.data_seed)
+    val = collect_posterior_snapshots(args.variant, args.n_val_episodes, args.data_seed + 10_000_000)
+    print(f"collected {len(train['weights'])} train rows / {len(val['weights'])} val rows "
+          f"in {time.time() - t0:.0f}s; train distinct s*: "
+          f"{len(set(train['true_state'].tolist()))}")
+    train_b = BeliefBatches(train, centre, device)
+    val_b = BeliefBatches(val, centre, device)
+
+    # ---- model ---------------------------------------------------------------
+    space = _belief_space(n_states)
+    if args.init_from and args.encoder != "st":
+        raise SystemExit("--init_from is implemented for --encoder st only")
+    extractor = build_extractor(args, space, scale, args.init_from)
+    if args.init_from:
+        # Verify the warm start landed (PITFALLS.md section 1 habit): compare every
+        # encoder tensor against the checkpoint.
+        ck = torch.load(args.init_from, map_location="cpu", weights_only=False)
+        ref = {k[len("set_transformer."):]: v for k, v in ck["model_state_dict"].items()
+               if k.startswith("set_transformer.")}
+        cur = extractor.encoder.state_dict()
+        delta = max(float((ref[k] - cur[k].cpu()).abs().max()) for k in ref)
+        print(f"Verified: encoder warm-started from {args.init_from} "
+              f"({len(ref)} tensors, max|delta| = {delta})")
+        if delta != 0.0:
+            raise SystemExit("warm start did not land exactly")
+    if args.freeze_encoder:
+        for p in extractor.parameters():
+            p.requires_grad_(False)
+        extractor.eval()
+    geometry = extractor_geometry(extractor)
+    model = BeliefEncoderWithHead(extractor, n_states).to(device)
+    n_params = sum(p.numel() for p in model.parameters())
+    n_head = model.head.weight.numel() + n_states
+    n_encoder_buffers = sum(b.numel() for b in extractor.buffers())
+    print(f"encoder+head parameters: {n_params:,}  (head {n_head:,}; encoder "
+          f"{n_params - n_head:,} trainable + {n_encoder_buffers:,} buffer values)")
+    if args.encoder == "st":
+        args.encoder_params = int(n_params - n_head)
+
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    print(f"trainable parameters: {sum(p.numel() for p in trainable):,}"
+          + ("  (encoder FROZEN, head only)" if args.freeze_encoder else ""))
+    optimizer = torch.optim.AdamW(trainable, lr=args.learning_rate,
+                                  weight_decay=args.weight_decay)
+    steps_per_epoch = math.ceil(train_b.n_rows / args.batch_size)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.num_epochs * steps_per_epoch)
+
+    # Reference: the entropy of the exact posterior is the floor of the
+    # belief_kl loss (CE = H(posterior) + KL). Print it so the loss is readable.
+    if target == "belief_kl":
+        w = val_b.weights.clamp_min(1e-30)
+        entropy = float(-(val_b.weights * w.log()).sum(dim=-1).mean())
+        print(f"val posterior entropy (loss floor for belief_kl): {entropy:.4f}")
+
+    # ---- train ---------------------------------------------------------------
+    history, best_val, best_epoch = [], float("inf"), None
+    for epoch in range(1, args.num_epochs + 1):
+        model.train()
+        if args.freeze_encoder:
+            model.extractor.eval()
+        perm = torch.randperm(train_b.n_rows, device=device)
+        running, t_epoch = 0.0, time.time()
+        for start in range(0, train_b.n_rows, args.batch_size):
+            index = perm[start:start + args.batch_size]
+            logits = model(train_b.obs(index))
+            loss = belief_loss(logits, train_b, index, target)
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(trainable, 1.0)
+            optimizer.step()
+            scheduler.step()
+            running += loss.item() * len(index)
+        metrics = evaluate_belief_head(model, val_b, target, 2048, transient_max_step)
+        metrics.update(epoch=epoch, train_loss=running / train_b.n_rows,
+                       lr=scheduler.get_last_lr()[0], seconds=time.time() - t_epoch)
+        history.append(metrics)
+        flag = ""
+        if metrics["loss"] < best_val:
+            best_val, best_epoch = metrics["loss"], epoch
+            save_belief_checkpoint(model, run_dir / "checkpoint_best.pt", args, epoch, metrics, geometry)
+            flag = "  *best*"
+        print(f"epoch {epoch:3d} | train {metrics['train_loss']:.4f} | val {metrics['loss']:.4f} | "
+              f"head mode acc tr/st {metrics['head_mode_acc']['transient']:.3f}/"
+              f"{metrics['head_mode_acc']['steady']:.3f} | "
+              f"s* acc {metrics['head_true_state_acc']['transient']:.3f}/"
+              f"{metrics['head_true_state_acc']['steady']:.3f} | "
+              f"feat std {metrics['feature_abs_std']:.2e} | eff.rank {metrics['feature_eff_rank']:.1f} | "
+              f"{metrics['seconds']:.0f}s{flag}", flush=True)
+        (run_dir / "history.json").write_text(json.dumps(history, indent=1))
+    save_belief_checkpoint(model, run_dir / "checkpoint_last.pt", args, args.num_epochs, history[-1], geometry)
+    print(f"best val loss {best_val:.4f}; checkpoints in {run_dir}")
+
+    checkpoints = {"best": run_dir / "checkpoint_best.pt", "last": run_dir / "checkpoint_last.pt"}
+    return PretrainResult(run_dir=run_dir, rl_checkpoint=checkpoints["best"], checkpoints=checkpoints,
+                          summary={"best_val_loss": best_val, "best_epoch": best_epoch})
+
+
+def _belief_report(args, ctx: PretrainContext, result: PretrainResult) -> None:
+    """The end-of-run probe of `3_pretrain_st_belief.py`, moved: the FROZEN best-checkpoint
+    latent under the mode-readout protocol (geometry, the trained head's accuracy, and grouped-CV
+    readouts against EXACT and GAUSS2), written to probe_results.json. `--skip_probe` skips it."""
+    if args.skip_probe:
+        return
+    run_dir = Path(result.run_dir)
+    n_states = int(args.num_particles)
+    scale = float(args.arena_scale)
+    space = _belief_space(n_states)
+
+    # ---- probe the FROZEN latent the way the readout probe does ----------------
+    print("\nprobing the frozen best-checkpoint latent with the mode-readout protocol ...")
+    best = torch.load(run_dir / "checkpoint_best.pt", map_location="cpu", weights_only=False)
+    probe_extractor = build_extractor(args, space, scale,
+                                      pretrained_path=str(run_dir / "checkpoint_best.pt"))
+    probe_extractor.eval()
+    head = nn.Linear(probe_extractor.features_dim - 1, n_states)
+    head.load_state_dict(best["head_state_dict"])
+    enc_label = f"{args.encoder.upper()}_BELIEF"
+
+    data = collect_rollouts(args.variant, args.probe_episodes, args.probe_seed)
+    st_feats = _run_extractor(probe_extractor, data)                 # [R, 64] float64
+    with torch.no_grad():
+        head_pred = head(torch.from_numpy(st_feats).float()).argmax(dim=-1).numpy() + 1
+
+    weights = data["weights"].astype(np.float64)
+    weights /= weights.sum(axis=1, keepdims=True)
+    x = data["particles"].astype(np.float64)[:, :, 0] / scale
+    mean = (weights * x).sum(axis=1)
+    var = (weights * (x - mean[:, None]) ** 2).sum(axis=1)
+    feature_sets = {"EXACT": weights, "GAUSS2": np.c_[mean, var], enc_label: st_feats}
+
+    results = {"geometry": {}, "head": {}, "targets": {}}
+    print(f"\n{'encoding':<12} {'width':>6} {'abs.std':>10} {'eff.rank':>9} {'|r(PC1,mean)|':>14}")
+    for name, feats in feature_sets.items():
+        g = geometry(feats, mean)
+        results["geometry"][name] = g
+        print(f"{name:<12} {feats.shape[1]:>6} {g['abs_std']:>10.2e} {g['eff_rank']:>9.2f} "
+              f"{g['pc1_corr_mean']:>14.5f}")
+
+    for target_label, truth in (("B_posterior_mode", data["mode"]),
+                                ("A_true_state", data["true_state"])):
+        acc = _split_accuracy(head_pred, truth, data["step"])
+        results["head"][target_label] = acc
+        print(f"\ntrained linear head on {enc_label} -> {target_label}: "
+              f"tr {acc['transient']:.3f} / st {acc['steady']:.3f}")
+
+    for target_label, truth in (("B_posterior_mode", data["mode"]),
+                                ("A_true_state", data["true_state"])):
+        results["targets"][target_label] = {}
+        print(f"\n=== target {target_label}  (50-way, chance 0.020; GroupKFold {args.probe_splits}) ===")
+        print(f"{'encoding':<12} {'logreg raw':>16} {'logreg z':>16} {'mlp raw':>16} {'mlp z':>16}")
+        for name, feats in feature_sets.items():
+            row, cells = {}, []
+            for classifier in ("logreg", "mlp"):
+                for standardise in (False, True):
+                    preds = _fit_predict(feats, truth, data["group"], args.probe_splits,
+                                         classifier, standardise, args.seed)
+                    acc = _split_accuracy(preds, truth, data["step"])
+                    row[f"{classifier}_{'z' if standardise else 'raw'}"] = acc
+                    cells.append(f"{acc['transient']:.3f} / {acc['steady']:.3f}")
+            results["targets"][target_label][name] = row
+            print(f"{name:<12} " + " ".join(f"{c:>16}" for c in cells), flush=True)
+
+    (run_dir / "probe_results.json").write_text(json.dumps(results, indent=1))
+    print(f"\nwrote {run_dir / 'probe_results.json'}")
+
+
+def _exact_posterior_objective(target: str, description: str) -> Objective:
+    """One of the three exact-posterior objectives; they share every hook and differ in the
+    loss target (`belief_loss`) and in the run folder's name."""
+    return Objective(
+        name=target,
+        description=description,
+        add_arguments=_belief_add_arguments,
+        run=lambda args, ctx: _belief_run(args, ctx, target),
+        run_name=lambda args, now: _belief_run_name(args, now, target),
+        resolve_arguments=_belief_resolve_arguments,
+        prepare=_belief_prepare,
+        report=_belief_report,
+        default_experiment_name=lambda encoder_name: f"{encoder_name}_belief_pretrain",
+    )
+
+
+#: Declared on the Domain record below; `rl/pretrain.py --domain odd_even` offers them next
+#: to the generic `reconstruction`, and runs `belief_kl` when --objective is omitted.
+EXACT_POSTERIOR_OBJECTIVES = {
+    "belief_kl": _exact_posterior_objective(
+        "belief_kl",
+        "encoder + linear head -> the env's exact posterior; soft cross-entropy "
+        "(= KL up to a constant); asks for the whole belief (Odd-Even's default)"),
+    "mode_ce": _exact_posterior_objective(
+        "mode_ce",
+        "encoder + linear head -> the posterior argmax (target B); hard cross-entropy"),
+    "state_ce": _exact_posterior_objective(
+        "state_ce",
+        "encoder + linear head -> the true state (target A); hard cross-entropy -- the Bayes "
+        "predictor of s* is the mode, so a noisier mode_ce"),
+}
+
+
+# ---------------------------------------------------------------------------
 # The Domain description (change 4, 2026-09-12): what the shared trainer needs from Odd-Even
 # ---------------------------------------------------------------------------
 
@@ -1275,4 +2024,8 @@ ODD_EVEN = Domain(
                           reseed_per_episode=True, references=_eval_references,
                           references_only=lambda args: bool(args.baselines_only),
                           report=_eval_report),
+    # Supervised pretraining on the exact posterior (3_pretrain_st_belief.py's three
+    # objectives, batch 7.3); the generic reconstruction objective needs no declaration.
+    # `belief_kl` is what `rl/pretrain.py --domain odd_even` runs when --objective is omitted.
+    pretraining=Pretraining(objectives=EXACT_POSTERIOR_OBJECTIVES, default_objective="belief_kl"),
 )

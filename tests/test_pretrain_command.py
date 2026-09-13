@@ -60,11 +60,30 @@ SMALL = ["--num_epochs", "1", "--batch_size", "8", "--num_workers", "0", "--devi
 def test_reconstruction_is_the_generic_default_and_every_domain_gets_it():
     assert pretrain_objectives.DEFAULT_OBJECTIVE == "reconstruction"
     for name in ("ant_tag", "odd_even"):
-        domain = get_domain(name)
-        assert "reconstruction" in pretrain.objectives_for(domain)
-        assert pretrain.default_objective_name(domain) == "reconstruction"
-        # Neither domain declares an objective of its own yet (7.3 adds Odd-Even's).
-        assert domain.pretraining == Pretraining()
+        assert "reconstruction" in pretrain.objectives_for(get_domain(name))
+    # Ant-Tag declares nothing of its own: the generic objectives only, reconstruction default.
+    ant_tag = get_domain("ant_tag")
+    assert ant_tag.pretraining == Pretraining()
+    assert pretrain.default_objective_name(ant_tag) == "reconstruction"
+
+
+def test_odd_even_declares_the_three_exact_posterior_objectives_and_defaults_to_belief_kl(capsys):
+    """Batch 7.3: the objectives of 3_pretrain_st_belief.py, declared in rl/domains/odd_even.py
+    and NOWHERE else; --objective offers them next to the generic reconstruction, for this
+    domain only, and runs belief_kl when --objective is omitted."""
+    odd_even = get_domain("odd_even")
+    assert set(odd_even.pretraining.objectives) == {"belief_kl", "mode_ce", "state_ce"}
+    assert set(pretrain.objectives_for(odd_even)) == {"reconstruction", "belief_kl", "mode_ce", "state_ce"}
+    assert pretrain.default_objective_name(odd_even) == "belief_kl"
+    assert pretrain.main(["--list_objectives", "--domain", "odd_even"]) is None
+    out = capsys.readouterr().out
+    for name in ("belief_kl", "mode_ce", "state_ce"):
+        assert f"{name:<18} odd_even only" in out, out
+    assert "belief_kl" not in pretrain.objectives_for(get_domain("ant_tag"))
+    # A domain-declared objective is not reachable without naming its domain.
+    with pytest.raises(SystemExit):
+        pretrain.main(["--encoder", "st", "--objective", "belief_kl", "--variant", "oe50_short", "--dry_run"])
+    assert "a domain-declared objective needs --domain" in capsys.readouterr().err
 
 
 def test_a_domain_declared_objective_joins_the_table_and_may_not_shadow_a_generic_one():
@@ -172,6 +191,78 @@ def test_dry_run_locates_the_domain_from_the_dataset_and_writes_the_record_under
     assert not list(record.parent.glob("checkpoints/*"))          # dry run: nothing trained
 
 
+def test_exact_posterior_dry_run_writes_the_record_under_the_root(tmp_path, monkeypatch):
+    """The Odd-Even objective through the package command, from a foreign cwd: the geometry the
+    objective derives from the variant (50 states, 1-D, scale 24.5), the domain's ST defaults,
+    the script's run-folder naming (encoder name inserted for every arm but the ST), the
+    default experiment folder <encoder>_belief_pretrain."""
+    from set_transformer.rl import run_records
+    monkeypatch.setattr(run_records, "git_provenance", lambda: {})
+    (tmp_path / "elsewhere").mkdir()
+    monkeypatch.chdir(tmp_path / "elsewhere")
+    root = tmp_path / "root"
+    assert pretrain.main(["--domain", "odd_even", "--encoder", "st", "--variant", "oe50_short",
+                          "--device", "cpu", "--output_root", str(root), "--dry_run"]) is None
+    [record] = list(root.glob("odd_even/oe50_short/pretrain/st_belief_pretrain/*_belief_kl_seed0/run_config.json"))
+    config = json.loads(record.read_text())
+    assert (config["domain"], config["encoder"], config["objective"]) == ("odd_even", "st", "belief_kl")
+    assert (config["num_particles"], config["dim_particles"], config["arena_scale"]) == (50, 1, 24.5)
+    assert (config["num_inds"], config["dim_hidden"], config["num_post_sab"]) == (16, 64, 2)
+    assert (config["num_epochs"], config["learning_rate"], config["batch_size"]) == (40, 1e-3, 512)
+    assert (config["n_train_episodes"], config["n_val_episodes"], config["data_seed"]) == (4000, 400, 100000)
+    assert (config["probe_episodes"], config["probe_seed"], config["probe_splits"]) == (300, 9000, 5)
+    assert not (tmp_path / "elsewhere" / "runs").exists()
+    assert not list(record.parent.glob("*.pt"))
+    assert pretrain.main(["--domain", "odd_even", "--encoder", "cgf", "--objective", "mode_ce", "--variant", "oe50_short",
+                          "--match_params", "109448", "--device", "cpu", "--output_root", str(root),
+                          "--run_tag", "t", "--dry_run"]) is None
+    [record] = list(root.glob("odd_even/oe50_short/pretrain/cgf_belief_pretrain/*_cgf_mode_ce_seed0_t/run_config.json"))
+    config = json.loads(record.read_text())
+    # Odd-Even's CGF recipe from the encoder table: tanh 50, spread_1d, running norm, t_init_max 40.
+    assert (config["t_param"], config["t_bound"], config["t_init_mode"], config["feature_norm"]) == ("tanh", 50.0, "spread_1d", "running")
+    assert config["t_init_max"] == 40.0 and config["encoder_params"] > 100_000
+
+
+def test_exact_posterior_refusals(tmp_path, capsys):
+    base = ["--domain", "odd_even", "--variant", "oe50_short", "--dry_run", "--base_dir", str(tmp_path)]
+    with pytest.raises(SystemExit):
+        pretrain.main(["--encoder", "deepset", *base])
+    assert "implemented for --encoder st | cgf, not 'deepset'" in capsys.readouterr().err
+    with pytest.raises(SystemExit):
+        pretrain.main(["--domain", "odd_even", "--encoder", "st", "--dry_run", "--base_dir", str(tmp_path)])
+    assert "rolls the env itself: pass --variant" in capsys.readouterr().err
+    with pytest.raises(SystemExit):
+        pretrain.main(["--domain", "odd_even", "--encoder", "st", "--dry_run"])
+    assert "objective 'belief_kl' has no inputs to read one from" in capsys.readouterr().err
+    with pytest.raises(SystemExit) as exc:
+        pretrain.main(["--encoder", "cgf", "--match_params", "2000", "--init_from", "nowhere.pt", *base])
+    assert "--init_from is implemented for --encoder st only" in str(exc.value)
+    assert not list(tmp_path.iterdir())        # every refusal came before a run folder existed
+
+
+def test_exact_posterior_package_route_trains_and_round_trips(tmp_path, monkeypatch):
+    """A real (tiny) run through `python -m set_transformer.rl.pretrain`: the script's files plus
+    run_config.json, the checkpoint in the RL loader's format, the round-trip check passed
+    (main raises otherwise), the probe skipped on request."""
+    from set_transformer.rl import run_records
+    monkeypatch.setattr(run_records, "git_provenance", lambda: {})
+    result = pretrain.main(["--domain", "odd_even", "--encoder", "st", "--variant", "oe50_short", "--device", "cpu",
+                            "--base_dir", str(tmp_path), "--n_train_episodes", "4", "--n_val_episodes", "2",
+                            "--num_epochs", "1", "--skip_probe"])
+    run_dir = result.run_dir
+    assert run_dir.parent == tmp_path / "st_belief_pretrain"
+    assert {"args.json", "run_config.json", "checkpoint_best.pt", "checkpoint_last.pt", "history.json"} <= {
+        p.name for p in run_dir.iterdir()}
+    assert not (run_dir / "probe_results.json").exists()
+    assert result.rl_checkpoint == run_dir / "checkpoint_best.pt" and result.summary["best_epoch"] == 1
+    ck = torch.load(result.rl_checkpoint, map_location="cpu", weights_only=False)
+    assert set(ck) == {"model_state_dict", "head_state_dict", "config", "epoch", "val", "args"}
+    assert (ck["config"]["objective"], ck["config"]["encoder"], ck["config"]["arena_scale"]) == ("belief_kl", "st", 24.5)
+    args = json.loads((run_dir / "args.json").read_text())
+    assert (args["num_epochs"], args["objective"], args["encoder"], args["variant"]) == (1, "belief_kl", "st", "oe50_short")
+    assert [row["epoch"] for row in json.loads((run_dir / "history.json").read_text())] == [1]
+
+
 def test_run_tag_and_experiment_name_shape_the_run_folder(dataset, tmp_path, monkeypatch):
     from set_transformer.rl import run_records
     monkeypatch.setattr(run_records, "git_provenance", lambda: {})
@@ -183,15 +274,74 @@ def test_run_tag_and_experiment_name_shape_the_run_folder(dataset, tmp_path, mon
 
 
 def test_variant_flag_must_belong_to_the_domain(dataset, tmp_path, capsys):
+    # --objective named: since 7.3 Odd-Even's default objective is belief_kl, not reconstruction.
     with pytest.raises(SystemExit) as exc:
-        pretrain.main(["--domain", "odd_even", "--encoder", "st", "--data_path", str(dataset), *SMALL,
-                       "--base_dir", str(tmp_path), "--dry_run"])
+        pretrain.main(["--domain", "odd_even", "--encoder", "st", "--objective", "reconstruction",
+                       "--data_path", str(dataset), *SMALL, "--base_dir", str(tmp_path), "--dry_run"])
     assert exc.value.code == 2 and "--variant 'smart' is not a odd_even variant" in capsys.readouterr().err
+
+
+def test_a_flag_of_another_objective_is_refused_with_the_default_named(dataset, tmp_path, capsys):
+    """--data_path without --objective on odd_even: the domain's default (belief_kl) applies, and
+    the error says so instead of a bare 'unrecognized arguments'."""
+    with pytest.raises(SystemExit) as exc:
+        pretrain.main(["--domain", "odd_even", "--encoder", "st", "--data_path", str(dataset),
+                       "--base_dir", str(tmp_path), "--dry_run"])
+    err = capsys.readouterr().err
+    assert exc.value.code == 2 and "unrecognized arguments: --data_path" in err
+    assert "odd_even's default 'belief_kl' applies; --list_objectives shows the others" in err
+    # With the objective named, the same typo is a plain unrecognized-argument error.
+    with pytest.raises(SystemExit):
+        pretrain.main(["--domain", "odd_even", "--encoder", "st", "--objective", "belief_kl", "--variant",
+                       "oe50_short", "--data_path", str(dataset), "--base_dir", str(tmp_path), "--dry_run"])
+    err = capsys.readouterr().err
+    assert "unrecognized arguments: --data_path" in err and "default" not in err
 
 
 # ---------------------------------------------------------------------------
 # The 3_train_st.py entry point: historical defaults
 # ---------------------------------------------------------------------------
+
+BELIEF = _ST_ROOT / "experiments" / "odd_even" / "3_pretrain_st_belief.py"
+
+
+def _load_belief_entry_point():
+    spec = importlib.util.spec_from_file_location("pretrain_cmd_test_3_pretrain_st_belief", BELIEF)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_belief_entry_point_translates_its_legacy_spellings(capsys):
+    """3_pretrain_st_belief.py: --epochs / --lr / --out_dir become the package spellings, the
+    script's defaults (--encoder st, --variant oe50_short) are filled in, the RL-side flags are
+    refused with the script's message (exit 2), and --help is the package help for the chosen
+    encoder with the translations appended."""
+    ep = _load_belief_entry_point()
+    assert ep.translate(["--epochs", "3", "--lr=0.01", "--out_dir", "/x/y", "--encoder", "cgf", "--skip_probe"]) == [
+        "--num_epochs", "3", "--learning_rate=0.01", "--base_dir", "/x", "--experiment_name", "y",
+        "--encoder", "cgf", "--skip_probe", "--variant", "oe50_short"]
+    assert ep.translate([]) == ["--encoder", "st", "--variant", "oe50_short"]
+    assert ep.translate(["--variant", "oe50", "--objective", "mode_ce"]) == [
+        "--variant", "oe50", "--objective", "mode_ce", "--encoder", "st"]
+    with pytest.raises(SystemExit) as exc:
+        ep.translate(["--encoder", "cgf", "--cgf_frozen"])
+    assert exc.value.code == 2
+    assert "RL-side flags; this script PRODUCES the checkpoint" in capsys.readouterr().err
+    assert ep.main(["--help"]) is None
+    out = " ".join(capsys.readouterr().out.split())        # argparse wraps at the terminal width
+    body, _, epilogue = out.partition("This script's historical spellings")
+    assert "--num_epochs" in body and "--num_post_sab" in body and "--probe_episodes" in body
+    assert "--epochs N" in epilogue and "--lr X" in epilogue and "--out_dir DIR" in epilogue
+    assert "--t_param" not in body and "--help --encoder cgf" in epilogue
+    assert ep.main(["--help", "--encoder", "cgf"]) is None
+    out = " ".join(capsys.readouterr().out.split())
+    assert "--t_param" in out and "--match_params" in out and "--help --encoder cgf" not in out
+    # The pieces the recorded tools and tests read off the script are still there.
+    for name in ("build_extractor", "BeliefBatches", "BeliefEncoderWithHead", "save_belief_checkpoint"):
+        assert hasattr(ep, name), name
+
 
 def test_entry_point_fills_its_historical_defaults_only_where_the_user_said_nothing():
     ep = _load_entry_point()

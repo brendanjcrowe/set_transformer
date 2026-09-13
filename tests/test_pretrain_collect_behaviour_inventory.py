@@ -397,7 +397,9 @@ def test_belief_run_folder_name_and_files(belief_st_run):
     assert {"args.json", "checkpoint_best.pt", "checkpoint_last.pt", "history.json",
             "probe_results.json"} <= {p.name for p in belief_st_run.iterdir()}
     args = json.loads((belief_st_run / "args.json").read_text())
-    assert args["variant"] == "oe50_short" and args["encoder"] == "st" and args["epochs"] == 2
+    # 7.3: args.json records the package command's spelling (--epochs is translated to
+    # --num_epochs by the entry point; decision 2 of plan section 7).
+    assert args["variant"] == "oe50_short" and args["encoder"] == "st" and args["num_epochs"] == 2
 
 
 def test_belief_st_checkpoint_is_in_the_rl_loaders_format(belief_st_run):

@@ -46,7 +46,12 @@ def _run(spec: str, threads: int) -> None:
 def _files(root: Path) -> dict[str, Path]:
     out = {}
     for path in sorted(root.rglob("*")):
-        if path.suffix in (".pt", ".json") and path.name != "run_config.json":
+        # run_config.json is the command's own record (paths, git, threads); args.json is the
+        # parsed namespace, whose flag spellings changed by decision 2 (--epochs -> --num_epochs,
+        # --lr -> --learning_rate) and which now carries the encoder table's extra flags. The
+        # checkpoint's `args` key is ignored for the same reason; every VALUE that matters is
+        # compared through the checkpoint's `config` block and the history / probe files.
+        if path.suffix in (".pt", ".json") and path.name not in ("run_config.json", "args.json"):
             rel = _TIMESTAMP.sub("<ts>", str(path.relative_to(root)))
             out[rel] = path
     return out

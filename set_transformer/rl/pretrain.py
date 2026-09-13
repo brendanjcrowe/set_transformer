@@ -272,7 +272,14 @@ def main(argv: Sequence[str] | None = None, *, domain: Domain | str | None = Non
                          "--variant <registry key> (and --domain) or --base_dir <folder>")
 
     parser = build_parser(domain, encoder, objective_record, prog=prog, selectors=True)
-    args = parser.parse_args(argv)
+    args, unknown = parser.parse_known_args(argv)
+    if unknown:
+        # 7.3: a domain may default to its own objective (Odd-Even: belief_kl), so a flag of
+        # another objective (--data_path) is "unrecognized" for a reason worth stating.
+        hint = ("" if (objective is not None or pre.objective) else
+                f" (--objective was not given, so {domain.name}'s default "
+                f"{objective_record.name!r} applies; --list_objectives shows the others)")
+        parser.error(f"unrecognized arguments: {' '.join(unknown)}{hint}")
     if args.list_variants:
         domain.print_variants()
         return None
@@ -290,7 +297,11 @@ def main(argv: Sequence[str] | None = None, *, domain: Domain | str | None = Non
         base_dir = Path(args.base_dir)
     else:
         if not args.variant:
-            parser.error("--base_dir not given and the dataset records no variant: pass "
+            # 7.3: an objective without inputs (the exact posterior rolls the env) has nothing
+            # to read a variant from; say so instead of blaming a dataset it does not take.
+            what = ("the dataset records no variant" if hasattr(args, "data_path")
+                    else f"objective {objective_record.name!r} has no inputs to read one from")
+            parser.error(f"--base_dir not given and {what}: pass "
                          "--variant <registry key> (and --domain) or --base_dir <folder>")
         experiment_dir = run_records.pretrain_dir(domain.name, args.variant, args.experiment_name,
                                                   root=args.output_root)

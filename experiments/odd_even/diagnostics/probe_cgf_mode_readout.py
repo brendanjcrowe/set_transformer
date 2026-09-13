@@ -103,9 +103,6 @@ for _p in (str(_REPO_ROOT), str(_OE_DIR), str(_ST_ROOT)):
 
 import gymnasium as gym  # noqa: E402
 import torch  # noqa: E402
-from sklearn.linear_model import LogisticRegression  # noqa: E402
-from sklearn.model_selection import GroupKFold  # noqa: E402
-from sklearn.neural_network import MLPClassifier  # noqa: E402
 
 from set_transformer.rl.feature_extractors.cgf import (  # noqa: E402
     WeightedCGFFeaturesExtractor,
@@ -119,11 +116,18 @@ from set_transformer.rl.feature_extractors.st import (  # noqa: E402
 from set_transformer.rl.domains import odd_even as variants  # noqa: E402
 belief_env = variants
 
-#: The transient/steady split. Steps 1..21 are the transient -- the belief is
-#: still sharpening and the encodings provably differ there; 22..cap is the
-#: steady state. domain_mds/oddeven.md uses this same boundary for every
-#: reward number, so a probe on a different one is not comparable to them.
-TRANSIENT_MAX_STEP = 21
+# The rollout, the extractor runner, the geometry numbers, the grouped-CV classifiers and
+# the transient/steady split live in the package since batch 7.3 (2026-09-13): the
+# exact-posterior pretraining's end-of-run report uses them, so they are imported here
+# rather than loaded from this file by path. Bodies unchanged.
+from set_transformer.rl.domains.odd_even import (  # noqa: E402
+    TRANSIENT_MAX_STEP,
+    _fit_predict,
+    _run_extractor,
+    _split_accuracy,
+    collect_rollouts,
+    geometry,
+)
 
 #: Sinkhorn-pretrained ST checkpoints from the 2026-09-04 alignment entry in
 #: domain_mds/oddeven.md, relative to the REPO ROOT. Both live under
@@ -160,100 +164,6 @@ def _dict_space(num_states: int) -> gym.spaces.Dict:
                                     np.float32),
         "weights": gym.spaces.Box(0.0, 1.0, (num_states,), np.float32),
     })
-
-
-def collect_rollouts(variant: str, n_episodes: int, seed: int):
-    """Roll the RL arms' own belief env, recording one snapshot per decision.
-
-    Rolls `make_odd_even_belief_env` -- the same factory every arm and the
-    eval build -- so the belief distribution probed is the one the policy
-    sees, including the float32 cast of the weights and the wrapper's
-    centring of the particles.
-
-    THE TIMING, which is the one thing here that is easy to get silently
-    wrong. `step()` fixes the prediction BEFORE drawing that step's
-    observations, so the belief available when choosing the action for step t
-    holds o_0 .. o_{t-1}. The reset observation is therefore the snapshot for
-    step 1, and the obs returned by step t is the snapshot for step t+1. The
-    obs after the final step is never acted on and is dropped. Recording the
-    post-step belief against step t instead would hand every encoding one
-    extra observation and inflate every number in the table.
-
-    Labels come from the SAME info dict that produced the snapshot:
-        target A  info['true_state']         -- s*, constant within an episode
-        target B  info['optimal_prediction'] -- argmax_s P(s | o_0..o_{t-1})
-    Both are read off the env's float64 posterior rather than recomputed from
-    the float32 weights in the observation, so an argmax tie broken
-    differently by the cast cannot mislabel a row.
-
-    Returns particles/weights as the extractors will receive them, plus
-    labels, episode groups and 1-based step indices.
-    """
-    resolved = variants.resolve(variant)
-    num_states = resolved.n_dist_size
-    cap = variants.episode_cap(variant)
-
-    env = belief_env.make_odd_even_belief_env(
-        variant=variant, num_particles=num_states, rank=0, seed=seed)()
-
-    particles, weights, base_obs = [], [], []
-    true_states, modes, groups, steps = [], [], [], []
-
-    for episode in range(n_episodes):
-        # seed + episode, never a constant seed: the hidden state is drawn at
-        # reset, so one seed IS one episode replayed N times (PITFALLS.md #2
-        # and the Gap 4 seeding trap).
-        obs, info = env.reset(seed=seed + episode)
-        for step in range(1, cap + 1):
-            particles.append(np.asarray(obs["particles"], dtype=np.float32))
-            weights.append(np.asarray(obs["weights"], dtype=np.float32))
-            base_obs.append(np.asarray(obs["obs"], dtype=np.float32))
-            true_states.append(int(info["true_state"]))
-            modes.append(int(info["optimal_prediction"]))
-            groups.append(episode)
-            steps.append(step)
-            # The action is irrelevant to the belief trajectory: it is a
-            # prediction and touches neither the hidden state nor the
-            # observation model, so the posterior evolves identically under
-            # any policy (domain_mds/oddeven.md, 2026-09-03 visualisation).
-            obs, _reward, terminated, truncated, info = env.step(0)
-            if terminated or truncated:
-                break
-    env.close()
-
-    return {
-        "particles": np.stack(particles),
-        "weights": np.stack(weights),
-        "base_obs": np.stack(base_obs),
-        "true_state": np.asarray(true_states, dtype=np.int64),
-        "mode": np.asarray(modes, dtype=np.int64),
-        "group": np.asarray(groups, dtype=np.int64),
-        "step": np.asarray(steps, dtype=np.int64),
-        "num_states": num_states,
-        "cap": cap,
-    }
-
-
-def _run_extractor(extractor, data, batch_size=1024) -> np.ndarray:
-    """Features from a real SB3 extractor, dropping the base-obs passthrough.
-
-    Column 0 of every extractor's output is `obs_dict["obs"]` -- here the
-    normalized step index, which is not part of the belief encoding and which
-    a 50-way readout would otherwise use as a strong prior over the mode
-    (later steps concentrate). The probe must measure the ENCODING, so the
-    passthrough is dropped.
-    """
-    extractor.eval()
-    out = []
-    with torch.no_grad():
-        for i in range(0, len(data["particles"]), batch_size):
-            sl = slice(i, i + batch_size)
-            out.append(extractor({
-                "obs": torch.from_numpy(data["base_obs"][sl]),
-                "particles": torch.from_numpy(data["particles"][sl]),
-                "weights": torch.from_numpy(data["weights"][sl]),
-            })[:, 1:].numpy())
-    return np.concatenate(out).astype(np.float64)
 
 
 def _fixed_t_cgf(space, num_features, arena_scale, t_lo, t_hi):
@@ -500,111 +410,6 @@ def relative_spread(features: np.ndarray) -> float:
     std = features.std(axis=0)
     mag = np.abs(features).mean() + 1e-12
     return float((std / mag).mean())
-
-
-def geometry(features: np.ndarray, posterior_mean: np.ndarray) -> dict:
-    """How many DIRECTIONS the encoding actually varies along, and along what.
-
-    This is the mechanism behind the accuracy table and the reason a 64-wide
-    encoding can score like a 1-wide one. Three numbers, all scale-free:
-
-        eff_rank      exp(entropy of the normalized singular-value spectrum)
-                      of the centred features. 1.0 means one direction
-                      carries the variance however many columns there are.
-        pc1_var_frac  variance fraction in the leading direction.
-        pc1_corr_mean |corr| between that direction and the POSTERIOR MEAN.
-                      If this is ~1, the encoding is a reparameterisation of
-                      the mean and cannot carry more than the mean does.
-        min_pair_corr smallest |corr| between any two features. Near 1 means
-                      every column is a monotone restatement of one number;
-                      GAUSS2 reads ~0.02 here because mean and variance are
-                      genuinely independent, which is the useful contrast.
-
-    Computed in float64 on the same features the classifiers get. Note the
-    numerical rank can still be full while eff_rank is 1.0 -- the tail
-    directions exist but at a magnitude the standardised/unstandardised
-    contrast is exactly about.
-    """
-    # Absolute per-feature spread, reported ALONGSIDE the relative one because
-    # the relative measure divides by the GLOBAL mean magnitude and so cannot
-    # separate "small signal" from "large constant offset". ST_E2E is exactly
-    # that case: relative spread 9.5e-4 but absolute per-column std 9.1e-5 on
-    # features whose mean magnitude is 0.096.
-    abs_std = float(features.std(axis=0).mean())
-
-    centred = features - features.mean(axis=0)
-    singular = np.linalg.svd(centred, compute_uv=False)
-    total = (singular ** 2).sum()
-    if total <= 0:
-        return {"eff_rank": 1.0, "pc1_var_frac": 1.0, "abs_std": abs_std,
-                "pc1_corr_mean": float("nan"), "min_pair_corr": float("nan")}
-    spectrum = singular ** 2 / total
-    eff_rank = float(np.exp(-(spectrum * np.log(spectrum + 1e-300)).sum()))
-
-    left, values, _ = np.linalg.svd(centred, full_matrices=False)
-    pc1 = left[:, 0] * values[0]
-    pc1_corr = abs(float(np.corrcoef(pc1, posterior_mean)[0, 1]))
-
-    if features.shape[1] > 1:
-        corr = np.corrcoef(features.T)
-        off_diagonal = corr[~np.eye(features.shape[1], dtype=bool)]
-        min_pair = float(np.abs(off_diagonal).min())
-    else:
-        min_pair = float("nan")
-
-    return {"eff_rank": eff_rank, "pc1_var_frac": float(spectrum[0]),
-            "abs_std": abs_std,
-            "pc1_corr_mean": pc1_corr, "min_pair_corr": min_pair}
-
-
-def _fit_predict(features, labels, groups, n_splits, classifier, standardise,
-                 seed):
-    """Grouped-CV out-of-fold predictions for one (classifier, scaling) pair.
-
-    GroupKFold by episode: every step of one episode shares s*, so an
-    ungrouped split puts the same label on both sides and the score measures
-    memorisation. Scaling statistics are fitted on the TRAINING fold only --
-    fitting them on everything leaks the test fold's distribution into the
-    amplification the whole standardised/unstandardised contrast is about.
-    """
-    preds = np.empty_like(labels)
-    for train, test in GroupKFold(n_splits=n_splits).split(
-            features, labels, groups):
-        x_train, x_test = features[train], features[test]
-        if standardise:
-            mu = x_train.mean(axis=0)
-            sd = x_train.std(axis=0)
-            sd = np.where(sd < 1e-12, 1.0, sd)
-            x_train = (x_train - mu) / sd
-            x_test = (x_test - mu) / sd
-        if classifier == "logreg":
-            # Multinomial (softmax over all 50 classes), which is
-            # LogisticRegression's only behaviour from sklearn 1.7 -- the
-            # `multi_class` argument that used to select it was removed in
-            # 1.9, so passing it raises rather than being ignored.
-            model = LogisticRegression(max_iter=3000, C=1.0)
-        elif classifier == "mlp":
-            model = MLPClassifier(hidden_layer_sizes=(128,), max_iter=600,
-                                  random_state=seed, early_stopping=False)
-        else:
-            raise ValueError(f"unknown classifier {classifier!r}")
-        model.fit(x_train, labels[train])
-        preds[test] = model.predict(x_test)
-    return preds
-
-
-def _split_accuracy(preds, labels, steps):
-    """Top-1 accuracy in the transient, the steady state, and pooled."""
-    correct = preds == labels
-    transient = steps <= TRANSIENT_MAX_STEP
-    steady = ~transient
-    return {
-        "transient": float(correct[transient].mean()) if transient.any()
-        else float("nan"),
-        "steady": float(correct[steady].mean()) if steady.any()
-        else float("nan"),
-        "pooled": float(correct.mean()),
-    }
 
 
 def main(argv=None):
