@@ -289,6 +289,11 @@ def main() -> None:
     cgf.add_argument("--x_embed_hidden", type=int, default=64)
     cgf.add_argument("--x_embed_depth", type=int, default=1)
     parser.add_argument(
+        "--device", type=str, default=None,
+        help="Torch device for training (cpu, cuda, cuda:1). Default: cuda when "
+             "available, else cpu -- what the script always did. Pass cpu for a "
+             "bit-for-bit comparison between two checkouts.")
+    parser.add_argument(
         "--seed", type=int, default=0,
         help="Seeds model init, the shuffle order and the train/val split. "
              "Without it every invocation gets a different val set, so "
@@ -318,7 +323,7 @@ def main() -> None:
     if mp.get_start_method(allow_none=True) != "spawn":
         mp.set_start_method("spawn")
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
 
     # Does the dataset carry PF weights? np.load on an .npz is lazy, so this
     # reads the archive index only, not the arrays.

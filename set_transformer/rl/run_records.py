@@ -150,6 +150,28 @@ class TeeStream:
             stream.flush()
 
 
+def thread_settings() -> dict:
+    """Record HOW MANY THREADS this run computes with, for run_config.json (PITFALLS.md
+    section 12, item 3).
+
+    On CPU the thread count is part of the seed: BLAS reductions round differently per
+    thread count, and PPO amplifies the last bit, so a recorded run is reproducible to the
+    digit only at the thread count it ran with (checked 2026-09-12: the same Odd-Even CGF
+    command matched a recorded run bit for bit at OMP_NUM_THREADS=8 and drifted after
+    ~40k steps at 1, 2, 4 or 64). The three environment variables are recorded as the
+    process saw them (None when unset); ``torch`` is the number PyTorch actually uses,
+    which is what matters when none of them is set.
+    """
+    import torch  # local: keep importing this module cheap
+
+    return {
+        "omp": os.environ.get("OMP_NUM_THREADS"),
+        "mkl": os.environ.get("MKL_NUM_THREADS"),
+        "openblas": os.environ.get("OPENBLAS_NUM_THREADS"),
+        "torch": int(torch.get_num_threads()),
+    }
+
+
 def tee_stdout_stderr(log_path: str) -> None:
     """Mirror stdout/stderr into log_path, in addition to the console.
 

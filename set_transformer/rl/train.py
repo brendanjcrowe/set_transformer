@@ -624,6 +624,7 @@ def main(argv: Sequence[str] | None = None, *, domain: Domain | str | None = Non
         particle_filter_class=particle_filter_class.__name__,
         run_subdir=run_subdir,
         git=run_records.git_provenance(),
+        threads=run_records.thread_settings(),
         **domain.run_config_extras(args),
         **run_config,
     )

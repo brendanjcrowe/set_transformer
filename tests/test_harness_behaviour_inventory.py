@@ -846,6 +846,10 @@ def test_bare_entry_points_write_under_the_root_layout(ant_tag, odd_even, monkey
     [record] = list(root.glob("ant_tag/smart/rl/cgf/*_seed3_t/run_config.json"))
     config = json.loads(record.read_text())
     assert config["run_directory"] == str(record.parent) and config["output_root"] == str(root.resolve())
+    # Batch 7.0 (2026-09-13): the thread count is part of the record (PITFALLS sec 12, item 3).
+    import torch
+    assert set(config["threads"]) == {"omp", "mkl", "openblas", "torch"}
+    assert config["threads"]["torch"] == torch.get_num_threads()
     odd_even["4_train_rl_gaussian"].main(["--variant", "oe50_short", "--output_root", str(root), "--dry_run"])
     assert list(root.glob("odd_even/oe50_short/rl/gaussian/*_seed0/run_config.json"))
     ant_tag["4_train_rl_pool"].main(encoder="kmoments", argv=["--variant", "smart", "--run_subdir", "sweep",

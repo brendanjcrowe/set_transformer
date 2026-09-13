@@ -163,7 +163,7 @@ def test_end_to_end_script_on_a_tiny_weighted_dataset(tmp_path, weighted):
            "--num_epochs", "2", "--batch_size", "8", "--particle_scale", str(SCALE),
            "--base_dir", str(tmp_path / "runs"), "--experiment_name", "smoke",
            "--eval_freq", "3", "--save_freq", "1000", "--num_workers", "0",
-           "--warmup_epochs", "1", "--seed", "0", "--dim_hidden", "32"]
+           "--warmup_epochs", "1", "--seed", "0", "--dim_hidden", "32", "--device", "cpu"]
     if not weighted:
         cmd.append("--ignore_weights")
     env = {**os.environ, "WANDB_MODE": "offline", "CUDA_VISIBLE_DEVICES": ""}
@@ -180,6 +180,18 @@ def test_end_to_end_script_on_a_tiny_weighted_dataset(tmp_path, weighted):
                              pretrained_cgf_model_path=str(exports[0]))
     assert isinstance(ext, WeightedCGFFeaturesExtractor)
     assert "Exported CGF arm encoder" in proc.stdout
+
+
+def test_script_takes_a_device_flag_and_defaults_to_the_automatic_choice():
+    """Batch 7.0 (2026-09-13): --device exists so two checkouts can be compared on CPU;
+    without it the script keeps choosing cuda-if-available as it always did."""
+    script = Path(__file__).resolve().parents[1] / "experiments" / "ant_tag" / "3_train_st.py"
+    proc = subprocess.run([sys.executable, str(script), "--help"], cwd=script.parent,
+                          capture_output=True, text=True, timeout=300)
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    assert "--device" in proc.stdout
+    source = script.read_text()
+    assert 'args.device or ("cuda" if torch.cuda.is_available() else "cpu")' in source
 
 
 def test_rl_script_accepts_the_export_and_reloads_it(tmp_path):

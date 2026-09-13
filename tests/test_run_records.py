@@ -57,6 +57,19 @@ def test_git_provenance_names_both_repos_and_never_raises():
     assert Path(provenance["set_transformer"]["path"]) == _ST_ROOT
 
 
+def test_thread_settings_record_the_env_vars_and_torchs_count(monkeypatch):
+    """PITFALLS section 12, item 3: a CPU run reproduces to the digit only at its thread
+    count, so the record says what it was. Unset variables are None, not missing."""
+    import torch
+    monkeypatch.setenv("OMP_NUM_THREADS", "8")
+    monkeypatch.delenv("MKL_NUM_THREADS", raising=False)
+    monkeypatch.delenv("OPENBLAS_NUM_THREADS", raising=False)
+    threads = rr.thread_settings()
+    assert set(threads) == {"omp", "mkl", "openblas", "torch"}
+    assert threads["omp"] == "8" and threads["mkl"] is None and threads["openblas"] is None
+    assert threads["torch"] == torch.get_num_threads() and isinstance(threads["torch"], int)
+
+
 def test_scripts_hand_back_the_package_functions_under_their_old_names():
     """The scripts import the moved functions under their historical underscore names; the
     tests that monkeypatch `module._default_run_dir` etc. rely on those attributes existing,
