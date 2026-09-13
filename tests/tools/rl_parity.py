@@ -137,18 +137,37 @@ def compare_vecnormalize(a: Path, b: Path, report: list) -> None:
     report.append(("vecnormalize.pkl", not bad, f"{len(sa)} statistics" if not bad else f"differ: {bad}"))
 
 
-def compare_records(a: Path | None, b: Path | None, report: list, extra_ok: bool) -> None:
+def parse_renames(specs: list[str]) -> dict:
+    """``old=new`` or ``old=!new`` (B stores the negation): A's key -> (B's key, convert)."""
+    renames = {}
+    for spec in specs or ():
+        old, _, new = spec.partition("=")
+        negate = new.startswith("!")
+        renames[old] = (new.lstrip("!"), (lambda v: not v) if negate else (lambda v: v))
+    return renames
+
+
+def compare_records(a: Path | None, b: Path | None, report: list, extra_ok: bool,
+                    renames: dict | None = None) -> None:
     if a is None or b is None:
         report.append(("run_config.json", False, "missing on one side"))
         return
     ra, rb = json.loads(a.read_text()), json.loads(b.read_text())
-    differ = [k for k in ra if k not in RECORD_IGNORE and k in rb and ra[k] != rb[k]]
+    ra_full, rb_full = dict(ra), dict(rb)
+    renames = renames or {}
+    # A key B stores under another name (--record_rename): compare through the mapping.
+    renamed_bad = [k for k, (new, conv) in renames.items()
+                   if k in ra and (new not in rb or rb[new] != conv(ra[k]))]
+    ra = {k: v for k, v in ra.items() if k not in renames}
+    rb = {k: v for k, v in rb.items() if k not in {new for new, _ in renames.values()}}
+    differ = renamed_bad + [k for k in ra if k not in RECORD_IGNORE and k in rb and ra[k] != rb[k]]
     missing = [k for k in ra if k not in RECORD_IGNORE and k not in rb]
     extra = sorted(k for k in rb if k not in RECORD_IGNORE and k not in ra)
     ok = not differ and not missing and (extra_ok or not extra)
     note = []
     if differ:
-        note.append("differ: " + ", ".join(f"{k}={ra[k]!r}/{rb[k]!r}" for k in differ[:6]))
+        note.append("differ: " + ", ".join(
+            f"{k}={ra_full.get(k)!r}/{rb_full.get(renames.get(k, (k,))[0])!r}" for k in differ[:6]))
     if missing:
         note.append(f"missing in B: {missing}")
     if extra:
@@ -156,7 +175,7 @@ def compare_records(a: Path | None, b: Path | None, report: list, extra_ok: bool
     report.append(("run_config.json", ok, "; ".join(note) or f"{len(ra)} keys equal"))
 
 
-def compare(a: dict, b: dict, extra_ok: bool) -> list:
+def compare(a: dict, b: dict, extra_ok: bool, renames: dict | None = None) -> list:
     report = []
     compare_npz(a["log_dir"] / "evaluations.npz", b["log_dir"] / "evaluations.npz", report)
     compare_tensors(zip_tensors(a["model_path"]), zip_tensors(b["model_path"]), "final model", report)
@@ -169,7 +188,7 @@ def compare(a: dict, b: dict, extra_ok: bool) -> list:
             compare_tensors(zip_tensors(pa), zip_tensors(pb), f"checkpoint {pa.name}", report)
     compare_vecnormalize(a["model_path"].parent / "vecnormalize.pkl",
                          b["model_path"].parent / "vecnormalize.pkl", report)
-    compare_records(a["record"], b["record"], report, extra_ok)
+    compare_records(a["record"], b["record"], report, extra_ok, renames)
     return report
 
 
@@ -185,6 +204,9 @@ def main(argv=None) -> int:
     parser.add_argument("--no_preset", action="store_true", help="do not append the short-run size flags")
     parser.add_argument("--record_extra_ok", action="store_true",
                         help="B's run_config.json may carry keys A's does not")
+    parser.add_argument("--record_rename", action="append", default=[], metavar="OLD=NEW",
+                        help="A's record key OLD is B's key NEW; OLD=!NEW when B stores the "
+                             "negation (e.g. no_layer_norm=!ln). Repeatable.")
     parser.add_argument("--reuse", action="store_true",
                         help="skip a side whose final model already exists under --out")
     parser.add_argument("flags", nargs=argparse.REMAINDER, help="script flags after --")
@@ -207,7 +229,7 @@ def main(argv=None) -> int:
         print(f"[{label}] running {args.script} from {checkout} ...", flush=True)
         sides.append(run_side(label, checkout, args.domain, args.script, flags, args.out, stem))
 
-    report = compare(sides[0], sides[1], args.record_extra_ok)
+    report = compare(sides[0], sides[1], args.record_extra_ok, parse_renames(args.record_rename))
     width = max(len(name) for name, _, _ in report)
     for name, ok, note in report:
         print(f"  {name:<{width}}  {'EQUAL' if ok else 'DIFFER'}  {note}")

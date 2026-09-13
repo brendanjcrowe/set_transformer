@@ -55,6 +55,9 @@ pytest.importorskip("stable_baselines3")
 
 import torch  # noqa: E402
 
+from set_transformer.rl import run_records  # noqa: E402
+from set_transformer.rl import train as train_mod  # noqa: E402
+
 #: The main variant: n=50 on a 50-step cap, where the transient is 42% of the
 #: episode. Its state range half-width is 24.5 and its centre 25.5.
 VARIANT = "oe50"
@@ -693,17 +696,16 @@ def test_sentinel_callback_logs_over_the_whole_rollout(tmp_path):
     sentinel_module = _load("st_feature_sentinel")
     callback = sentinel_module.OddEvenSTFeatureSentinel()
 
-    cgf.train_odd_even(
-        policy_kwargs={
-            "features_extractor_class": SetTransformerFeaturesExtractor,
-            "features_extractor_kwargs": dict(
-                num_encodings=2, dim_encoder=4, num_inds=4, dim_hidden=16,
-                num_heads=2, ln=True, arena_scale=(NS - 1) / 2,
-                weight_channel=True),
-        },
-        encoder="st", variant=VARIANT, total_timesteps=256, n_envs=1,
+    assert SetTransformerFeaturesExtractor is train_mod._encoders.ENCODERS["st"].extractor_class
+    train_mod.train(
+        "odd_even", VARIANT, "st",
+        features_extractor_kwargs=dict(
+            num_encodings=2, dim_encoder=4, num_inds=4, dim_hidden=16,
+            num_heads=2, ln=True, arena_scale=(NS - 1) / 2,
+            weight_channel=True),
+        total_timesteps=256, n_envs=1,
         ppo_n_steps=128, batch_size=32, n_epochs=2, num_particles=NS,
-        device="cpu", seed=0, run_subdir="test_sentinel",
+        device="cpu", seed=0,
         log_dir=str(tmp_path / "logs") + "/",
         model_save_path=str(tmp_path / "models" / "st_agent.zip"),
         eval_freq=10**9, save_freq=10**9, n_eval_episodes=1,
@@ -778,10 +780,11 @@ def test_arm_trains_end_to_end(tmp_path, arm, encoder):
         }
 
     model_path = tmp_path / "models" / f"{encoder}_agent.zip"
-    model = cgf.train_odd_even(
-        policy_kwargs=policy_kwargs,
-        encoder=encoder,
-        variant=VARIANT,
+    assert policy_kwargs["features_extractor_class"] is \
+        train_mod._encoders.ENCODERS[encoder].extractor_class
+    model = train_mod.train(
+        "odd_even", VARIANT, encoder,
+        features_extractor_kwargs=policy_kwargs["features_extractor_kwargs"],
         total_timesteps=256,
         n_envs=1,
         ppo_n_steps=128,
@@ -790,7 +793,6 @@ def test_arm_trains_end_to_end(tmp_path, arm, encoder):
         num_particles=NS,
         device="cpu",
         seed=0,
-        run_subdir=f"test_{encoder}",
         log_dir=str(tmp_path / "logs") + "/",
         model_save_path=str(model_path),
         eval_freq=10**9,
@@ -851,8 +853,7 @@ def test_run_subdir_is_honoured(tmp_path):
     in the base variant's directory. That wart is deliberately not
     reproduced, so it is worth a test.
     """
-    cgf = _load("4_train_rl_cgf")
-    run_dir = cgf._default_run_dir(3, "odd_even_cgf_oe50", run_tag="tag one")
+    run_dir = run_records.default_run_dir(3, "odd_even_cgf_oe50", run_tag="tag one")
     assert run_dir.startswith("runs/odd_even_cgf_oe50/")
     assert run_dir.endswith("_seed3_tag_one"), run_dir
 
@@ -1107,15 +1108,13 @@ def test_failed_run_is_marked_failed_beside_its_saved_model(tmp_path):
 
     model_path = tmp_path / "models" / "cgf_agent.zip"
     with pytest.raises(RuntimeError, match="simulated crash"):
-        cgf.train_odd_even(
-            policy_kwargs={
-                "features_extractor_class": WeightedCGFFeaturesExtractor,
-                "features_extractor_kwargs": dict(
-                    num_cgf_features=8, arena_scale=(NS - 1) / 2, t_init_mode="spread_1d"),
-            },
-            encoder="cgf", variant=VARIANT, total_timesteps=256, n_envs=1,
+        train_mod.train(
+            "odd_even", VARIANT, "cgf",
+            features_extractor_kwargs=dict(
+                num_cgf_features=8, arena_scale=(NS - 1) / 2, t_init_mode="spread_1d"),
+            total_timesteps=256, n_envs=1,
             ppo_n_steps=128, batch_size=32, n_epochs=1, num_particles=NS,
-            device="cpu", seed=0, run_subdir="test_failed",
+            device="cpu", seed=0,
             log_dir=str(tmp_path / "logs") + "/", model_save_path=str(model_path),
             eval_freq=10**9, save_freq=10**9, n_eval_episodes=1,
             extra_callbacks=[Die()])
@@ -1153,12 +1152,15 @@ def _run_cgf_with_norm(tmp_path, total_timesteps=384, n_epochs=2,
                   t_init_max=40.0, feature_norm="running",
                   readout_hidden=16, readout_depth=1)
     kwargs.update(extractor_kwargs)
-    return cgf.train_odd_even(
-        policy_kwargs={"features_extractor_class": WeightedCGFFeaturesExtractor,
-                       "features_extractor_kwargs": kwargs},
-        encoder="cgf", variant=VARIANT, total_timesteps=total_timesteps,
+    # These tests attach and inspect the norm / drift callbacks THEMSELVES (extra_callbacks),
+    # so the shared trainer must not add its own refresh callback on top: minibatch mode
+    # attaches none (the trainer still adds the t-norm and drift loggers, which is harmless).
+    return train_mod.train(
+        "odd_even", VARIANT, "cgf",
+        features_extractor_kwargs=kwargs, total_timesteps=total_timesteps,
+        encoder_options=dict(running_norm_update="minibatch"),
         n_envs=1, ppo_n_steps=128, batch_size=32, n_epochs=n_epochs,
-        num_particles=NS, device="cpu", seed=0, run_subdir="test_norm",
+        num_particles=NS, device="cpu", seed=0,
         log_dir=str(tmp_path / "logs") + "/",
         model_save_path=str(tmp_path / "models" / "cgf_agent.zip"),
         eval_freq=10**9, save_freq=10**9, n_eval_episodes=1,

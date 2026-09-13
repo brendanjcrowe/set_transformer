@@ -108,13 +108,6 @@ def _odd_even_sibling():
     return module
 
 
-@pytest.fixture(scope="module")
-def odd_even():
-    with _sys_path(_ODD_EVEN_DIR):
-        return {name: _odd_even_sibling().load(name) for name in
-                ("variants", "4_train_rl_cgf", "4_train_rl_st", "4_train_rl_gaussian")}
-
-
 # --------------------------------------------------------------------------
 # Helpers
 # --------------------------------------------------------------------------
@@ -193,20 +186,6 @@ def _drive_ant_tag_script(mods, monkeypatch, tmp_path, module_name, train_name, 
     return captured["config"], captured["train"]
 
 
-def _drive_odd_even_script(oe, monkeypatch, tmp_path, arm, argv):
-    cgf, arm_mod = oe["4_train_rl_cgf"], oe[f"4_train_rl_{arm}"]
-    captured = {}
-    monkeypatch.setattr(cgf, "_default_run_dir", lambda *a, **k: str(tmp_path / "old_run"))
-    monkeypatch.setattr(cgf, "_git_provenance", lambda: {})
-    monkeypatch.setattr(cgf, "_tee_stdout_stderr", lambda path: None)
-    monkeypatch.setattr(cgf, "_write_run_config",
-                        lambda run_dir, **cfg: captured.setdefault("config", cfg))
-    monkeypatch.setattr(arm_mod, "train_odd_even", lambda **kw: captured.setdefault("train", kw))
-    monkeypatch.setattr(sys, "argv", [f"4_train_rl_{arm}.py"] + list(argv))
-    arm_mod.main()
-    return captured["config"], captured["train"]
-
-
 def _drive_shared(monkeypatch, tmp_path, domain, encoder, argv, *, legacy_layout=True):
     """The shared command line with --dry_run: the run record it writes, and the training
     call it would have made (captured by replacing train())."""
@@ -230,12 +209,6 @@ NEW_KEYS = {
     "algorithm", "resume_from", "resume_vecnormalize", "init_policy",
     "num_post_sab", "encoder_lr_scale", "unfreeze_at", "st_unfreeze_at",
 }
-#: Odd-Even ST stored two flags under its own names; the shared record uses the Ant-Tag
-#: names (2,000+ recorded runs). `ln` is the negation of `no_layer_norm`.
-ODD_EVEN_ST_RENAMES = {"no_layer_norm": ("ln", lambda v: not v),
-                       "st_weight_channel": ("weight_channel", lambda v: v)}
-
-
 #: Keys a script recorded as null because it resolved them INSIDE its train_* function
 #: (arena_scale on the Ant-Tag ST / Gaussian / pooled arms; the 2026-09-03 audit fixed only
 #: the CGF arm). The shared record carries the number that ran.
@@ -473,43 +446,9 @@ def test_ant_tag_shared_record_carries_the_scripts_record(
         assert new["encoder_params"] == old["encoder_params"]
 
 
-_ODD_EVEN_GRID = [
-    ("cgf", ["--variant", "oe50_short"], {}),
-    ("cgf", ["--variant", "oe50", "--particle_filter", "bootstrap", "--num_particles", "60",
-             "--lr_anneal", "--target_kl", "0.02", "--net_arch", "64,64", "--seed", "5"], {}),
-    # clamp mode: the shared record stores t_bound as null (not in force), the script kept 50
-    ("cgf", ["--variant", "oe50_short", "--t_param", "clamp"], {"t_bound": None}),
-    ("cgf", ["--variant", "oe50_short", "--feature_mode", "K_grad", "--feature_norm", "none",
-             "--t_init_max", "30"], {}),
-    ("cgf", ["--variant", "oe50_short", "--match_params", "3000"], {}),
-    ("cgf", ["--variant", "oe50_short", "--pretrained_cgf_model_path", "CKPT:odd_even_cgf",
-             "--cgf_frozen"], {}),
-    ("st", ["--variant", "oe50_short"], {}),
-    ("st", ["--variant", "oe50_short", "--num_inds", "8", "--no_layer_norm",
-            "--no_st_weight_channel", "--num_post_sab", "0"], {}),
-    ("st", ["--variant", "oe50_short", "--pretrained_st_model_path", "CKPT:odd_even_st",
-            "--st_frozen"], {}),
-    ("st", ["--variant", "oe50_short", "--pretrained_st_model_path", "CKPT:odd_even_st",
-            "--st_encoder_lr_scale", "0.1", "--st_unfreeze_at", "1000"], {}),
-    # (Odd-Even Gaussian left this grid at its switch, change 4.3: its script IS the shared
-    # command line now; the parity driver, tests/tools/rl_parity.py, covers it against master.)
-]
-
-
-@pytest.mark.parametrize("encoder,argv,differ", _ODD_EVEN_GRID,
-                         ids=[f"{c[0]}:{' '.join(c[1][2:])}".strip(": ") for c in _ODD_EVEN_GRID])
-def test_odd_even_shared_record_carries_the_scripts_record(
-        odd_even, checkpoints, monkeypatch, tmp_path, encoder, argv, differ):
-    argv = [checkpoints[a.split(":", 1)[1]] if a.startswith("CKPT:") else a for a in argv]
-    old, old_train = _drive_odd_even_script(odd_even, monkeypatch, tmp_path, encoder, argv)
-    new = _drive_shared(monkeypatch, tmp_path, "odd_even", encoder, argv)
-    renames = ODD_EVEN_ST_RENAMES if encoder == "st" else {}
-    _assert_record_matches(old, new, renames=renames, differ=differ)
-    # The Odd-Even scripts hand policy_kwargs to train_odd_even: the extractor kwargs the
-    # shared command line builds from its resolved record must be exactly those.
-    resolved_args = argparse.Namespace(**new)
-    assert encoders.ENCODERS[encoder].extractor_kwargs(resolved_args) == \
-        old_train["policy_kwargs"]["features_extractor_kwargs"]
+# (The Odd-Even arms left this grid at their switches, changes 4.3 / 4.4: their scripts ARE
+# the shared command line now; the parity driver, tests/tools/rl_parity.py, covers them
+# against master.)
 
 
 def test_odd_even_cgf_checkpoint_at_another_arena_scale_is_now_refused(

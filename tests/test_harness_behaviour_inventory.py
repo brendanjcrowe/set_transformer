@@ -218,7 +218,17 @@ def _drive_ant_tag_main(mods, monkeypatch, tmp_path, module_name, train_name, ar
 #: Arms whose main() forwards to set_transformer.rl.train.main (switched in change 4.3+).
 #: Their training call is the shared train(), intercepted below in the shape the older
 #: assertions read.
-_SWITCHED_ODD_EVEN_ARMS = {"gaussian"}
+_SWITCHED_ODD_EVEN_ARMS = {"gaussian", "cgf", "st"}
+
+
+def _shared_callback_names(encoder: str, train: dict) -> list[str]:
+    """The encoder / domain callbacks the shared trainer attaches for a switched arm's
+    resolved training call (the pre-switch scripts passed them as extra_callbacks)."""
+    from set_transformer.rl.domains.odd_even import ODD_EVEN
+    from set_transformer.rl.encoders import ENCODERS
+    callbacks = ENCODERS[encoder].callbacks(train["features_extractor_kwargs"],
+                                            train.get("encoder_options", {}))
+    return [type(cb).__name__ for cb in callbacks + ODD_EVEN.encoder_callbacks(encoder)]
 
 
 def _drive_switched_odd_even_main(oe, monkeypatch, tmp_path, arm, argv):
@@ -756,9 +766,9 @@ def test_odd_even_cgf_defaults_are_the_tanh_running_recipe(odd_even, monkeypatch
     assert kw["t_bound"] == 50.0 and kw["t_init_max"] == 40.0
     assert kw["feature_mode"] == "K" and kw["feature_norm"] == "running"
     assert kw["num_cgf_features"] == 64 and kw["pretrained_cgf_model_path"] is None
-    assert train["post_construct"] is None
-    names = [type(cb).__name__ for cb in train["extra_callbacks"]]
-    assert names == ["TNormLoggingCallback", "EncoderDriftLoggingCallback", "RolloutFeatureNormCallback"]
+    assert train["pretrained_path"] is None
+    assert _shared_callback_names("cgf", train) == \
+        ["TNormLoggingCallback", "EncoderDriftLoggingCallback", "RolloutFeatureNormCallback"]
 
     _, train = _drive_odd_even_main(odd_even, monkeypatch, tmp_path, "cgf",
                                     ["--variant", "oe50_short", "--t_param", "clamp"])
@@ -767,7 +777,7 @@ def test_odd_even_cgf_defaults_are_the_tanh_running_recipe(odd_even, monkeypatch
 
     _, train = _drive_odd_even_main(odd_even, monkeypatch, tmp_path, "cgf",
                                     ["--variant", "oe50_short", "--feature_norm", "none"])
-    assert [type(cb).__name__ for cb in train["extra_callbacks"]] == \
+    assert _shared_callback_names("cgf", train) == \
         ["TNormLoggingCallback", "EncoderDriftLoggingCallback"]
 
 
@@ -782,8 +792,8 @@ def test_odd_even_st_geometry_defaults_and_the_checkpoint_rule(odd_even, monkeyp
     assert (kw["num_encodings"], kw["dim_encoder"], kw["num_heads"]) == (8, 8, 4)
     assert kw["ln"] is True and kw["weight_channel"] is True
     assert kw["pretrained_st_model_path"] is None and kw["st_frozen"] is False
-    assert train["post_construct"] is None
-    assert [type(cb).__name__ for cb in train["extra_callbacks"]] == \
+    assert train["pretrained_path"] is None
+    assert _shared_callback_names("st", train) == \
         ["STFeatureLoggingCallback", "OddEvenSTFeatureSentinel"]
 
     ckpt = tmp_path / "st.pt"
@@ -792,7 +802,7 @@ def test_odd_even_st_geometry_defaults_and_the_checkpoint_rule(odd_even, monkeyp
                                     ["--variant", "oe50_short", "--pretrained_st_model_path", str(ckpt)])
     kw = train["policy_kwargs"]["features_extractor_kwargs"]
     assert (kw["num_inds"], kw["dim_hidden"], kw["num_post_sab"]) == (8, 32, 1)
-    assert kw["pretrained_st_model_path"] == str(ckpt) and train["post_construct"] is not None
+    assert kw["pretrained_st_model_path"] == str(ckpt) and train["pretrained_path"] == str(ckpt)
 
     with pytest.raises(SystemExit) as exc:
         _drive_odd_even_main(odd_even, monkeypatch, tmp_path, "st",
@@ -844,15 +854,18 @@ def test_odd_even_train_wiring(odd_even, monkeypatch, tmp_path):
     prefix odd_even_<encoder>; extra callbacks appended after checkpoint and eval; the
     zip, vecnormalize.pkl and a `completed` run_status.json written on exit."""
     from set_transformer.rl.feature_extractors.gaussian import WeightedGaussianFeaturesExtractor
-    cgf, belief = odd_even["4_train_rl_cgf"], odd_even["odd_even_belief_env"]
-    evals, checkpoints = _install_fakes(monkeypatch, cgf)
+    from set_transformer.rl import train as train_mod
+    belief = odd_even["odd_even_belief_env"]
+    # Since change 4.4 the Odd-Even loop IS set_transformer.rl.train.train (the CGF script's
+    # train_odd_even is gone); the fakes go on the shared module.
+    evals, checkpoints = _install_fakes(monkeypatch, train_mod)
     marker = TNormLoggingCallback()
     log_dir = str(tmp_path / "logs") + "/"
     model_path = str(tmp_path / "models" / "gaussian_agent.zip")
-    cgf.train_odd_even(
-        policy_kwargs={"features_extractor_class": WeightedGaussianFeaturesExtractor,
-                       "features_extractor_kwargs": dict(arena_scale=24.5)},
-        encoder="gaussian", variant="oe50_short", total_timesteps=500, n_envs=1,
+    assert WeightedGaussianFeaturesExtractor is train_mod._encoders.ENCODERS["gaussian"].extractor_class
+    train_mod.train(
+        "odd_even", "oe50_short", "gaussian",
+        features_extractor_kwargs=dict(arena_scale=24.5), total_timesteps=500, n_envs=1,
         num_particles=50, device="cpu", seed=11, log_dir=log_dir, model_save_path=model_path,
         eval_freq=100, save_freq=200, n_eval_episodes=2, lr_anneal=True, target_kl=0.02,
         extra_callbacks=[marker])
