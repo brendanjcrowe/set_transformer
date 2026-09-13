@@ -89,7 +89,9 @@ This script's historical spellings are translated before parsing:
   --lr X          = --learning_rate X
   --out_dir DIR   = --base_dir <DIR's parent> --experiment_name <DIR's name>
                     (so runs land in DIR/<stamp>_[<encoder>_]<objective>_seed<n>[_<tag>])
---variant defaults to oe50_short, --encoder to st, --objective to belief_kl.
+--variant defaults to oe50_short, --encoder to st, --objective to belief_kl; without --out_dir the
+run lands in <root>/odd_even/<variant>/pretrain/<encoder>_belief_pretrain/ as it always did (the
+package command's own default is pretrain/<encoder>/<objective>/<stamp>_seed<n>/checkpoints/).
 --pretrained_cgf_model_path / --cgf_frozen are RL-side flags and are refused: this script
 PRODUCES the checkpoint.
 """
@@ -140,6 +142,10 @@ def translate(argv: list[str]) -> list[str]:
     for flag, value in LEGACY_DEFAULTS.items():
         if not _given(out, flag):
             out += [flag, value]
+    if not any(_given(out, flag) for flag in ("--experiment_name", "--base_dir")):
+        # 7.5: the package command files runs under pretrain/<encoder>/<objective>/; this
+        # script keeps its historical folder pretrain/<encoder>_belief_pretrain/<stamp>_...
+        out += ["--experiment_name", f"{_value(out, '--encoder')}_belief_pretrain"]
     return out
 
 

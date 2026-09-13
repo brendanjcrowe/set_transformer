@@ -86,6 +86,10 @@ class PretrainContext:
     run_name: str
     #: Whatever :attr:`Objective.prepare` returned (loaded data, validated matrix, ...).
     data: Any = None
+    #: Where the objective writes its checkpoints (batch 7.5): ``run_dir / "checkpoints"`` under
+    #: the root layout, ``run_dir`` itself under the legacy layouts the entry points keep.
+    #: ``None`` means ``run_dir``.
+    checkpoint_dir: Path | None = None
 
 
 @dataclass(frozen=True)

@@ -73,8 +73,10 @@ def add_arguments(parser: argparse.ArgumentParser, domain=None) -> None:
     Spelled as ``3_train_st.py`` spelled them (decision 2 of plan section 7)."""
     g = parser.add_argument_group("reconstruction objective: data")
     g.add_argument(
-        "--data_path", type=str, required=True,
-        help="Path to the .npz (or legacy .npy) dataset from 2_collect_pf_dataset.py")
+        "--data_path", type=str, default=None,
+        help="Path to the .npz (or legacy .npy) dataset from the collector. Default (7.5): "
+             "the variant's collected dataset under the run root, "
+             "<root>/<domain>/<variant>/data/<variant>_pf_dataset.npz -- needs --variant.")
     g.add_argument(
         "--particle_scale", type=float, default=None,
         help="Divide coordinates by this before training. Default: the scale "
@@ -192,6 +194,20 @@ def locate(args: argparse.Namespace) -> dict:
 def resolve_arguments(parser: argparse.ArgumentParser, args: argparse.Namespace,
                       domain, encoder) -> None:
     """The checks that need no data (the script ran them right after parsing)."""
+    if args.data_path is None:
+        # 7.5 (decision 1): the dataset the collector puts under the run root for this variant.
+        if not getattr(args, "variant", None):
+            parser.error("--data_path not given: pass it, or --variant <registry key> to take "
+                         "<root>/<domain>/<variant>/data/<variant>_pf_dataset.npz")
+        from set_transformer.rl import run_records
+        candidate = run_records.dataset_path(domain.name, args.variant,
+                                             root=getattr(args, "output_root", None))
+        if not candidate.exists():
+            parser.error(f"no collected dataset at {candidate}: collect one (python3 -m "
+                         f"set_transformer.rl.collect --domain {domain.name} --variant "
+                         f"{args.variant}) or pass --data_path")
+        args.data_path = str(candidate)
+        print(f"Dataset: {candidate} (the variant's collected dataset under the run root)")
     if encoder.name not in ENCODERS:
         parser.error(f"--objective reconstruction pretrains {ENCODERS}; "
                      f"encoder {encoder.name!r} has no reconstruction path.")
@@ -491,7 +507,9 @@ def run(args: argparse.Namespace, ctx: PretrainContext) -> PretrainResult:
         path = experiment_config.checkpoint_dir / f"checkpoint_{tag}.pt"
         if path.exists():
             checkpoints[tag] = path
-    rl_checkpoint = checkpoints.get("best")
+    # 7.5: a run too short to have evaluated has no checkpoint_best.pt; the RL-loadable file
+    # is then the latest one (the drivers fell back the same way).
+    rl_checkpoint = checkpoints.get("best") or checkpoints.get("latest")
 
     if encoder_name == "cgf":
         # The RL loader wants the extractor's own keys and its geometry, not the
@@ -512,24 +530,25 @@ def run(args: argparse.Namespace, ctx: PretrainContext) -> PretrainResult:
                               "sinkhorn_blur": args.sinkhorn_blur,
                               "sinkhorn_scaling": args.sinkhorn_scaling})
             exported[tag] = dst
+        primary = "best" if "best" in exported else "latest"     # 7.5: see rl_checkpoint above
         check = make_arm_extractor(args.num_particles, args.dim_particles,
                                    arena_scale=applied_scale, **cgf_kwargs,
-                                   pretrained_cgf_model_path=str(exported["best"]))
-        ref = torch.load(exported["best"], map_location="cpu", weights_only=False)["model_state_dict"]
+                                   pretrained_cgf_model_path=str(exported[primary]))
+        ref = torch.load(exported[primary], map_location="cpu", weights_only=False)["model_state_dict"]
         live = check.state_dict()
         worst = max(float((ref[k].float() - live[k].float()).abs().max()) for k in ref)
         if worst > 0.0:
             raise RuntimeError(f"exported checkpoint does not round-trip (max |delta| {worst})")
-        print(f"Exported CGF arm encoder: {exported['best']}"
-              + (f" (and {exported['latest']})" if "latest" in exported else ""))
+        print(f"Exported CGF arm encoder: {exported[primary]}"
+              + (f" (and {exported['latest']})" if primary == "best" and "latest" in exported else ""))
         print("  loads strict into WeightedCGFFeaturesExtractor with this geometry. Use:\n"
               f"    python3 4_train_rl_cgf.py --variant <variant> "
-              f"--pretrained_cgf_model_path {exported['best']} [--cgf_frozen | "
+              f"--pretrained_cgf_model_path {exported[primary]} [--cgf_frozen | "
               "--st_encoder_lr_scale 0.1]\n"
               "  (flags left at default take the checkpoint's geometry; arena_scale must "
               f"equal {applied_scale}).")
         checkpoints.update({f"{tag}_export": path for tag, path in exported.items()})
-        rl_checkpoint = exported["best"]
+        rl_checkpoint = exported[primary]
 
     summary = {}
     best = checkpoints.get("best")

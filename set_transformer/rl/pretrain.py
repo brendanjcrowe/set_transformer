@@ -18,10 +18,14 @@ seeding; ``run_config.json`` with git provenance and thread count; and, for a le
 the proof that the produced checkpoint loads into a fresh RL extractor with max|delta| == 0.
 What the objective owns: its inputs and its training loop (``rl/domains/base.py::Objective``).
 
-Placement (unchanged from change 5.2): ``--base_dir`` as given, else
-``<output root>/<domain>/<variant>/pretrain/`` with ``<experiment_name>/<run name>`` below it;
-the domain and variant come from the flags or from the objective's inputs (a collected dataset
-records both).
+Placement (batch 7.5, decision 4 of plan section 7): by default
+``<root>/<domain>/<variant>/pretrain/<encoder>/<objective>/<timestamp>_seed<n>[_<tag>]/`` with
+``checkpoints/``, ``run_config.json`` and ``run_status.json`` (which names the RL-loadable
+checkpoint; ``run_records.latest_pretrain_checkpoint`` reads it). ``--experiment_name`` or
+``--base_dir`` selects the legacy layout, ``<base_dir>/<experiment_name>/<objective's own run
+name>/``, which the two entry-point scripts keep. The domain and variant come from the flags or
+from the objective's inputs (a collected dataset records both). Every RL-loadable checkpoint
+also carries a ``pretraining_run`` record (see :data:`CHECKPOINT_RECORD_KEY`).
 """
 
 from __future__ import annotations
@@ -175,12 +179,33 @@ def _resolve_device(args) -> str:
     return args.device or ("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def _round_trip(encoder: _encoders.Encoder, args, result: PretrainResult, weighted: bool) -> None:
+#: Top-level key every RL-loadable pretraining checkpoint carries since batch 7.5: the run's
+#: identity (domain, variant, encoder, objective), placement, the RL-loadable file, the
+#: geometry the RL extractor was built with, data path, command, git and threads. ADDITIVE:
+#: every key the loaders read (`model_state_dict`, `config`, `particle_scale`, ...) is untouched.
+CHECKPOINT_RECORD_KEY = "pretraining_run"
+
+
+def _stamp_checkpoints(result: PretrainResult, record: dict) -> None:
+    """Add :data:`CHECKPOINT_RECORD_KEY` to every checkpoint the objective produced (best,
+    last / latest, the CGF exports); tensors and the objective's own keys are left as written."""
+    for path in {Path(p) for p in result.checkpoints.values()}:
+        if path.suffix != ".pt" or not path.exists():
+            continue
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+        if not isinstance(payload, dict):
+            continue
+        payload[CHECKPOINT_RECORD_KEY] = record
+        torch.save(payload, path)
+
+
+def _round_trip(encoder: _encoders.Encoder, args, result: PretrainResult, weighted: bool) -> dict:
     """Prove the produced checkpoint is what ``rl/train.py --pretrained_path`` will load: build
-    a fresh RL extractor from the resolved flags, load the file, compare every encoder tensor."""
+    a fresh RL extractor from the resolved flags, load the file, compare every encoder tensor.
+    Returns the extractor's geometry record (empty when nothing was checked)."""
     path = result.rl_checkpoint
     if path is None or not encoder.learned:
-        return
+        return {}
     kwargs = encoder.extractor_kwargs(args)
     kwargs[encoder.extractor_class.PRETRAINED_PATH_KWARG] = str(path)
     if "weight_channel" in kwargs:
@@ -194,6 +219,9 @@ def _round_trip(encoder: _encoders.Encoder, args, result: PretrainResult, weight
     extractor = encoder.extractor_class(space, **kwargs)
     verify_matches_checkpoint(extractor.reference_state(str(path)), extractor.encoder_state_dict(),
                               str(path), label=f"{encoder.extractor_class.__name__} encoder")
+    geometry = getattr(extractor, "_st_geometry", None) or getattr(extractor, "_cgf_geometry", None) or {}
+    return {k: (v if isinstance(v, (int, float, str, bool, type(None))) else str(v))
+            for k, v in dict(geometry).items()}
 
 
 def main(argv: Sequence[str] | None = None, *, domain: Domain | str | None = None,
@@ -291,22 +319,35 @@ def main(argv: Sequence[str] | None = None, *, domain: Domain | str | None = Non
     if args.variant is not None and args.variant not in domain.variants:
         parser.error(f"--variant {args.variant!r} is not a {domain.name} variant "
                      f"({domain.variant_names()})")
-    if args.experiment_name is None:
-        args.experiment_name = objective_record.default_experiment_name(encoder.name)
-    if args.base_dir:
-        base_dir = Path(args.base_dir)
+    if not args.base_dir and not args.variant:
+        # 7.3: an objective without inputs (the exact posterior rolls the env) has nothing
+        # to read a variant from; say so instead of blaming a dataset it does not take.
+        what = ("the dataset records no variant" if hasattr(args, "data_path")
+                else f"objective {objective_record.name!r} has no inputs to read one from")
+        parser.error(f"--base_dir not given and {what}: pass "
+                     "--variant <registry key> (and --domain) or --base_dir <folder>")
+    # 7.5 (decision 4 of plan section 7): the package command files a run as
+    # <root>/<domain>/<variant>/pretrain/<encoder>/<objective>/<timestamp>_seed<n>[_<tag>]/ with a
+    # checkpoints/ folder, like an RL run. --experiment_name or --base_dir selects the LEGACY
+    # layout, <base_dir>/<experiment_name>/<objective's own run name>/, which the entry points
+    # keep by injecting their historical experiment names.
+    if args.experiment_name is None and not args.base_dir:
+        layout = "root"
+        args.experiment_name = objective_record.name
+        base_dir = run_records.pretrain_dir(domain.name, args.variant, encoder.name, root=args.output_root)
+        print(f"Output root layout: {base_dir}/{objective_record.name}/ (domain {domain.name}, "
+              f"variant {args.variant}, encoder {encoder.name})")
     else:
-        if not args.variant:
-            # 7.3: an objective without inputs (the exact posterior rolls the env) has nothing
-            # to read a variant from; say so instead of blaming a dataset it does not take.
-            what = ("the dataset records no variant" if hasattr(args, "data_path")
-                    else f"objective {objective_record.name!r} has no inputs to read one from")
-            parser.error(f"--base_dir not given and {what}: pass "
-                         "--variant <registry key> (and --domain) or --base_dir <folder>")
-        experiment_dir = run_records.pretrain_dir(domain.name, args.variant, args.experiment_name,
-                                                  root=args.output_root)
-        print(f"Output root layout: {experiment_dir}/ (domain {domain.name}, variant {args.variant})")
-        base_dir = experiment_dir.parent
+        layout = "legacy"
+        if args.experiment_name is None:
+            args.experiment_name = objective_record.default_experiment_name(encoder.name)
+        if args.base_dir:
+            base_dir = Path(args.base_dir)
+        else:
+            experiment_dir = run_records.pretrain_dir(domain.name, args.variant, args.experiment_name,
+                                                      root=args.output_root)
+            print(f"Output root layout: {experiment_dir}/ (domain {domain.name}, variant {args.variant})")
+            base_dir = experiment_dir.parent
 
     # -- the pretraining side PRODUCES the checkpoint: no start mode here -------------------------
     for dest, value in ((encoder.pretrained_dest, None), (encoder.frozen_dest, False),
@@ -329,11 +370,15 @@ def main(argv: Sequence[str] | None = None, *, domain: Domain | str | None = Non
 
     # -- the run folder and its record ------------------------------------------------------------
     now = datetime.now()
-    run_name = objective_record.run_name(args, now)
-    if args.run_tag:
-        run_name = f"{run_name}_{re.sub(r'[^A-Za-z0-9._-]', '_', args.run_tag)}"
+    if layout == "root":
+        run_name = run_records.run_leaf(args.seed, args.run_tag, now.strftime("%Y%m%d_%H%M%S"))
+    else:
+        run_name = objective_record.run_name(args, now)
+        if args.run_tag:
+            run_name = f"{run_name}_{re.sub(r'[^A-Za-z0-9._-]', '_', args.run_tag)}"
     run_dir = Path(base_dir) / args.experiment_name / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_dir = run_dir / "checkpoints" if layout == "root" else run_dir
     # Selector and placement flags are written explicitly below (resolved), not as parsed.
     run_config = {k: v for k, v in vars(args).items()
                   if k not in ("domain", "encoder", "objective", "device", "list_variants",
@@ -342,8 +387,9 @@ def main(argv: Sequence[str] | None = None, *, domain: Domain | str | None = Non
     run_records.write_run_config(
         str(run_dir),
         domain=domain.name, encoder=encoder.name, objective=objective_record.name,
-        experiment_name=args.experiment_name, run_name=run_name,
-        run_directory=os.path.abspath(run_dir), base_dir=str(Path(base_dir).resolve()),
+        experiment_name=args.experiment_name, run_name=run_name, layout=layout,
+        run_directory=os.path.abspath(run_dir), checkpoint_dir=os.path.abspath(checkpoint_dir),
+        base_dir=str(Path(base_dir).resolve()),
         output_root=None if args.base_dir else str(run_records.output_root(args.output_root)),
         device=device, command=" ".join([prog or "set_transformer.rl.pretrain", *argv]),
         git=run_records.git_provenance(), threads=run_records.thread_settings(),
@@ -355,10 +401,31 @@ def main(argv: Sequence[str] | None = None, *, domain: Domain | str | None = Non
 
     ctx = PretrainContext(domain=domain, variant=args.variant, encoder=encoder, device=device,
                           run_dir=run_dir, base_dir=Path(base_dir),
-                          experiment_name=args.experiment_name, run_name=run_name, data=data)
-    result = objective_record.run(args, ctx)
-    weighted = bool(getattr(data, "weighted", getattr(args, "weight_channel", True)))
-    _round_trip(encoder, args, result, weighted)
+                          experiment_name=args.experiment_name, run_name=run_name, data=data,
+                          checkpoint_dir=checkpoint_dir)
+    try:
+        result = objective_record.run(args, ctx)
+        weighted = bool(getattr(data, "weighted", getattr(args, "weight_channel", True)))
+        geometry = _round_trip(encoder, args, result, weighted)
+    except BaseException as exc:
+        # A crashed or interrupted run must not look like a finished one (PITFALLS.md section
+        # 8 item 7): say so in run_status.json, then re-raise.
+        run_records.write_pretrain_status(run_dir, completed=False, error=exc)
+        raise
+    record = dict(
+        domain=domain.name, variant=args.variant, encoder=encoder.name, objective=objective_record.name,
+        experiment_name=args.experiment_name, run_name=run_name, layout=layout,
+        run_directory=os.path.abspath(run_dir),
+        rl_checkpoint=None if result.rl_checkpoint is None else str(Path(result.rl_checkpoint).resolve()),
+        num_particles=int(args.num_particles), dim_particles=int(args.dim_particles),
+        arena_scale=float(args.arena_scale), data_path=getattr(args, "data_path", None),
+        geometry=geometry, command=" ".join([prog or "set_transformer.rl.pretrain", *argv]),
+        git=run_records.git_provenance(), threads=run_records.thread_settings(),
+    )
+    _stamp_checkpoints(result, record)
+    run_records.write_pretrain_status(run_dir, completed=True, error=None,
+                                      rl_checkpoint=result.rl_checkpoint,
+                                      checkpoints=result.checkpoints, summary=result.summary)
     if objective_record.report is not None:
         objective_record.report(args, ctx, result)
     if result.summary:

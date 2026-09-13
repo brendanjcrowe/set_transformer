@@ -64,8 +64,15 @@ ENCODER_LR_SCALE="${ENCODER_LR_SCALE:-1.0}"   # applied to finetune arms only (-
 # 109,640 params). The cdens_terminal / smart_hard ST runs used 32 / 128
 # (428,168 params); pass NUM_INDS=32 DIM_HIDDEN=128 to reproduce those.
 NUM_INDS="${NUM_INDS:-16}"; DIM_HIDDEN="${DIM_HIDDEN:-64}"
-DATA=data/${VARIANT}${SUFFIX}_pf_dataset.npz
-EMD=data/${VARIANT}${SUFFIX}_pf_dataset_emd.npy
+# Dataset location (decision 1 of plan section 7, 2026-09-13): new datasets live under the run
+# root, $ROOT/ant_tag/<variant>/data/; a recorded dataset still in data/ beside the scripts is
+# used when it exists. DATA= overrides both; the EMD matrix always sits beside the dataset.
+DATA="${DATA:-}"
+if [[ -z "$DATA" ]]; then
+  DATA=$ROOT/ant_tag/${VARIANT}/data/${VARIANT}${SUFFIX}_pf_dataset.npz
+  [[ -f "data/${VARIANT}${SUFFIX}_pf_dataset.npz" ]] && DATA=data/${VARIANT}${SUFFIX}_pf_dataset.npz
+fi
+EMD=${DATA%.npz}_emd.npy
 export WANDB_MODE=offline
 
 stamp() { echo "=== [$(date '+%F %T')] $*"; }

@@ -53,7 +53,8 @@ def _files(root: Path) -> dict[str, Path]:
         # --lr -> --learning_rate) and which now carries the encoder table's extra flags. The
         # checkpoint's `args` key is ignored for the same reason; every VALUE that matters is
         # compared through the checkpoint's `config` block and the history / probe files.
-        if path.suffix in (".pt", ".json", ".npz") and path.name not in ("run_config.json", "args.json"):
+        if path.suffix in (".pt", ".json", ".npz") and path.name not in ("run_config.json", "args.json",
+                                                                             "run_status.json"):
             rel = _TIMESTAMP.sub("<ts>", str(path.relative_to(root)))
             out[rel] = path
     return out
@@ -84,7 +85,10 @@ _IGNORED = re.compile(r"(^|\.)(args|command|run_directory|base_dir|output_root|g
                       r"run_name|out_dir|init_from|source_checkpoint|"
                       # 7.2: TrainingConfig gained num_post_sab (default 2, the old fixed count);
                       # a master checkpoint lacks the key, a branch one records 2.
-                      r"num_post_sab)($|\.|\[)")
+                      r"num_post_sab|"
+                      # 7.5: additive provenance -- the checkpoint's pretraining_run record, the run
+                      # record's layout / checkpoint_dir, the dataset metadata's command / threads.
+                      r"pretraining_run|layout|checkpoint_dir)($|\.|\[)")
 
 
 def _compare_checkpoint(a: Path, b: Path) -> list[str]:

@@ -187,9 +187,11 @@ def collect_arrays(domain: Domain, args, options: dict, *, progress: bool = True
 
 
 def build_metadata(domain: Domain, args, options: dict, particles, weights, steps, *,
-                   record_args: bool = True) -> dict:
+                   record_args: bool = True, command: str | None = None) -> dict:
     """The metadata JSON that travels in the .npz: the shared facts, the problem's extras, the
-    CLI args (``None`` for an in-process test collection) and git provenance."""
+    CLI args (``None`` for an in-process test collection), the command line, the thread count
+    and git provenance (7.5: the same provenance an RL or pretraining run record carries; a
+    dataset is one file, so it travels inside rather than in a sidecar)."""
     collection = collection_of(domain)
     metadata = {
         "variant": args.variant,
@@ -203,6 +205,8 @@ def build_metadata(domain: Domain, args, options: dict, particles, weights, step
     }
     metadata.update(collection.metadata_extras(args, options, particles, weights, steps))
     metadata["args"] = vars(args) if record_args else None
+    metadata["command"] = command
+    metadata["threads"] = run_records.thread_settings()
     metadata["git"] = run_records.git_provenance()
     return metadata
 
@@ -279,7 +283,8 @@ def main(argv: Sequence[str] | None = None, *, domain: Domain | str | None = Non
         particles, weights, steps = collection.rebalance(args, options, particles, weights, steps)
     collection.report(args, options, particles, weights, steps, "final")
 
-    metadata = build_metadata(domain, args, options, particles, weights, steps)
+    metadata = build_metadata(domain, args, options, particles, weights, steps,
+                              command=" ".join([prog or "set_transformer.rl.collect", *argv]))
     extra = collection.extra_arrays(args, options, particles, weights, steps)
     save_dataset(output, particles, weights, metadata, extra)
     print(f"Saved to {output}")

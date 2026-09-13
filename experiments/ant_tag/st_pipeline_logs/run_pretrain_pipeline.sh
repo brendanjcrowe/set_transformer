@@ -10,6 +10,13 @@ cd /home/himanshu/Documents/Research/rl_for_beliefmdps/set_transformer/experimen
 ROOT=$(PYTHONPATH=../.. python3 -m set_transformer.rl.run_records)
 PRETRAIN=$ROOT/ant_tag/cdens_terminal/pretrain
 LOGS=$ROOT/ant_tag/waves; mkdir -p "$LOGS"
+# Dataset location (decision 1 of plan section 7, 2026-09-13): under the run root; the
+# recorded data/cdens_terminal_pf_dataset.npz beside the scripts is used when it exists.
+DATA="${DATA:-}"
+if [[ -z "$DATA" ]]; then
+  DATA=$ROOT/ant_tag/cdens_terminal/data/cdens_terminal_pf_dataset.npz
+  [[ -f data/cdens_terminal_pf_dataset.npz ]] && DATA=data/cdens_terminal_pf_dataset.npz
+fi
 
 # ---- Stage 1: collect ------------------------------------------------------
 # visibility_radius_min 1.0 matches the RL curriculum's FINAL radius, so the
@@ -27,7 +34,7 @@ CUDA_VISIBLE_DEVICES=1 python3 2_collect_pf_dataset.py \
   --locomotion_vecnorm_path models/locomotion_vecnorm.pkl \
   --max_snapshots 40000 \
   --seed 42 \
-  --output_file data/cdens_terminal_pf_dataset.npz 2>&1 | tee "$LOGS/collect.log"
+  --output_file "$DATA" 2>&1 | tee "$LOGS/collect.log"
 
 # ---- Stage 2: pretrain ----------------------------------------------------
 # Geometry MUST match the RL arm: 8 x 8 = 64 features, num_inds 32,
@@ -36,7 +43,7 @@ CUDA_VISIBLE_DEVICES=1 python3 2_collect_pf_dataset.py \
 # the den radius the encoder must resolve.
 echo "=== [$(date)] STAGE 2: pretrain ==="
 WANDB_MODE=offline CUDA_VISIBLE_DEVICES=1 python3 3_train_st.py \
-  --data_path data/cdens_terminal_pf_dataset.npz \
+  --data_path "$DATA" \
   --loss_type sinkhorn --sinkhorn_blur 0.01 --sinkhorn_scaling 0.5 \
   --num_encodings 8 --dim_encoder 8 \
   --num_inds 32 --dim_hidden 128 --num_heads 4 \

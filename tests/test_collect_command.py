@@ -106,7 +106,9 @@ def test_odd_even_collection_lands_under_the_root_with_its_contract(tmp_path, mo
         meta = json.loads(str(z["metadata"]))
     assert set(meta) == {"variant", "env_id", "particle_filter_class", "num_particles", "dim_particles",
                          "particle_scale", "n_dist_size", "episode_cap", "particle_centre", "step_index_min",
-                         "step_index_max", "args", "git"}
+                         "step_index_max", "args", "command", "threads", "git"}
+    # 7.5: the same provenance an RL / pretraining run record carries, inside the file.
+    assert meta["command"].startswith("set_transformer.rl.collect --domain odd_even") and "torch" in meta["threads"]
     assert (meta["variant"], meta["n_dist_size"], meta["episode_cap"]) == ("oe50_short", 50, 30)   # the short variant's cap
     assert meta["particle_filter_class"] == "OddEvenExactSupportParticleFilter"
     # The script's defaults were resolved from the variant and recorded.
@@ -126,7 +128,7 @@ def test_ant_tag_collection_with_an_explicit_output_file(tmp_path, monkeypatch):
         assert z["particles"].shape == (4, 20, 2) and float(z["particle_scale"]) == 4.5     # reset + 3 steps
         meta = json.loads(str(z["metadata"]))
     assert set(meta) == {"variant", "env_id", "particle_filter_class", "num_particles", "dim_particles",
-                         "particle_scale", "args", "git"}
+                         "particle_scale", "args", "command", "threads", "git"}
     assert meta["particle_filter_class"] == "SmartAntTagParticleFilter" and meta["args"]["num_episodes"] == 1
 
 

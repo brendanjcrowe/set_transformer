@@ -46,7 +46,8 @@ experiments/odd_even/3_pretrain_st_belief.py (exact-posterior pretraining, Odd-E
       checkpoint_best.pt, checkpoint_last.pt, history.json, probe_results.json
         -> test_belief_run_folder_name_and_files, test_belief_cgf_run_names_the_encoder_and_skips_the_probe
   B5  ST checkpoint: model_state_dict keys under `set_transformer.`, head_state_dict, config with the
-      geometry + objective + variant + arena_scale + encoder + encoder_params + pretraining
+      geometry + objective + variant + arena_scale + encoder + encoder_params + pretraining (+ the
+      top-level pretraining_run record since 7.5)
         -> test_belief_st_checkpoint_is_in_the_rl_loaders_format
   B6  the checkpoint loads into the RL extractor with max|delta| == 0
         -> test_belief_checkpoint_loads_into_the_rl_extractor
@@ -67,8 +68,8 @@ experiments/ant_tag/2_collect_pf_dataset.py (Ant-Tag collection)
   C1  --help exits 0; --list_variants prints the registry -> test_collect_help_and_list_variants
   C2  the .npz contract: particles [S,N,D] float32 raw coords, weights [S,N] rows summing to 1,
       particle_scale = the arena half-width, metadata JSON with variant / env_id /
-      particle_filter_class / num_particles / dim_particles / particle_scale / args / git
-        -> test_collect_npz_contract
+      particle_filter_class / num_particles / dim_particles / particle_scale / args / git (+ command
+      and threads since 7.5) -> test_collect_npz_contract
   C3  the same seed gives the same file -> test_collect_same_seed_gives_the_same_arrays
   C4  a .npy output is refused (cannot hold the weights) -> test_collect_refuses_npy_output
   C5  weighted spread is the weighted std per coordinate averaged; rebalancing with
@@ -405,7 +406,8 @@ def test_belief_run_folder_name_and_files(belief_st_run):
 
 def test_belief_st_checkpoint_is_in_the_rl_loaders_format(belief_st_run):
     ck = torch.load(belief_st_run / "checkpoint_best.pt", map_location="cpu", weights_only=False)
-    assert set(ck) == {"model_state_dict", "head_state_dict", "config", "epoch", "val", "args"}
+    # 7.5 added the top-level `pretraining_run` record (additive; the loaders' keys are unchanged).
+    assert set(ck) == {"model_state_dict", "head_state_dict", "config", "epoch", "val", "args", "pretraining_run"}
     assert ck["model_state_dict"] and all(k.startswith("set_transformer.") for k in ck["model_state_dict"])
     assert set(ck["head_state_dict"]) == {"weight", "bias"} and ck["head_state_dict"]["weight"].shape == (50, 64)
     c = ck["config"]
@@ -508,8 +510,9 @@ def test_collect_npz_contract(collect_smart):
         assert np.allclose(weights.sum(1), 1.0, atol=1e-5)
         assert float(z["particle_scale"]) == SCALE
         meta = json.loads(str(z["metadata"]))
+    # 7.5 added command + threads (the run records' provenance) to the metadata.
     assert set(meta) == {"variant", "env_id", "particle_filter_class", "num_particles", "dim_particles",
-                         "particle_scale", "args", "git"}
+                         "particle_scale", "args", "command", "threads", "git"}
     assert meta["variant"] == "smart" and meta["env_id"] == "pdomains-ant-tag-smart-v0"
     assert meta["particle_filter_class"] == "SmartAntTagParticleFilter"
     assert (meta["num_particles"], meta["dim_particles"], meta["particle_scale"]) == (100, 2, SCALE)

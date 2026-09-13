@@ -83,12 +83,18 @@ from set_transformer.loss import ChamferDistanceLoss, SinkhornLoss
 
 ## ST autoencoder pretraining (model-agnostic)
 
-The training entry point is `experiments/ant_tag/3_train_st.py`. Despite its
-location it is env-generic: it reads a `.npz` written by a domain's
-`2_collect_pf_dataset.py` (particles, PF weights, coordinate frame, git
-provenance) and never touches an env, so the same script pretrains the
-Odd-Even and Ant-Tag encoders. Set size, coordinate dimension, weightedness
-and frame all come from the dataset; a contradicting flag is an error.
+The pretraining command is `python3 -m set_transformer.rl.pretrain --domain <d> --variant <v>
+--encoder st|cgf [--objective reconstruction | belief_kl ...]` (2026-09-13; `set_transformer/rl/pretrain.py`);
+`experiments/ant_tag/3_train_st.py` is its entry point with the objective fixed to
+`reconstruction`, and `experiments/odd_even/3_pretrain_st_belief.py` the entry point for the
+Odd-Even exact-posterior objectives. Reconstruction is env-generic: it reads a `.npz` written by
+the collector (particles, PF weights, coordinate frame, git provenance) and never touches an env,
+so the same objective pretrains the Odd-Even and Ant-Tag encoders. Set size, coordinate dimension,
+weightedness and frame all come from the dataset; a contradicting flag is an error. With
+`--variant` given, `--data_path` defaults to the variant's dataset under the run root. Runs land
+in `<root>/runs/<domain>/<variant>/pretrain/<encoder>/<objective>/<timestamp>_seed<n>/` with
+`checkpoints/`, `run_config.json` and `run_status.json` (the entry points keep their historical
+folders); `run_records.latest_pretrain_checkpoint(...)` finds the newest RL-loadable file.
 
 ```bash
 cd experiments/ant_tag
@@ -114,12 +120,15 @@ Each domain in `experiments/<domain>/` follows the same numbered pipeline:
 
 1. **(MuJoCo only) Locomotion warm-start** — `1_train_locomotion.py`: a baseline policy
    that can move toward goals, so the data-collection rollouts cover the state space.
-2. **Particle-filter dataset collection** — `2_collect_pf_dataset.py --variant <v>`: roll
-   out the SAME belief env the RL scripts use, snapshot particles AND PF weights to an
-   `.npz` with metadata (env id, filter, variant, coordinate frame, git provenance).
-3. **Encoder pretraining** — `3_train_st.py` (weighted Sinkhorn reconstruction, ST or the
-   CGF block; env-generic, see above) or, on Odd-Even, `3_pretrain_st_belief.py`
-   (supervised on exact posteriors).
+2. **Particle-filter dataset collection** — `python3 -m set_transformer.rl.collect --domain <d>
+   --variant <v>` (entry point `2_collect_pf_dataset.py --variant <v>`): roll out the SAME
+   belief env the RL scripts use, snapshot particles AND PF weights to an `.npz` with metadata
+   (env id, filter, variant, coordinate frame, CLI args, command, threads, git provenance) under
+   `<root>/runs/<domain>/<variant>/data/`. Step 2b, `python3 -m set_transformer.rl.precompute_emd`
+   (entry point `2b_precompute_emd.py`), builds the EMD matrix for the aligned arm beside it.
+3. **Encoder pretraining** — `python3 -m set_transformer.rl.pretrain` (see above): `reconstruction`
+   (weighted Sinkhorn, ST or the CGF block; env-generic) for every domain, plus the objectives a
+   domain declares (Odd-Even: `belief_kl` / `mode_ce` / `state_ce`, supervised on exact posteriors).
 4. **RL** — `4_train_rl_<encoder>.py --variant <v>`: PPO with the encoder inside the SB3
    policy as a features extractor over the `{"obs", "particles", "weights"}` observation.
 
@@ -176,10 +185,11 @@ particle filter, episode cap and default curricula). 31-D obs (qpos 15 + qvel 14
 cd experiments/ant_tag
 # 1. Pre-train locomotion policy (dense reward wrapper on AntTag)
 python3 1_train_locomotion.py --total_timesteps 1000000
-# 2. Collect PF dataset (mix of random + pursuit with the locomotion policy)
+# 2. Collect PF dataset (mix of random + pursuit with the locomotion policy) -> <root>/runs/ant_tag/smart/data/
 python3 2_collect_pf_dataset.py --variant smart --locomotion_policy_path models/ant_locomotion_policy.zip
-# 3. Pretrain the ST autoencoder (output under <root>/runs/ant_tag/smart/pretrain/)
-WANDB_MODE=offline python3 3_train_st.py --data_path data/smart_pf_dataset.npz --num_encodings 8 --dim_encoder 8
+# 3. Pretrain the ST autoencoder (output under <root>/runs/ant_tag/smart/pretrain/; --data_path
+#    defaults to the dataset step 2 wrote when --variant is given)
+WANDB_MODE=offline python3 3_train_st.py --variant smart --num_encodings 8 --dim_encoder 8
 # 4. RL: the ST arm, encoder trained under PPO / frozen pretrained / finetuned pretrained
 python3 4_train_rl_st.py --variant smart --seed 0
 python3 4_train_rl_st.py --variant smart --pretrained_st_model_path <ckpt> --st_frozen

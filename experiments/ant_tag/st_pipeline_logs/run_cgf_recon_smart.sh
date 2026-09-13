@@ -32,7 +32,13 @@ LOG=$LOGS/smart_cgf_recon_${STAMP}.log
 exec > >(tee -a "$LOG") 2>&1
 echo "[$(date)] CGF reconstruction pretraining + RL arms on smart; log $LOG"
 
-DATA=${DATA:-data/smart_pf_dataset.npz}
+# Dataset location (decision 1 of plan section 7, 2026-09-13): under the run root; the
+# recorded data/smart_pf_dataset.npz beside the scripts is used when it exists.
+DATA="${DATA:-}"
+if [[ -z "$DATA" ]]; then
+  DATA=$ROOT/ant_tag/smart/data/smart_pf_dataset.npz
+  [[ -f data/smart_pf_dataset.npz ]] && DATA=data/smart_pf_dataset.npz
+fi
 PRETRAIN_GPU=${PRETRAIN_GPU:-0}
 PRETRAIN_EPOCHS=${PRETRAIN_EPOCHS:-30}
 EXP_NAME=${EXP_NAME:-smart_cgf_recon}

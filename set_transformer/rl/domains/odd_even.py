@@ -1744,6 +1744,10 @@ def _belief_run(args, ctx: PretrainContext, target: str) -> PretrainResult:
 
     run_dir = Path(ctx.run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
+    # 7.5: checkpoints/ under the root layout; the run folder itself under the entry point's
+    # historical layout (ctx.checkpoint_dir is None there).
+    checkpoint_dir = Path(ctx.checkpoint_dir) if ctx.checkpoint_dir else run_dir
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "args.json").write_text(json.dumps(vars(args), indent=2))
     print(f"run dir: {run_dir}")
     print(f"variant {args.variant} | env {resolved.env_id} | n={n_states} | "
@@ -1832,7 +1836,7 @@ def _belief_run(args, ctx: PretrainContext, target: str) -> PretrainResult:
         flag = ""
         if metrics["loss"] < best_val:
             best_val, best_epoch = metrics["loss"], epoch
-            save_belief_checkpoint(model, run_dir / "checkpoint_best.pt", args, epoch, metrics, geometry)
+            save_belief_checkpoint(model, checkpoint_dir / "checkpoint_best.pt", args, epoch, metrics, geometry)
             flag = "  *best*"
         print(f"epoch {epoch:3d} | train {metrics['train_loss']:.4f} | val {metrics['loss']:.4f} | "
               f"head mode acc tr/st {metrics['head_mode_acc']['transient']:.3f}/"
@@ -1842,10 +1846,10 @@ def _belief_run(args, ctx: PretrainContext, target: str) -> PretrainResult:
               f"feat std {metrics['feature_abs_std']:.2e} | eff.rank {metrics['feature_eff_rank']:.1f} | "
               f"{metrics['seconds']:.0f}s{flag}", flush=True)
         (run_dir / "history.json").write_text(json.dumps(history, indent=1))
-    save_belief_checkpoint(model, run_dir / "checkpoint_last.pt", args, args.num_epochs, history[-1], geometry)
-    print(f"best val loss {best_val:.4f}; checkpoints in {run_dir}")
+    save_belief_checkpoint(model, checkpoint_dir / "checkpoint_last.pt", args, args.num_epochs, history[-1], geometry)
+    print(f"best val loss {best_val:.4f}; checkpoints in {checkpoint_dir}")
 
-    checkpoints = {"best": run_dir / "checkpoint_best.pt", "last": run_dir / "checkpoint_last.pt"}
+    checkpoints = {"best": checkpoint_dir / "checkpoint_best.pt", "last": checkpoint_dir / "checkpoint_last.pt"}
     return PretrainResult(run_dir=run_dir, rl_checkpoint=checkpoints["best"], checkpoints=checkpoints,
                           summary={"best_val_loss": best_val, "best_epoch": best_epoch})
 
@@ -1863,9 +1867,9 @@ def _belief_report(args, ctx: PretrainContext, result: PretrainResult) -> None:
 
     # ---- probe the FROZEN latent the way the readout probe does ----------------
     print("\nprobing the frozen best-checkpoint latent with the mode-readout protocol ...")
-    best = torch.load(run_dir / "checkpoint_best.pt", map_location="cpu", weights_only=False)
-    probe_extractor = build_extractor(args, space, scale,
-                                      pretrained_path=str(run_dir / "checkpoint_best.pt"))
+    best_path = Path(result.checkpoints["best"])
+    best = torch.load(best_path, map_location="cpu", weights_only=False)
+    probe_extractor = build_extractor(args, space, scale, pretrained_path=str(best_path))
     probe_extractor.eval()
     head = nn.Linear(probe_extractor.features_dim - 1, n_states)
     head.load_state_dict(best["head_state_dict"])

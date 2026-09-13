@@ -341,6 +341,85 @@ def pretrain_dir(domain: str, variant: str, experiment_name: str, *,
     return Path(root) / domain / variant / "pretrain" / experiment_name
 
 
+PRETRAIN_STATUS_FILENAME = RUN_STATUS_FILENAME
+
+
+def write_pretrain_status(run_dir: "str | os.PathLike", *, completed: bool, error,
+                          rl_checkpoint: "str | os.PathLike | None" = None,
+                          checkpoints: "Mapping[str, object] | None" = None,
+                          summary: "Mapping[str, object] | None" = None) -> dict:
+    """Write <run_dir>/run_status.json for a PRETRAINING run (batch 7.5) and return it.
+
+    Besides completed / failed it names the RL-loadable checkpoint (``rl_checkpoint``: what
+    ``rl/train.py --pretrained_path`` takes -- the ST's checkpoint_best.pt, the reconstruction-
+    pretrained CGF's exported checkpoint_best_cgf_arm.pt), so :func:`latest_pretrain_checkpoint`
+    reads the answer instead of guessing a file name.
+    """
+    status = {
+        "status": "completed" if completed else "failed",
+        "error": None if error is None else f"{type(error).__name__}: {error}",
+        "rl_checkpoint": None if rl_checkpoint is None else str(Path(rl_checkpoint).resolve()),
+        "checkpoints": {k: str(Path(v).resolve()) for k, v in (checkpoints or {}).items()},
+        "summary": dict(summary or {}),
+        "finished_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    path = Path(run_dir) / PRETRAIN_STATUS_FILENAME
+    with open(path, "w") as handle:
+        json.dump(status, handle, indent=2, default=str)
+    return status
+
+
+#: Old run-folder shapes, recognised read-only by :func:`latest_pretrain_checkpoint`: the
+#: reconstruction-pretrained CGF export, the Trainer's checkpoint, the Odd-Even script's.
+_LEGACY_RL_CHECKPOINTS = ("checkpoints/checkpoint_best_cgf_arm.pt", "checkpoints/checkpoint_best.pt",
+                          "checkpoint_best.pt")
+
+
+def latest_pretrain_checkpoint(domain: str, variant: str, encoder: str, objective: "str | None" = None, *,
+                               root: "str | os.PathLike | None" = None,
+                               experiment_name: "str | None" = None,
+                               base_dir: "str | os.PathLike | None" = None) -> "Path | None":
+    """The newest RL-loadable pretraining checkpoint for (domain, variant, encoder, objective),
+    or None (batch 7.5; decision 4 of plan section 7).
+
+    Default: the root layout, ``<root>/<domain>/<variant>/pretrain/<encoder>/<objective>/*/``,
+    newest folder first (their names start with the timestamp), taking the first whose
+    ``run_status.json`` says completed and names an existing ``rl_checkpoint``. With
+    ``experiment_name`` (or ``base_dir`` + ``experiment_name``): an OLD experiment folder,
+    ``<root>/<domain>/<variant>/pretrain/<experiment_name>/*/`` -- a run with a status file is
+    read the same way, one without is recognised by its file names (``checkpoints/
+    checkpoint_best_cgf_arm.pt``, ``checkpoints/checkpoint_best.pt``, ``checkpoint_best.pt``).
+    Read-only: nothing is renamed or moved.
+    """
+    if experiment_name is None:
+        if objective is None:
+            raise ValueError("latest_pretrain_checkpoint: the root layout needs the objective "
+                             "(or pass experiment_name for an old experiment folder)")
+        folder = pretrain_dir(domain, variant, encoder, root=root) / objective
+    elif base_dir is not None:
+        folder = Path(base_dir) / experiment_name
+    else:
+        folder = pretrain_dir(domain, variant, experiment_name, root=root)
+    if not folder.is_dir():
+        return None
+    for run in sorted((d for d in folder.iterdir() if d.is_dir()), key=lambda d: d.name, reverse=True):
+        status_path = run / PRETRAIN_STATUS_FILENAME
+        if status_path.exists():
+            with open(status_path) as handle:
+                status = json.load(handle)
+            if status.get("status") != "completed" or not status.get("rl_checkpoint"):
+                continue
+            candidate = Path(status["rl_checkpoint"])
+            if candidate.exists():
+                return candidate
+            continue
+        if experiment_name is not None:
+            for rel in _LEGACY_RL_CHECKPOINTS:
+                if (run / rel).exists():
+                    return run / rel
+    return None
+
+
 def data_dir(domain: str, variant: str, *, root: "str | os.PathLike | None" = None) -> Path:
     """`<root>/<domain>/<variant>/data`: where the collectors put new datasets (plan section 7,
     decision 1, 2026-09-13). Recorded datasets stay in `experiments/<domain>/data/`."""
