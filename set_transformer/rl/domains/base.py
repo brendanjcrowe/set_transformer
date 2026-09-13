@@ -165,6 +165,65 @@ class Pretraining:
 
 
 @dataclass(frozen=True)
+class Collection:
+    """What the shared dataset collector (``rl/collect.py``, plan section 7, batch 7.4) lets a
+    problem decide. The collector owns the loop that is the same for every problem: build the
+    belief env exactly as the RL step does, play episodes, store the particle cloud and its
+    weights after the reset and after every step, stop at ``--max_snapshots``, rebalance, write
+    one ``.npz`` (``particles [S,N,D]`` float32 raw coordinates, ``weights [S,N]``,
+    ``particle_scale``, a ``metadata`` JSON) and print the distribution report. The problem
+    owns what differs: how an episode is driven, how rows are rebalanced, what extra facts and
+    arrays the file carries. Every hook takes the parsed command line ``args`` and the
+    ``options`` dict :attr:`resolve_arguments` returned.
+    """
+
+    #: ``add_arguments(parser)``: the problem's own collection flags (Ant-Tag: the locomotion
+    #: policy, the pursuit / fully-observed mix, the visibility radius range, the spread
+    #: thresholds; Odd-Even: the filter override and the step / ESS rebalancing knobs).
+    add_arguments: Callable = lambda parser: None
+    #: Defaults for the SHARED flags where the problem's script had its own: ``seed``,
+    #: ``num_particles``, ``timesteps`` (``None`` = resolved from the variant later).
+    defaults: Mapping[str, object] = field(default_factory=dict)
+    #: ``resolve_arguments(parser, args, domain) -> options``: resolve the env id and filter
+    #: (overrides included), fill ``args.timesteps`` / ``args.num_particles`` when None, refuse
+    #: contradictions. MUST return ``{"env_id": str, "particle_filter_class": type, ...}``.
+    resolve_arguments: Callable = lambda parser, args, domain: {}
+    #: ``particle_scale(args, options) -> float``: the scale recorded in the file (the arena
+    #: half-width the RL extractors divide by).
+    particle_scale: Callable = lambda args, options: 1.0
+    #: ``particle_centre(args, options) -> float | None``: added back to the stored particles so
+    #: the file holds RAW coordinates (Odd-Even undoes the env's centring); None = stored as is.
+    particle_centre: Callable = lambda args, options: None
+    #: ``prepare(args, options) -> state``: before the env is built (Ant-Tag: the episode RNG,
+    #: the locomotion policy and its VecNormalize stats, the trajectory-type counts).
+    prepare: Callable = lambda args, options: None
+    #: ``make_env(args, options, state) -> env``: the collection env, built through the same
+    #: factory the RL step uses.
+    make_env: Callable = lambda args, options, state: None
+    #: ``begin_episode(args, options, state, env, episode) -> (reset_kwargs, act)``: called
+    #: right before ``env.reset(**reset_kwargs)``; ``act(obs) -> action`` drives the episode.
+    begin_episode: Callable = lambda args, options, state, env, episode: ({}, None)
+    #: ``finish(args, options, state, n_snapshots)``: after the loop (Ant-Tag prints its mix).
+    finish: Callable = lambda args, options, state, n_snapshots: None
+    #: ``report(args, options, particles, weights, steps, stage)``: the distribution report;
+    #: ``stage`` is ``"raw"`` (before rebalancing) or ``"final"`` (what is written).
+    report: Callable = lambda args, options, particles, weights, steps, stage: None
+    #: ``rebalance(args, options, particles, weights, steps) -> (particles, weights, steps)``;
+    #: ``steps`` may come back None when the problem does not keep the index. Skipped under
+    #: ``--no_rebalance``.
+    rebalance: Callable = lambda args, options, particles, weights, steps: (particles, weights, steps)
+    #: ``metadata_extras(args, options, particles, weights, steps) -> dict``: facts added to the
+    #: metadata JSON next to the shared ones (Odd-Even: n_dist_size, episode_cap, the centre,
+    #: the step-index range).
+    metadata_extras: Callable = lambda args, options, particles, weights, steps: {}
+    #: ``extra_arrays(args, options, particles, weights, steps) -> dict``: further members of the
+    #: ``.npz`` (Odd-Even: ``particle_centre``, ``steps``).
+    extra_arrays: Callable = lambda args, options, particles, weights, steps: {}
+    #: The progress bar's label.
+    progress_desc: str = "Collecting episodes"
+
+
+@dataclass(frozen=True)
 class Domain:
     """One problem, as the trainer sees it. See the module docstring."""
 
@@ -237,6 +296,9 @@ class Domain:
     #: The pretraining objectives this problem declares for itself (see :class:`Pretraining`);
     #: the generic ones (reconstruction) need no declaration.
     pretraining: Pretraining = field(default_factory=Pretraining)
+    #: How this problem's particle-filter datasets are collected (see :class:`Collection`);
+    #: ``None`` for a problem without a collector.
+    collection: "Collection | None" = None
 
     def variant_names(self) -> list[str]:
         return sorted(self.variants)

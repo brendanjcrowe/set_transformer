@@ -74,7 +74,8 @@ experiments/ant_tag/2_collect_pf_dataset.py (Ant-Tag collection)
   C5  weighted spread is the weighted std per coordinate averaged; rebalancing with
       upsample=False never duplicates a row, with upsample=True keeps the size
         -> test_collect_spread_and_rebalance_helpers
-  C6  default output data/<variant>_pf_dataset.npz -> test_collect_default_output_name
+  C6  default output <root>/<domain>/<variant>/data/<variant>_pf_dataset.npz (decision 1, 7.4; was
+      data/<variant>_pf_dataset.npz under the cwd) -> test_collect_default_output_name
   --  the locomotion policy's pursuit action and the visibility-radius draw: not tested on
       purpose (stochastic policy rollouts; the parity runs cover them).
 
@@ -557,6 +558,13 @@ def test_collect_spread_and_rebalance_helpers(monkeypatch):
     assert len({row.tobytes() for row in p_up}) < 60          # ... by duplicating rows
 
 
-def test_collect_default_output_name():
-    source = COLLECT.read_text()
-    assert 'f"data/{args.variant}_pf_dataset.npz"' in source
+def test_collect_default_output_name(tmp):
+    """C6, CHANGED by decision 1 of plan section 7 (2026-09-13): the default output is
+    <root>/<domain>/<variant>/data/<variant>_pf_dataset.npz under the shared run root, no longer
+    data/<variant>_pf_dataset.npz under the current folder; --output_file still overrides."""
+    from set_transformer.rl import run_records
+    assert run_records.dataset_path("ant_tag", "smart", root=tmp) == (
+        tmp / "ant_tag" / "smart" / "data" / "smart_pf_dataset.npz")
+    proc = _run(COLLECT, ["--help"], tmp)
+    # argparse wraps (and may break) the long path token, so compare without whitespace.
+    assert "<root>/<domain>/<variant>/data/<variant>_pf_dataset" in "".join(proc.stdout.split())

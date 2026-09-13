@@ -136,6 +136,7 @@ from set_transformer.rl.wrappers.particle_filter import (
     PFDictWithWeightsObservationWrapper,
 )
 from set_transformer.rl.domains.base import (
+    Collection,
     Domain,
     Evaluation,
     Objective,
@@ -1952,6 +1953,326 @@ EXACT_POSTERIOR_OBJECTIVES = {
 
 
 # ---------------------------------------------------------------------------
+# Dataset collection (moved from experiments/odd_even/2_collect_pf_dataset.py, batch 7.4,
+# 2026-09-13; that script is now an entry point of rl/collect.py and re-exports these names).
+# The shared loop lives in rl/collect.py; what is here is what only Odd-Even knows.
+#
+# WHAT THIS DOMAIN DOES *NOT* HAVE, and why. The Ant-Tag collection carries a locomotion
+# policy, a pursuit-versus-random action mix, a visibility radius and spread thresholds in
+# arena units. None of it applies: on this env the action is a PREDICTION, so it changes
+# neither the hidden state nor the observation stream. The belief trajectory is a function of
+# the observations alone, and random actions therefore give the correct, unbiased belief
+# distribution. There is no exploration policy to design and step 1 of the pipeline drops out.
+#
+# WHAT REPLACES THE SPREAD REBALANCING. The belief here locks on by about step 21 of 50, so
+# uniform sampling over an episode leaves roughly 60% of snapshots one-hot -- the regime where
+# every encoder is equivalent, and so the regime an encoder comparison learns nothing from.
+# Rebalancing is by STEP INDEX (or, with --rebalance_by ess, by effective sample size), never
+# by "spread in arena units": on a 1-D integer state the spread of a near-one-hot belief and
+# of a two-mode belief can coincide, while the step index is exactly the axis along which the
+# belief sharpens. Bodies unchanged.
+# ---------------------------------------------------------------------------
+
+#: Steps below this still carry a genuinely BROAD belief. Measured at n=50:
+#: the share of snapshots with effective sample size above 3 (of 50) is 0.90,
+#: 0.95, 0.95 at steps 0, 1, 2 and collapses to 0.20, 0.05, 0.00 at steps
+#: 3, 4, 5. The belief therefore sharpens several times faster than the
+#: max(belief) > 0.9 criterion suggests, so the 'early' bucket has to be
+#: narrow to hold anything an encoder can distinguish.
+EARLY_STEP = 3
+
+
+def _effective_sample_size(weights: np.ndarray) -> np.ndarray:
+    """1 / sum(w^2) per snapshot. About 1.0 once the belief has locked on."""
+    weights = np.asarray(weights, dtype=np.float64)
+    return 1.0 / np.clip((weights ** 2).sum(axis=1), 1e-30, None)
+
+
+def _rebalance(
+    particles: np.ndarray,
+    weights: np.ndarray,
+    steps: np.ndarray,
+    by: str = "step",
+    early_step: int = EARLY_STEP,
+    collapse_step: int = COLLAPSE_STEP,
+    diffuse_ess: float = 5.0,
+    collapsed_ess: float = 1.5,
+    early_frac: float = 0.40,
+    mid_frac: float = 0.35,
+    late_frac: float = 0.25,
+    seed: int = 42,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Rebalance the snapshot mix across the belief's own sharpening axis.
+
+    Three buckets, downsampled (never upsampled -- no row appears twice) to
+    the target fractions. `by="step"` splits on the step index, which is the axis the
+    belief sharpens along and needs no coordinate units. `by="ess"` splits on
+    effective sample size, which measures the sharpening directly and so is
+    the better choice when episodes are ragged.
+
+    An empty bucket cannot be sampled from; its quota is redistributed over
+    the buckets that do have data, in proportion to their own quotas, so the
+    target fractions still describe the output. The output is smaller than
+    the input whenever the buckets are not already in the target ratio, and
+    says so.
+    """
+    if by == "step":
+        early = np.where(steps < early_step)[0]
+        mid = np.where((steps >= early_step) & (steps < collapse_step))[0]
+        late = np.where(steps >= collapse_step)[0]
+        labels = (f"steps <{early_step}", f"steps {early_step}-{collapse_step-1}",
+                  f"steps >={collapse_step}")
+    elif by == "ess":
+        ess = _effective_sample_size(weights)
+        early = np.where(ess >= diffuse_ess)[0]
+        mid = np.where((ess < diffuse_ess) & (ess > collapsed_ess))[0]
+        late = np.where(ess <= collapsed_ess)[0]
+        labels = (f"ess >={diffuse_ess}",
+                  f"ess {collapsed_ess}-{diffuse_ess}",
+                  f"ess <={collapsed_ess}")
+    else:
+        raise ValueError(f"Unknown --rebalance_by: {by!r}; use step or ess")
+
+    n_total = len(particles)
+    buckets = [(labels[0], early, early_frac),
+               (labels[1], mid, mid_frac),
+               (labels[2], late, late_frac)]
+    print("Pre-rebalance: " + ", ".join(
+        f"{name}={len(idx)} ({len(idx)/max(n_total,1)*100:.1f}%)"
+        for name, idx, _ in buckets))
+
+    live = [b for b in buckets if len(b[1]) > 0]
+    if not live:
+        raise ValueError("No samples to rebalance")
+    empty = [name for name, idx, _ in buckets if len(idx) == 0]
+    if empty:
+        print(f"  WARNING: no samples in bucket(s) {empty}; their share is "
+              "redistributed over the remaining buckets. Consider a longer "
+              "--timesteps or different --early_step / --collapse_step.")
+
+    rng = np.random.default_rng(seed)
+    live_frac_total = sum(frac for _, _, frac in live)
+    shares = [(frac / live_frac_total if live_frac_total > 0
+               else 1.0 / len(live)) for _, _, frac in live]
+    # Never upsample. Sampling WITH replacement used to fill the early
+    # bucket's quota with copies (measured 5.84x duplication on oe50_short);
+    # 3_train_st.py then random-splits the rows, so identical snapshots
+    # landed on both sides and made best_val_loss optimistic. Instead the
+    # output size is set by the tightest bucket, so every target fraction is
+    # met exactly with distinct rows. Collect more episodes for more data.
+    n_out = int(min(len(idx) / share for (_n, idx, _f), share in zip(live, shares)))
+    sampled = []
+    for (_name, idx, _frac), share in zip(live, shares):
+        n_target = min(len(idx), int(round(n_out * share)))
+        sampled.append(rng.choice(idx, size=n_target, replace=False))
+    all_idx = np.concatenate(sampled)
+    rng.shuffle(all_idx)
+    if len(all_idx) < n_total:
+        print(f"  Rebalance keeps {len(all_idx)} of {n_total} snapshots "
+              "(downsampled to the target fractions without duplication)")
+    return particles[all_idx], weights[all_idx], steps[all_idx]
+
+
+def _report_distribution(particles, weights, steps, collapse_step) -> None:
+    """Print the achieved mix, so a bad dataset is visible before step 3."""
+    ess = _effective_sample_size(weights)
+    n = len(particles)
+    print(f"Dataset: particles {particles.shape}, weights {weights.shape}")
+    print(f"  state range: [{particles.min():.1f}, {particles.max():.1f}]")
+    print(f"  effective sample size: median {np.median(ess):.2f} of "
+          f"{particles.shape[1]} (min {ess.min():.2f}, max {ess.max():.2f})")
+    print(f"  step index: min {steps.min()}, median {np.median(steps):.0f}, "
+          f"max {steps.max()}")
+    print(f"  pre-collapse snapshots (step < {collapse_step}): "
+          f"{int((steps < collapse_step).sum())}/{n} "
+          f"({(steps < collapse_step).mean()*100:.1f}%)")
+    for threshold in (1.5, 3.0, 5.0, 10.0):
+        share = float((ess > threshold).mean())
+        print(f"  ess > {threshold:>4}: {share*100:5.1f}%")
+
+
+# -- the Collection hooks (rl/domains/base.py::Collection) -----------------------------------
+
+def _collect_add_arguments(parser) -> None:
+    """Odd-Even's own collection flags (help texts from the script); the shared ones
+    (--num_episodes, --timesteps, --num_particles, --seed, --max_snapshots, --no_rebalance,
+    --output) are rl/collect.py's."""
+    parser.add_argument(
+        "--particle_filter", type=str, default=None,
+        choices=sorted(PARTICLE_FILTERS),
+        help="Override the variant's filter. The bootstrap filter is a "
+             "deliberate arm (a lossier belief on the same env), not a "
+             "different domain.")
+    parser.add_argument(
+        "--rebalance_by", type=str, default="step", choices=["step", "ess"],
+        help="Bucket on the step index (default) or on effective sample "
+             "size. NOT on spread in coordinate units, which does not "
+             "separate a near-one-hot belief from a two-mode one here.")
+    parser.add_argument(
+        "--early_step", type=int, default=EARLY_STEP,
+        help=f"Steps below this are the 'early' bucket (default "
+             f"{EARLY_STEP}). Measured, not guessed: at n=50 the share of "
+             "snapshots with effective sample size above 3 of 50 is 0.90, "
+             "0.95, 0.95 at steps 0-2 and then 0.20, 0.05, 0.00 at steps "
+             "3-5. Everything the encoder could distinguish is in those "
+             "first three steps.")
+    parser.add_argument(
+        "--collapse_step", type=int, default=COLLAPSE_STEP,
+        help=f"Steps at or above this are 'late'. Default {COLLAPSE_STEP}, "
+             "the measured step at which the n=50 posterior has locked on.")
+    parser.add_argument("--diffuse_ess", type=float, default=5.0)
+    parser.add_argument("--collapsed_ess", type=float, default=1.5)
+    parser.add_argument("--early_frac", type=float, default=0.40)
+    parser.add_argument("--mid_frac", type=float, default=0.35)
+    parser.add_argument("--late_frac", type=float, default=0.25)
+
+
+def _collect_resolve_arguments(parser, args, domain) -> dict:
+    """The variant's filter (or the override), and the script's defaults: steps per episode =
+    the registered cap, set size = the state count (an EXACT belief, one particle per state)."""
+    resolved = variants.resolve(args.variant)
+    particle_filter_class = resolve_particle_filter(args.variant, args.particle_filter)
+    if args.timesteps is None:
+        args.timesteps = variants.episode_cap(args.variant)
+    if args.num_particles is None:
+        args.num_particles = resolved.n_dist_size
+    print(f"Variant: {args.variant} | env: {resolved.env_id} | "
+          f"filter: {particle_filter_class.__name__} | "
+          f"n={resolved.n_dist_size} | cap={variants.episode_cap(args.variant)}")
+    return {"env_id": resolved.env_id, "particle_filter_class": particle_filter_class}
+
+
+def _collect_make_env(args, options, state):
+    return make_odd_even_belief_env(
+        num_particles=args.num_particles,
+        rank=0,
+        seed=args.seed,
+        variant=args.variant,
+        particle_filter_class=options["particle_filter_class"],
+    )()
+
+
+def _collect_begin_episode(args, options, state, env, episode):
+    # seed + episode: on this env the hidden state is drawn at reset, so
+    # THE SEED IS THE EPISODE. A constant reset seed would collect one
+    # episode num_episodes times (PITFALLS.md section 2). Actions are drawn
+    # uniformly: the action is a prediction and does not move the state or the
+    # observation stream, so the belief distribution collected under random
+    # actions is the same one any policy would induce.
+    return {"seed": args.seed + episode}, (lambda obs: env.action_space.sample())
+
+
+def _collect_report(args, options, particles, weights, steps, stage) -> None:
+    if stage == "raw":
+        print(f"\nRaw snapshots: {len(particles)}")
+        _report_distribution(particles, weights, steps, args.collapse_step)
+        return
+    if not args.no_rebalance:
+        print("\nPost-rebalance:")
+        _report_distribution(particles, weights, steps, args.collapse_step)
+    print(f"\n  particle_scale (recorded for pretraining): "
+          f"{variants.state_scale(args.variant)}")
+    print(f"  particle_centre: {variants.state_centre(args.variant)}")
+
+
+def _collect_rebalance(args, options, particles, weights, steps):
+    print("\nRebalancing...")
+    return _rebalance(
+        particles, weights, steps,
+        by=args.rebalance_by,
+        early_step=args.early_step,
+        collapse_step=args.collapse_step,
+        diffuse_ess=args.diffuse_ess,
+        collapsed_ess=args.collapsed_ess,
+        early_frac=args.early_frac,
+        mid_frac=args.mid_frac,
+        late_frac=args.late_frac,
+        seed=args.seed,
+    )
+
+
+def _collect_metadata_extras(args, options, particles, weights, steps) -> dict:
+    """What this domain records beyond the shared facts (the script's `_build_metadata`)."""
+    resolved = variants.resolve(args.variant)
+    return {
+        "n_dist_size": resolved.n_dist_size,
+        "episode_cap": variants.episode_cap(args.variant),
+        # The centre the RL env subtracts before dividing by particle_scale. Recorded so the
+        # two halves of the mapping cannot drift apart (PITFALLS.md section 4).
+        "particle_centre": variants.state_centre(args.variant),
+        "step_index_min": int(steps.min()) if len(steps) else None,
+        "step_index_max": int(steps.max()) if len(steps) else None,
+    }
+
+
+def _collect_extra_arrays(args, options, particles, weights, steps) -> dict:
+    return {
+        # Top-level so get_dataset() reads it without parsing the metadata.
+        # dataset.py applies (x - centre) / scale, matching the RL wrapper.
+        "particle_centre": np.float32(variants.state_centre(args.variant)),
+        # Per-row step index, so the transient/steady mix can be checked or
+        # re-split downstream (only min/max used to be recorded).
+        "steps": steps.astype(np.int32),
+    }
+
+
+def collect_dataset_for_test(ns: int, num_episodes: int, timesteps: int,
+                             num_particles: int, seed: int):
+    """Collect a small dataset in-process, for the contract tests.
+
+    Named and shaped for tests/test_odd_even_pomdp_contract.py, which calls
+    exactly this signature. `ns` selects the variant by state range, so a
+    test does not have to know the registry keys.
+
+    Returns:
+        (particles, weights, metadata_dict) -- the same three things the .npz
+        carries, so a test checks the real contract and not a parallel one.
+    """
+    from set_transformer.rl import collect as _collect   # imported here: rl/collect imports the domains
+
+    matches = [name for name, v in VARIANTS.items()
+               if v.n_dist_size == int(ns)]
+    if not matches:
+        raise ValueError(
+            f"No registered variant with n_dist_size={ns}; have "
+            + ", ".join(f"{n}(n={v.n_dist_size})"
+                        for n, v in VARIANTS.items()))
+    # The shortest cap among the matches: a test wants the cheapest env whose
+    # state range is the one it asked for.
+    variant = min(matches, key=variants.episode_cap)
+
+    parser = _collect.build_parser(ODD_EVEN, selectors=False)
+    args = parser.parse_args(["--variant", variant, "--num_episodes", str(num_episodes),
+                              "--timesteps", str(timesteps), "--num_particles", str(num_particles),
+                              "--seed", str(seed)])
+    options = ODD_EVEN_COLLECTION.resolve_arguments(parser, args, ODD_EVEN)
+    particles, weights, steps = _collect.collect_arrays(ODD_EVEN, args, options, progress=False)
+    particles, weights, steps = _rebalance(particles, weights, steps,
+                                           by="step", seed=seed)
+    metadata = _collect.build_metadata(ODD_EVEN, args, options, particles, weights, steps,
+                                       record_args=False)
+    return particles, weights, metadata
+
+
+ODD_EVEN_COLLECTION = Collection(
+    add_arguments=_collect_add_arguments,
+    # The script's defaults for the shared flags; --timesteps and --num_particles are resolved
+    # from the variant in _collect_resolve_arguments.
+    defaults={"seed": 0, "num_episodes": 200},
+    resolve_arguments=_collect_resolve_arguments,
+    particle_scale=lambda args, options: variants.state_scale(args.variant),
+    particle_centre=lambda args, options: variants.state_centre(args.variant),
+    make_env=_collect_make_env,
+    begin_episode=_collect_begin_episode,
+    report=_collect_report,
+    rebalance=_collect_rebalance,
+    metadata_extras=_collect_metadata_extras,
+    extra_arrays=_collect_extra_arrays,
+    progress_desc="Collecting episodes",
+)
+
+
+# ---------------------------------------------------------------------------
 # The Domain description (change 4, 2026-09-12): what the shared trainer needs from Odd-Even
 # ---------------------------------------------------------------------------
 
@@ -2028,4 +2349,7 @@ ODD_EVEN = Domain(
     # objectives, batch 7.3); the generic reconstruction objective needs no declaration.
     # `belief_kl` is what `rl/pretrain.py --domain odd_even` runs when --objective is omitted.
     pretraining=Pretraining(objectives=EXACT_POSTERIOR_OBJECTIVES, default_objective="belief_kl"),
+    # Step 2 of the pipeline: random actions (the action is a prediction), rebalanced by step
+    # index or effective sample size (batch 7.4).
+    collection=ODD_EVEN_COLLECTION,
 )

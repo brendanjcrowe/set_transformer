@@ -341,6 +341,20 @@ def pretrain_dir(domain: str, variant: str, experiment_name: str, *,
     return Path(root) / domain / variant / "pretrain" / experiment_name
 
 
+def data_dir(domain: str, variant: str, *, root: "str | os.PathLike | None" = None) -> Path:
+    """`<root>/<domain>/<variant>/data`: where the collectors put new datasets (plan section 7,
+    decision 1, 2026-09-13). Recorded datasets stay in `experiments/<domain>/data/`."""
+    root = output_root() if root is None else Path(root)
+    return Path(root) / domain / variant / "data"
+
+
+def dataset_path(domain: str, variant: str, *, tag: str = "",
+                 root: "str | os.PathLike | None" = None) -> Path:
+    """`<data_dir>/<variant>_pf_dataset[_<tag>].npz`: the collectors' default output file."""
+    suffix = f"_{tag}" if tag else ""
+    return data_dir(domain, variant, root=root) / f"{variant}_pf_dataset{suffix}.npz"
+
+
 def eval_dir(domain: str, variant: str, *, root: "str | os.PathLike | None" = None) -> Path:
     """`<root>/<domain>/<variant>/eval`: the evaluation script's JSON summaries."""
     root = output_root() if root is None else Path(root)
