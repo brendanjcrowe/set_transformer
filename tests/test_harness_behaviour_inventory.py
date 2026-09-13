@@ -215,9 +215,40 @@ def _drive_ant_tag_main(mods, monkeypatch, tmp_path, module_name, train_name, ar
     return captured["config"], captured["train"]
 
 
+#: Arms whose main() forwards to set_transformer.rl.train.main (switched in change 4.3+).
+#: Their training call is the shared train(), intercepted below in the shape the older
+#: assertions read.
+_SWITCHED_ODD_EVEN_ARMS = {"gaussian"}
+
+
+def _drive_switched_odd_even_main(oe, monkeypatch, tmp_path, arm, argv):
+    """A switched arm: intercept the shared run-record helpers and train(); return the
+    record and the training call with the keys the pre-switch assertions use
+    (`variant`, `encoder`, `policy_kwargs`, `run_subdir` beside train()'s own kwargs)."""
+    from set_transformer.rl import run_records
+    from set_transformer.rl import train as train_mod
+    captured = {}
+    monkeypatch.setattr(run_records, "default_run_dir", lambda *a, **k: str(tmp_path / "run"))
+    monkeypatch.setattr(run_records, "git_provenance", lambda: {})
+    monkeypatch.setattr(run_records, "tee_stdout_stderr", lambda path: None)
+    monkeypatch.setattr(run_records, "write_run_config",
+                        lambda run_dir, **cfg: captured.setdefault("config", cfg))
+
+    def fake_train(domain, variant, encoder, **kw):
+        captured.setdefault("train", dict(
+            kw, variant=variant, encoder=encoder if isinstance(encoder, str) else encoder.name,
+            policy_kwargs={"features_extractor_kwargs": kw["features_extractor_kwargs"]},
+            run_subdir=captured["config"]["run_subdir"]))
+    monkeypatch.setattr(train_mod, "train", fake_train)
+    oe[f"4_train_rl_{arm}"].main(list(argv))
+    return captured["config"], captured["train"]
+
+
 def _drive_odd_even_main(oe, monkeypatch, tmp_path, arm, argv):
     """Same for an Odd-Even arm. The shared pieces live on the CGF module (the other
     two arms bind them by name), the training call on the arm's own module."""
+    if arm in _SWITCHED_ODD_EVEN_ARMS:
+        return _drive_switched_odd_even_main(oe, monkeypatch, tmp_path, arm, argv)
     cgf, arm_mod = oe["4_train_rl_cgf"], oe[f"4_train_rl_{arm}"]
     captured = {}
     monkeypatch.setattr(cgf, "_default_run_dir", lambda *a, **k: str(tmp_path / "run"))

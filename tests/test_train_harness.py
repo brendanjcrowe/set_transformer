@@ -491,7 +491,8 @@ _ODD_EVEN_GRID = [
             "--st_frozen"], {}),
     ("st", ["--variant", "oe50_short", "--pretrained_st_model_path", "CKPT:odd_even_st",
             "--st_encoder_lr_scale", "0.1", "--st_unfreeze_at", "1000"], {}),
-    ("gaussian", ["--variant", "oe50_long", "--run_tag", "g"], {}),
+    # (Odd-Even Gaussian left this grid at its switch, change 4.3: its script IS the shared
+    # command line now; the parity driver, tests/tools/rl_parity.py, covers it against master.)
 ]
 
 
