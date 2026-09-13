@@ -120,7 +120,7 @@ from set_transformer.rl.particle_filters.odd_even import (
 from set_transformer.rl.wrappers.particle_filter import (
     PFDictWithWeightsObservationWrapper,
 )
-from set_transformer.rl.domains.base import Domain
+from set_transformer.rl.domains.base import Domain, Evaluation
 
 
 # ---------------------------------------------------------------------------
@@ -959,6 +959,244 @@ def relative_feature_spread(features, eps: float = 1e-8) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Evaluation (change 5.1, 2026-09-12): how Odd-Even scores a policy. Moved here from
+# experiments/odd_even/eval_scripts/eval_true_reward_odd_even.py, which now forwards to the
+# shared script rl/eval_true_reward.py and re-exports these names for the tests.
+# ---------------------------------------------------------------------------
+#
+# THERE IS NO "SUCCESS" ON THIS DOMAIN, so the Ant-Tag success-rate metric does not transfer.
+# What is reported instead, and why each piece is load-bearing:
+#
+# * **Mean reward per step, SPLIT at the collapse step.** The belief tightens to ~2 live
+#   candidates by about step 8 and keeps sharpening after that; the split separates the
+#   informative transient from the settled tail. So the pooled mean is largely a measurement of
+#   how much uninformed guessing the cap dilutes: at n=50 / cap 50 step 1 alone is about 18% of
+#   the oracle's pooled mean, and before reset() folded in its own observation it was 81%.
+#   Worse, the pooled mean is not comparable ACROSS CAPS -- the two n=50 variants share a
+#   protocol and have IDENTICAL transient columns, and their whole pooled difference (-0.941
+#   against -0.259) is dilution. **Steady state is the headline.**
+# * **Exact-match rate and mean absolute error**, split the same way. Since 2026-09-03 the
+#   env's reward IS the exact-match indicator, so the reward and the exact-match rate now
+#   measure the same thing; MAE remains the separate signal, saying how wrong the policy is
+#   when it misses.
+# * **The Bayes oracle and the play-the-previous-observation baseline**, measured on the SAME
+#   episodes. The oracle is info["optimal_prediction"], which under the current 0/1
+#   exact-match reward is the posterior MODE. (Until 2026-09-03 the reward was -(pred - s*)^2
+#   and that helper returned the posterior MEAN, which was Bayes-optimal for THAT rule. The env
+#   now derives it from the reward in force -- see OddEvenPOMDP.get_optimal_prediction -- so
+#   this code needs no change to follow it, but any number quoted from a squared-error run is
+#   not comparable to a current one.) The gap between the oracle's steady state (-0.329) and
+#   play-the-previous-observation (-9.750) is about 9.4 reward per step: that is the value of
+#   accumulating evidence, and it is exactly what a belief encoding either delivers or loses.
+#
+# TWO SEEDING RULES, both from PITFALLS.md section 2 and both sharper here than on Ant-Tag:
+#
+# 1. **Re-seed AFTER PPO.load** (the shared script does it for every domain).
+# 2. **Vary the seed per episode** (``Evaluation.reseed_per_episode``). On this env the hidden
+#    state is drawn at reset, so THE SEED IS THE EPISODE: reset(seed=42) replays one episode
+#    byte for byte. A constant seed makes 100 episodes one episode counted 100 times, and the
+#    tell -- byte-identical results across "different" seeds -- looks like a robust policy.
+
+#: Transient/steady boundary: the measured step at which the n=50 exact posterior has locked
+#: on (max(belief) > 0.9). Steps 1..COLLAPSE_STEP are the transient; COLLAPSE_STEP+1..cap are
+#: the steady state.
+COLLAPSE_STEP = 21
+
+
+def summarize_episode(rewards, collapse_step: int = COLLAPSE_STEP) -> dict:
+    """Split one episode's per-step rewards into transient / steady / pooled.
+
+    `rewards[0]` is step 1. The transient is steps 1..collapse_step and the steady state is
+    everything after, so the two are disjoint and their lengths reconstruct the episode
+    exactly.
+
+    A steady segment can be EMPTY (an episode shorter than collapse_step), in which case its
+    mean is NaN rather than 0.0 -- averaging a missing segment as zero would pull a very
+    negative mean toward the oracle and read as improvement.
+    """
+    rewards = np.asarray(rewards, dtype=np.float64).ravel()
+    transient = rewards[:collapse_step]
+    steady = rewards[collapse_step:]
+    return {
+        "transient": float(transient.mean()) if transient.size else float("nan"),
+        "steady": float(steady.mean()) if steady.size else float("nan"),
+        "pooled": float(rewards.mean()) if rewards.size else float("nan"),
+        "n_transient": int(transient.size),
+        "n_steady": int(steady.size),
+        "n_pooled": int(rewards.size),
+    }
+
+
+def split_metric(values, collapse_step: int = COLLAPSE_STEP) -> dict:
+    """Per-episode arrays -> transient / steady / pooled means over all steps.
+
+    MEANS pool across episodes at the STEP level, not by averaging per-episode means:
+    episodes here can differ in length, and a per-episode average would weight a short
+    episode's steps more heavily.
+
+    SEMs are PER EPISODE: the standard error of the per-episode means over the episodes that
+    have any step in the split. Steps within an episode are not independent samples -- once
+    the belief locks on, the policy repeats the same right or wrong guess, and 82% of oracle
+    episodes have all nine steady rewards identical -- so a step-pooled SEM understated the
+    uncertainty ~2.5x (0.009 vs 0.022 at 150 episodes; PITFALLS.md section 8 item 1). Every
+    number quoted before 2026-09-06 used the step-pooled SEM; the means were unaffected.
+    """
+    transient, steady, pooled = [], [], []
+    for row in values:
+        row = np.asarray(row, dtype=np.float64).ravel()
+        transient.append(row[:collapse_step])
+        steady.append(row[collapse_step:])
+        pooled.append(row)
+
+    def _mean(chunks):
+        flat = np.concatenate(chunks) if chunks else np.array([])
+        return float(flat.mean()) if flat.size else float("nan")
+
+    def _sem(chunks):
+        per_episode = np.array([c.mean() for c in chunks if c.size], dtype=np.float64)
+        return (float(per_episode.std(ddof=1) / np.sqrt(per_episode.size))
+                if per_episode.size > 1 else float("nan"))
+
+    return {
+        "transient": _mean(transient), "transient_sem": _sem(transient),
+        "steady": _mean(steady), "steady_sem": _sem(steady),
+        "pooled": _mean(pooled), "pooled_sem": _sem(pooled),
+    }
+
+
+def episode_metrics(rewards, predictions, true_states,
+                    collapse_step: int = COLLAPSE_STEP) -> dict:
+    """Reward, exact-match and absolute error, each split the same way."""
+    exact, abs_err = [], []
+    for preds, truth in zip(predictions, true_states):
+        preds = np.asarray(preds, dtype=np.float64)
+        exact.append((preds == float(truth)).astype(np.float64))
+        abs_err.append(np.abs(preds - float(truth)))
+    return {
+        "reward": split_metric(rewards, collapse_step),
+        "exact_match": split_metric(exact, collapse_step),
+        "abs_error": split_metric(abs_err, collapse_step),
+    }
+
+
+def run_reference_policies(variant: str, n_episodes: int, seed: int,
+                           collapse_step: int = COLLAPSE_STEP) -> dict:
+    """The Bayes oracle (info['optimal_prediction']) and play-the-previous-obs.
+
+    Run on the RAW env, not the belief env: neither policy uses a particle filter, and both
+    read what the env already reports in `info`. Deciding happens BEFORE each step's
+    observation arrives, because `step()` converts the action to a prediction first and only
+    then draws observations -- an oracle that peeked at the current step's observation would
+    score about -1.098 per step at n=50, which no policy can reach.
+
+    Uses `seed + episode_index`, so these are the same episodes the policy is evaluated on
+    when it is given the same --seed.
+    """
+    resolved = resolve(variant)
+    cap = episode_cap(variant)
+    env = gym.make(resolved.env_id)
+    results = {}
+    for name in ("oracle", "prev_obs"):
+        rewards, predictions, truths = [], [], []
+        for episode in range(n_episodes):
+            _obs, info = env.reset(seed=seed + episode)
+            previous = int(np.asarray(info["observations"]).ravel()[-1])
+            episode_rewards, episode_predictions = [], []
+            for _step in range(cap):
+                if name == "oracle":
+                    prediction = int(info["optimal_prediction"])
+                else:
+                    prediction = previous
+                _obs, reward, terminated, truncated, info = env.step(prediction - 1)
+                episode_rewards.append(float(reward))
+                episode_predictions.append(float(prediction))
+                previous = int(np.asarray(info["observations"]).ravel()[-1])
+                if terminated or truncated:
+                    break
+            rewards.append(episode_rewards)
+            predictions.append(episode_predictions)
+            truths.append(int(info["true_state"]))
+        results[name] = episode_metrics(rewards, predictions, truths, collapse_step)
+    env.close()
+    return results
+
+
+def print_metrics_block(name: str, metrics: dict, collapse_step: int) -> None:
+    reward = metrics["reward"]
+    exact = metrics["exact_match"]
+    error = metrics["abs_error"]
+    print(f"\n{name}")
+    print(f"  {'':14s} {'steady (HEADLINE)':>20s} {'transient':>14s} "
+          f"{'pooled':>14s}")
+    print(f"  {'reward/step':14s} {reward['steady']:20.3f} "
+          f"{reward['transient']:14.3f} {reward['pooled']:14.3f}")
+    print(f"  {'exact match':14s} {exact['steady']:20.3f} "
+          f"{exact['transient']:14.3f} {exact['pooled']:14.3f}")
+    print(f"  {'abs error':14s} {error['steady']:20.3f} "
+          f"{error['transient']:14.3f} {error['pooled']:14.3f}")
+    print(f"  (reward SEM: steady {reward['steady_sem']:.3f}, "
+          f"transient {reward['transient_sem']:.3f}, "
+          f"pooled {reward['pooled_sem']:.3f})")
+
+
+def _eval_add_arguments(parser) -> None:
+    parser.add_argument(
+        "--collapse_step", type=int, default=COLLAPSE_STEP,
+        help=f"Transient/steady boundary (default {COLLAPSE_STEP}, the measured n=50 "
+             "collapse step). Steps 1..this are the transient.")
+    parser.add_argument(
+        "--baselines_only", "--oracle_only", action="store_true", dest="baselines_only",
+        help="Report just the Bayes oracle and the prev-obs reference. No checkpoint needed "
+             "-- use it to reproduce the reference table in domain_mds/oddeven.md. "
+             "--oracle_only is an alias: the flag reports BOTH references, so neither name "
+             "is quite right on its own and both are accepted.")
+
+
+def _eval_references(args, variant) -> dict:
+    """Print the header and both reference policies, on the episodes the policy will see."""
+    cap = episode_cap(args.variant)
+    print(f"n={variant.n_dist_size} | Episodes: {args.n_episodes}, seeds {args.seed}.."
+          f"{args.seed + args.n_episodes - 1} (one per episode: on this env the hidden "
+          "state is drawn at reset, so the seed IS the episode)")
+    print(f"Transient = steps 1-{args.collapse_step}, steady = {args.collapse_step + 1}-{cap}")
+    references = run_reference_policies(args.variant, args.n_episodes, args.seed,
+                                        args.collapse_step)
+    print_metrics_block("Bayes oracle (info['optimal_prediction'])",
+                        references["oracle"], args.collapse_step)
+    print_metrics_block("play the previous observation",
+                        references["prev_obs"], args.collapse_step)
+    return references
+
+
+def _eval_report(episodes, references, args, variant, cap) -> None:
+    """The policy's block and its placement on the oracle-to-naive span."""
+    # The env's own reward is what is being measured, so the prediction is read back from
+    # info rather than recomputed from the action -- the env owns the 0-indexed to 1-indexed
+    # shift.
+    rewards = [episode.rewards for episode in episodes]
+    predictions = [[float(info["predicted_state"]) for info in episode.infos]
+                   for episode in episodes]
+    truths = [int(episode.final_info["true_state"]) for episode in episodes]
+    metrics = episode_metrics(rewards, predictions, truths, args.collapse_step)
+    print_metrics_block(f"policy ({os.path.basename(args.model_path)}, "
+                        f"deterministic={args.deterministic})",
+                        metrics, args.collapse_step)
+
+    oracle_steady = references["oracle"]["reward"]["steady"]
+    prev_steady = references["prev_obs"]["reward"]["steady"]
+    policy_steady = metrics["reward"]["steady"]
+    span = oracle_steady - prev_steady
+    print(f"\nSteady-state placement: oracle {oracle_steady:.3f}, "
+          f"policy {policy_steady:.3f}, prev-obs {prev_steady:.3f}")
+    if np.isfinite(span) and span != 0:
+        # Where the policy sits on the oracle-to-naive span. This is the quantity the encoder
+        # comparison is about: 0 means the belief bought nothing, 1 means the encoding
+        # delivered the whole value of accumulating evidence.
+        print(f"  fraction of the oracle-to-naive span recovered: "
+              f"{(policy_steady - prev_steady) / span:.3f}")
+
+
+# ---------------------------------------------------------------------------
 # The Domain description (change 4, 2026-09-12): what the shared trainer needs from Odd-Even
 # ---------------------------------------------------------------------------
 
@@ -1025,4 +1263,10 @@ ODD_EVEN = Domain(
     # order (the sentinel records under its own keys so it cannot overwrite the shared ones).
     encoder_callbacks=lambda encoder_name: (
         [OddEvenSTFeatureSentinel()] if encoder_name == "st" else []),
+    # No success on this domain: transient / steady split against the Bayes oracle and the
+    # previous-observation baseline, on the same episodes, re-seeded per episode.
+    evaluation=Evaluation(add_arguments=_eval_add_arguments, default_n_episodes=400,
+                          reseed_per_episode=True, references=_eval_references,
+                          references_only=lambda args: bool(args.baselines_only),
+                          report=_eval_report),
 )

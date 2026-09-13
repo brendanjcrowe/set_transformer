@@ -1183,16 +1183,23 @@ def test_eval_reseeds_after_load():
     PPO.load restores the TRAINING seed and set_random_seed re-seeds the env
     with it, overriding --seed. On this env the seed is the episode, so the
     consequence is sharper than on Ant-Tag: every eval replays one episode.
-    The eval script must re-seed after the load AND vary the seed per episode.
+    The shared eval script (which eval_true_reward_odd_even.py forwards to
+    since change 5.1) must re-seed after the load, and the Odd-Even domain
+    must ask for the per-episode re-seeding.
     """
+    import set_transformer.rl.eval_true_reward as shared
+    from set_transformer.rl.domains.odd_even import ODD_EVEN
+
     module = _load_experiment_module(
         _ODD_EVEN_DIR / "eval_scripts", "eval_true_reward_odd_even")
-    source = Path(module.__file__).read_text()
-    load_at = source.index("PPO.load")
-    assert "seed" in source[load_at:], "no re-seed after PPO.load"
-    assert ("episode" in source[load_at:load_at + 2000]
-            or "+ ep" in source[load_at:load_at + 2000]), (
-        "the eval loop does not vary the seed per episode")
+    assert module.main is not None and module._shared_main is shared.main
+    source = Path(shared.__file__).read_text()
+    load_at = source.index("PPO.load(")
+    assert "env.seed(args.seed)" in source[load_at:], "no re-seed after PPO.load"
+    assert ODD_EVEN.evaluation.reseed_per_episode is True, (
+        "the Odd-Even eval does not vary the seed per episode")
+    rollout_src = source[source.index("def rollout("):source.index("def report_success_rate(")]
+    assert "env.seed(seed + index)" in rollout_src
 
 
 def test_metrics_split_transient_steady():

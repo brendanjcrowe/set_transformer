@@ -29,6 +29,42 @@ from set_transformer.rl.curriculum import Schedule
 
 
 @dataclass(frozen=True)
+class Evaluation:
+    """What the shared evaluation script (``rl/eval_true_reward.py``, change 5.1) lets a
+    problem decide. Every field has a default, so a domain that only needs the generic
+    protocol -- roll the checkpoint out, count an episode a success when its final ``info``
+    says ``is_success`` or it ended before the cap -- leaves this record alone.
+
+    The script owns everything else: the command line, the particle count read off the
+    checkpoint, the cap from the registry, the env through :attr:`Domain.make_env` with
+    ``training=False``, VecNormalize in inference mode, re-seeding after ``PPO.load`` and the
+    rollout itself.
+    """
+
+    #: ``add_arguments(parser)``: evaluation-only flags of this problem (Ant-Tag: ``--no_mask``;
+    #: Odd-Even: ``--collapse_step``, ``--baselines_only``).
+    add_arguments: Callable = lambda parser: None
+    #: ``options(args) -> dict``: the ``options`` :attr:`Domain.make_env` takes for the eval env.
+    options: Callable = lambda args: {}
+    #: Default ``--n_episodes``.
+    default_n_episodes: int = 50
+    #: ``False``: the vec env is seeded once, after ``PPO.load``, and the episodes run on.
+    #: ``True``: ``env.seed(seed + episode)`` before EVERY reset (Odd-Even, where the hidden
+    #: state is drawn at reset, so the seed IS the episode; PITFALLS.md section 2).
+    reseed_per_episode: bool = False
+    #: ``references(args, variant) -> object | None``: reference policies run BEFORE the
+    #: checkpoint is loaded, on the episodes the policy will see (Odd-Even: the Bayes oracle
+    #: and play-the-previous-observation). Whatever it returns is handed to :attr:`report`.
+    references: Callable = lambda args, variant: None
+    #: ``references_only(args) -> bool``: stop after the references; no checkpoint needed.
+    references_only: Callable = lambda args: False
+    #: ``report(episodes, references, args, variant, cap) -> None``: print the result.
+    #: ``episodes`` is the list of :class:`~set_transformer.rl.eval_true_reward.Episode`
+    #: records (per-step rewards and infos). ``None`` selects the script's success-rate report.
+    report: Callable | None = None
+
+
+@dataclass(frozen=True)
 class Domain:
     """One problem, as the trainer sees it. See the module docstring."""
 
@@ -96,6 +132,8 @@ class Domain:
     #: ``encoder_callbacks(encoder_name) -> list``: callbacks the domain adds for one encoder
     #: (Odd-Even attaches its collapse sentinel to the ST arm). Empty by default.
     encoder_callbacks: Callable = lambda encoder_name: []
+    #: What the shared evaluation script lets this problem decide (see :class:`Evaluation`).
+    evaluation: Evaluation = field(default_factory=Evaluation)
 
     def variant_names(self) -> list[str]:
         return sorted(self.variants)

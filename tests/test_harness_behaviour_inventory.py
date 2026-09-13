@@ -721,13 +721,16 @@ def test_git_provenance_records_both_repos_and_never_raises(ant_tag, odd_even):
 # ==========================================================================
 
 def _load_ant_tag_eval(ant_tag):
+    """The CGF eval entry point (a forwarder since change 5.1) and the shared script it
+    forwards to; the fakes are installed on the shared module, which owns the loop."""
+    import set_transformer.rl.eval_true_reward as shared
     path = _ANT_TAG_DIR / "eval_scripts" / "eval_true_reward_cgf.py"
     key = "_inventory_eval_true_reward_cgf"
     spec = importlib.util.spec_from_file_location(key, path)
     module = importlib.util.module_from_spec(spec)
     with _sys_path(_ANT_TAG_DIR, path.parent):
         spec.loader.exec_module(module)
-    return module
+    return module, shared
 
 
 class _ZeroPolicy:
@@ -740,8 +743,9 @@ def test_ant_tag_eval_defaults_the_cap_to_the_registry_and_reseeds_after_load(
     """The eval reads the episode cap off the variant's gym registration (a wrong cap
     counts timeouts as tags), builds the env at the real radius without shaping, and
     re-applies --seed to the vec env AFTER PPO.load (which would otherwise restore the
-    training seed and replay one episode set)."""
-    module = _load_ant_tag_eval(ant_tag)
+    training seed and replay one episode set). Ant-Tag seeds ONCE (no per-episode
+    re-seeding), as the standalone script did."""
+    module, shared = _load_ant_tag_eval(ant_tag)
     seeds = []
 
     class RecordingDummyVecEnv(DummyVecEnv):
@@ -749,8 +753,8 @@ def test_ant_tag_eval_defaults_the_cap_to_the_registry_and_reseeds_after_load(
             seeds.append(seed)
             return super().seed(seed)
 
-    monkeypatch.setattr(module, "DummyVecEnv", RecordingDummyVecEnv)
-    monkeypatch.setattr(module, "PPO", SimpleNamespace(load=lambda path, env=None: _ZeroPolicy()))
+    monkeypatch.setattr(shared, "DummyVecEnv", RecordingDummyVecEnv)
+    monkeypatch.setattr(shared, "PPO", SimpleNamespace(load=lambda path, env=None: _ZeroPolicy()))
     monkeypatch.setattr(sys, "argv", ["eval_true_reward_cgf.py", "--variant", "smart",
                                       "--model_path", "/nonexistent/agent.zip",
                                       "--num_particles", "16", "--n_episodes", "1", "--seed", "123"])
@@ -760,17 +764,58 @@ def test_ant_tag_eval_defaults_the_cap_to_the_registry_and_reseeds_after_load(
     assert "Eval episode seed: 123" in out
     assert seeds == [123]
     assert "Success rate  : " in out
+    assert "Median length : " in out    # the wave drivers grep this line
 
 
 def test_ant_tag_eval_refuses_a_particle_count_that_contradicts_the_checkpoint(
         ant_tag, monkeypatch):
-    module = _load_ant_tag_eval(ant_tag)
-    monkeypatch.setattr(module, "_checkpoint_num_particles", lambda path: 100)
+    module, shared = _load_ant_tag_eval(ant_tag)
+    monkeypatch.setattr(shared, "checkpoint_num_particles", lambda path: 100)
     monkeypatch.setattr(sys, "argv", ["eval_true_reward_cgf.py", "--variant", "smart",
                                       "--model_path", "x.zip", "--num_particles", "16"])
     with pytest.raises(SystemExit) as exc:
         module.main()
     assert exc.value.code == 2
+
+
+def test_ant_tag_eval_env_is_the_domain_eval_env(ant_tag):
+    """`make_eval_env` (what the diagnostics call) and `Domain.make_env(training=False)`
+    (what the shared script calls) build the same stack: real visibility radius, no shaping,
+    Monitor on the env's own reward, seeded particle filter."""
+    from set_transformer.rl.domains.ant_tag import ANT_TAG, PFRewardShapingWrapper, resolve
+
+    def _layers(env):
+        names = []
+        cur = env
+        while cur is not None:
+            names.append(type(cur).__name__)
+            cur = getattr(cur, "env", None)
+        return names
+
+    module, _shared = _load_ant_tag_eval(ant_tag)
+    variant = resolve("smart")
+    a = module.make_eval_env(16, [-2, -1], 5, env_id=variant.env_id,
+                             particle_filter_class=variant.particle_filter)()
+    b = ANT_TAG.make_env("smart", num_particles=16, particle_filter_class=variant.particle_filter,
+                         seed=5, rank=0, monitor_dir=None, training=False,
+                         options=ANT_TAG.evaluation.options(SimpleNamespace(no_mask=False)))()
+    try:
+        assert _layers(a) == _layers(b)
+        assert PFRewardShapingWrapper.__name__ not in _layers(a)
+        for env in (a, b):
+            pf = next(w for w in _walk(env) if hasattr(w, "particle_filter_seed"))
+            assert pf.particle_filter_seed == 5
+            assert pf.obs_mask_indices == [-2, -1]
+    finally:
+        a.close()
+        b.close()
+
+
+def _walk(env):
+    cur = env
+    while cur is not None:
+        yield cur
+        cur = getattr(cur, "env", None)
 
 
 # ==========================================================================

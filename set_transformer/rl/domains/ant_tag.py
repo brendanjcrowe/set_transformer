@@ -76,7 +76,7 @@ from set_transformer.rl.curriculum import (
     parse_reward_schedule,
 )
 from set_transformer.rl.curriculum import parse_reward_schedule as _parse_reward_schedule
-from set_transformer.rl.domains.base import Domain
+from set_transformer.rl.domains.base import Domain, Evaluation
 from set_transformer.rl.particle_filters.ant_tag import (
     AntTagParticleFilter,
     CounterweightedDenAntTagParticleFilter,
@@ -1228,6 +1228,32 @@ def _make_env(variant: str, *, num_particles: int, particle_filter_class: type, 
         env_id=env_id, particle_filter_class=particle_filter_class, **options)
 
 
+def make_eval_env(num_particles: int, obs_mask_indices, seed: int,
+                  env_id: str = "pdomains-ant-tag-v0",
+                  particle_filter_class: type = AntTagParticleFilter):
+    """The EVAL env with the signature ``eval_scripts/eval_true_reward_cgf.py`` gave it
+    (the diagnostics build their env through it): the env's real visibility radius, no
+    reward shaping, Monitor on the env's own reward. Same stack as
+    ``_make_env(training=False)``, which the shared evaluation script uses."""
+    return make_ant_tag_cgf_env(
+        num_particles=num_particles, seed=seed, env_id=env_id,
+        particle_filter_class=particle_filter_class,
+        initial_visibility_radius=get_env_visible_radius(env_id),
+        obs_mask_indices=obs_mask_indices, apply_reward_shaping=False)
+
+
+def _eval_add_arguments(parser) -> None:
+    parser.add_argument("--no_mask", action="store_true",
+                        help="Do not zero obs[-2:] (the target position) for the agent. "
+                             "Must match how the checkpoint was trained (masked by default).")
+
+
+def _eval_options(args) -> dict:
+    """The env-factory options of the eval env: only the target mask (the shaping
+    coefficients are irrelevant with shaping off, and the visibility radius is the env's)."""
+    return dict(obs_mask_indices=None if args.no_mask else [-2, -1])
+
+
 def _cgf_t_init_max_default(args):
     """Ant-Tag's rule for a ``--t_init_max`` left unset (4_train_rl_cgf.resolve_cgf_encoder_args):
     clamp mode keeps None (the extractor's legacy 2.8 ceiling, recorded as null as every old
@@ -1280,4 +1306,7 @@ ANT_TAG = Domain(
         # The Ant-Tag ST geometry: 32 inducing points, hidden 128, two post-PMA SABs.
         "st": dict(num_inds=32, dim_hidden=128, num_post_sab=2),
     },
+    # The generic protocol: success = is_success from info, else ended before the cap.
+    evaluation=Evaluation(add_arguments=_eval_add_arguments, options=_eval_options,
+                          default_n_episodes=50),
 )
