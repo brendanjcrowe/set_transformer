@@ -375,10 +375,35 @@ _LEGACY_RL_CHECKPOINTS = ("checkpoints/checkpoint_best_cgf_arm.pt", "checkpoints
                           "checkpoint_best.pt")
 
 
+def _sanitise_run_tag(run_tag: str) -> str:
+    """The run-tag sanitising `run_leaf` / `default_run_dir` apply when they name a folder."""
+    return re.sub(r'[^A-Za-z0-9._-]', '_', run_tag)
+
+
+def _leaf_matches(name: str, seed: "int | None", run_tag: "str | None") -> bool:
+    """Does the run-folder name `<timestamp>_seed<n>[_<run_tag>]` carry this seed and this run
+    tag? Batch 8.0 (plan section 8): the sweep driver finds a cell's run by the exact
+    `_seed<n>_<run_tag>` ending it chose itself, never by "newest". `None` = no constraint."""
+    if run_tag is not None:
+        tail = f"_{_sanitise_run_tag(run_tag)}"
+        if not name.endswith(tail):
+            return False
+        name = name[: -len(tail)]
+        if seed is None:
+            return re.search(r"_seed\d+$", name) is not None
+        return name.endswith(f"_seed{int(seed)}")
+    if seed is not None:
+        # `_seed<n>` followed by the end or by a tag; `_seed1` must not match `_seed10`.
+        return re.search(rf"_seed{int(seed)}(?:_|$)", name) is not None
+    return True
+
+
 def latest_pretrain_checkpoint(domain: str, variant: str, encoder: str, objective: "str | None" = None, *,
                                root: "str | os.PathLike | None" = None,
                                experiment_name: "str | None" = None,
-                               base_dir: "str | os.PathLike | None" = None) -> "Path | None":
+                               base_dir: "str | os.PathLike | None" = None,
+                               seed: "int | None" = None,
+                               run_tag: "str | None" = None) -> "Path | None":
     """The newest RL-loadable pretraining checkpoint for (domain, variant, encoder, objective),
     or None (batch 7.5; decision 4 of plan section 7).
 
@@ -390,6 +415,11 @@ def latest_pretrain_checkpoint(domain: str, variant: str, encoder: str, objectiv
     read the same way, one without is recognised by its file names (``checkpoints/
     checkpoint_best_cgf_arm.pt``, ``checkpoints/checkpoint_best.pt``, ``checkpoint_best.pt``).
     Read-only: nothing is renamed or moved.
+
+    ``seed`` / ``run_tag`` (batch 8.0): consider only run folders whose name ends in
+    ``_seed<seed>`` / ``_seed<n>_<run_tag>``. Every arm pretrained with one objective shares the
+    objective folder (all CGF arms under ``cgf/belief_kl/``), so a caller that wants ONE arm's run
+    must say which; with both left at None the behaviour is unchanged.
     """
     if experiment_name is None:
         if objective is None:
@@ -403,6 +433,8 @@ def latest_pretrain_checkpoint(domain: str, variant: str, encoder: str, objectiv
     if not folder.is_dir():
         return None
     for run in sorted((d for d in folder.iterdir() if d.is_dir()), key=lambda d: d.name, reverse=True):
+        if not _leaf_matches(run.name, seed, run_tag):
+            continue
         status_path = run / PRETRAIN_STATUS_FILENAME
         if status_path.exists():
             with open(status_path) as handle:
@@ -417,6 +449,36 @@ def latest_pretrain_checkpoint(domain: str, variant: str, encoder: str, objectiv
             for rel in _LEGACY_RL_CHECKPOINTS:
                 if (run / rel).exists():
                     return run / rel
+    return None
+
+
+def find_rl_run(domain: str, variant: str, encoder: str, seed: int, run_tag: str, *,
+                root: "str | os.PathLike | None" = None) -> "Path | None":
+    """The newest COMPLETED RL run folder for one sweep cell, or None (batch 8.0, plan section 8).
+
+    Looks under ``<root>/<domain>/<variant>/rl/<encoder>/`` for folders named
+    ``<timestamp>_seed<seed>_<run_tag>`` (the layout :func:`run_dir` writes) and returns the newest
+    whose ``models/run_status.json`` says ``completed`` and whose ``models/<encoder>_agent.zip`` and
+    ``models/vecnormalize.pkl`` exist. A folder whose status says ``failed``, has no status, or
+    lacks either file is not a result and is skipped, so a driver re-runs that cell. Read-only.
+    """
+    root = output_root() if root is None else Path(root)
+    folder = Path(root) / domain / variant / "rl" / encoder
+    if not folder.is_dir():
+        return None
+    for run in sorted((d for d in folder.iterdir() if d.is_dir()), key=lambda d: d.name, reverse=True):
+        if not _leaf_matches(run.name, seed, run_tag):
+            continue
+        models = run / "models"
+        status_path = models / RUN_STATUS_FILENAME
+        if not status_path.exists():
+            continue
+        with open(status_path) as handle:
+            status = json.load(handle)
+        if status.get("status") != "completed":
+            continue
+        if (models / f"{encoder}_agent.zip").exists() and (models / "vecnormalize.pkl").exists():
+            return run
     return None
 
 

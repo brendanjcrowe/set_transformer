@@ -104,3 +104,103 @@ def test_precompute_emd_entry_point_and_module_share_one_main(tmp_path):
     assert sidecar["command"].startswith("2b_precompute_emd.py --data_path") and "torch" in sidecar["threads"]
     with pytest.raises(SystemExit):
         precompute_emd.main(["--sinkhorn_blur", "0.05"])        # neither --data_path nor --domain/--variant
+
+
+# ---------------------------------------------------------------------------------------------
+# Batch 8.0 (plan section 8): the sweep driver finds ONE cell's run by seed and run tag.
+# ---------------------------------------------------------------------------------------------
+
+
+def test_latest_checkpoint_seed_filter_ignores_a_newer_run_of_another_seed(tmp_path):
+    root = tmp_path
+    base = root / "odd_even" / "oe50_short" / "pretrain" / "st" / "belief_kl"
+    s0 = _touch(base / "20260901_000000_seed0_w1_st_belief_kl_frozen" / "checkpoints" / "checkpoint_best.pt")
+    run_records.write_pretrain_status(s0.parent.parent, completed=True, error=None, rl_checkpoint=s0)
+    s1 = _touch(base / "20260902_000000_seed1_w1_st_belief_kl_frozen" / "checkpoints" / "checkpoint_best.pt")
+    run_records.write_pretrain_status(s1.parent.parent, completed=True, error=None, rl_checkpoint=s1)
+    # unchanged default: newest completed, whatever its seed
+    assert run_records.latest_pretrain_checkpoint("odd_even", "oe50_short", "st", "belief_kl", root=root) == s1.resolve()
+    assert run_records.latest_pretrain_checkpoint("odd_even", "oe50_short", "st", "belief_kl", root=root,
+                                                  seed=0) == s0.resolve()
+    assert run_records.latest_pretrain_checkpoint("odd_even", "oe50_short", "st", "belief_kl", root=root,
+                                                  seed=1) == s1.resolve()
+    assert run_records.latest_pretrain_checkpoint("odd_even", "oe50_short", "st", "belief_kl", root=root,
+                                                  seed=2) is None
+    # seed 1 must not match seed 10 (suffix, not substring)
+    s10 = _touch(base / "20260903_000000_seed10" / "checkpoints" / "checkpoint_best.pt")
+    run_records.write_pretrain_status(s10.parent.parent, completed=True, error=None, rl_checkpoint=s10)
+    assert run_records.latest_pretrain_checkpoint("odd_even", "oe50_short", "st", "belief_kl", root=root,
+                                                  seed=1) == s1.resolve()
+
+
+def test_latest_checkpoint_run_tag_filter_picks_the_right_arm_in_a_shared_objective_folder(tmp_path):
+    root = tmp_path
+    base = root / "odd_even" / "oe50_short" / "pretrain" / "cgf" / "belief_kl"   # every CGF arm lands here
+    kgrad = _touch(base / "20260901_000000_seed0_w1_cgf_Kgrad_fixed_belief_kl_frozen" / "checkpoints"
+                   / "checkpoint_best.pt")
+    run_records.write_pretrain_status(kgrad.parent.parent, completed=True, error=None, rl_checkpoint=kgrad)
+    k = _touch(base / "20260902_000000_seed0_w1_cgf_K_fixed_belief_kl_frozen" / "checkpoints" / "checkpoint_best.pt")
+    run_records.write_pretrain_status(k.parent.parent, completed=True, error=None, rl_checkpoint=k)
+    # without the filter the newer K arm shadows the K' arm -- the reason the filter exists
+    assert run_records.latest_pretrain_checkpoint("odd_even", "oe50_short", "cgf", "belief_kl", root=root) == k.resolve()
+    assert run_records.latest_pretrain_checkpoint("odd_even", "oe50_short", "cgf", "belief_kl", root=root,
+                                                  run_tag="w1_cgf_Kgrad_fixed_belief_kl_frozen") == kgrad.resolve()
+    assert run_records.latest_pretrain_checkpoint("odd_even", "oe50_short", "cgf", "belief_kl", root=root,
+                                                  seed=0, run_tag="w1_cgf_K_fixed_belief_kl_frozen") == k.resolve()
+    assert run_records.latest_pretrain_checkpoint("odd_even", "oe50_short", "cgf", "belief_kl", root=root,
+                                                  seed=1, run_tag="w1_cgf_K_fixed_belief_kl_frozen") is None
+    # the tag is sanitised the way run_leaf names the folder, and a partial tag does not match
+    assert run_records.latest_pretrain_checkpoint("odd_even", "oe50_short", "cgf", "belief_kl", root=root,
+                                                  run_tag="w1 cgf_K_fixed_belief_kl_frozen") == k.resolve()
+    assert run_records.latest_pretrain_checkpoint("odd_even", "oe50_short", "cgf", "belief_kl", root=root,
+                                                  run_tag="K_fixed_belief_kl_frozen") is None
+    # a newer run of the SAME cell that failed does not hide the completed one
+    failed = base / "20260903_000000_seed0_w1_cgf_K_fixed_belief_kl_frozen"
+    failed.mkdir()
+    run_records.write_pretrain_status(failed, completed=False, error=RuntimeError("x"))
+    assert run_records.latest_pretrain_checkpoint("odd_even", "oe50_short", "cgf", "belief_kl", root=root,
+                                                  run_tag="w1_cgf_K_fixed_belief_kl_frozen") == k.resolve()
+    # the filter also applies on the old-layout path
+    old = _touch(root / "odd_even" / "oe50_short" / "pretrain" / "cgf_belief_pretrain"
+                 / "20260905_000000_cgf_belief_kl_seed0_v3" / "checkpoint_best.pt")
+    _touch(root / "odd_even" / "oe50_short" / "pretrain" / "cgf_belief_pretrain"
+           / "20260906_000000_cgf_belief_kl_seed0_v4" / "checkpoint_best.pt")
+    assert run_records.latest_pretrain_checkpoint("odd_even", "oe50_short", "cgf", root=root,
+                                                  experiment_name="cgf_belief_pretrain", run_tag="v3") == old
+
+
+def _fake_rl_run(root, encoder, leaf, *, status, zip_present=True, vecnorm_present=True):
+    run = root / "odd_even" / "oe50_short" / "rl" / encoder / leaf
+    models = run / "models"
+    models.mkdir(parents=True)
+    if status is not None:
+        run_records.write_run_status(str(models / f"{encoder}_agent.zip"), completed=(status == "completed"),
+                                     error=None if status == "completed" else RuntimeError("x"),
+                                     timesteps=10, total_timesteps=10)
+    if zip_present:
+        _touch(models / f"{encoder}_agent.zip")
+    if vecnorm_present:
+        _touch(models / "vecnormalize.pkl")
+    return run
+
+
+def test_find_rl_run_returns_the_completed_cell_and_skips_failed_or_incomplete_ones(tmp_path):
+    root = tmp_path
+    assert run_records.find_rl_run("odd_even", "oe50_short", "cgf", 0, "w1_cgf_K_fixed_e2e", root=root) is None
+    done = _fake_rl_run(root, "cgf", "20260913_100000_seed0_w1_cgf_K_fixed_e2e", status="completed")
+    other_arm = _fake_rl_run(root, "cgf", "20260913_110000_seed0_w1_cgf_Kgrad_fixed_e2e", status="completed")
+    other_seed = _fake_rl_run(root, "cgf", "20260913_120000_seed1_w1_cgf_K_fixed_e2e", status="completed")
+    _fake_rl_run(root, "cgf", "20260913_130000_seed0_w1_cgf_K_fixed_e2e", status="failed")        # crashed later
+    _fake_rl_run(root, "cgf", "20260913_140000_seed0_w1_cgf_K_fixed_e2e", status=None)            # killed, no status
+    _fake_rl_run(root, "cgf", "20260913_150000_seed0_w1_cgf_K_fixed_e2e", status="completed", zip_present=False)
+    _fake_rl_run(root, "cgf", "20260913_160000_seed0_w1_cgf_K_fixed_e2e", status="completed", vecnorm_present=False)
+    assert run_records.find_rl_run("odd_even", "oe50_short", "cgf", 0, "w1_cgf_K_fixed_e2e", root=root) == done
+    assert run_records.find_rl_run("odd_even", "oe50_short", "cgf", 0, "w1_cgf_Kgrad_fixed_e2e", root=root) == other_arm
+    assert run_records.find_rl_run("odd_even", "oe50_short", "cgf", 1, "w1_cgf_K_fixed_e2e", root=root) == other_seed
+    assert run_records.find_rl_run("odd_even", "oe50_short", "cgf", 2, "w1_cgf_K_fixed_e2e", root=root) is None
+    assert run_records.find_rl_run("odd_even", "oe50_short", "st", 0, "w1_cgf_K_fixed_e2e", root=root) is None
+    # newest completed wins when a cell was completed twice
+    again = _fake_rl_run(root, "cgf", "20260913_170000_seed0_w1_cgf_K_fixed_e2e", status="completed")
+    assert run_records.find_rl_run("odd_even", "oe50_short", "cgf", 0, "w1_cgf_K_fixed_e2e", root=root) == again
+    # nothing was written or renamed under the root by the lookups
+    assert sorted(p.name for p in (root / "odd_even" / "oe50_short" / "rl" / "cgf").iterdir())[0] == done.name
