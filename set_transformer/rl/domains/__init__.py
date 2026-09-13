@@ -1,6 +1,38 @@
-"""Per-domain pieces of the RL harness: env wrappers, curriculum, particle-filter glue.
+"""Per-domain pieces of the RL harness: variant registries, env wrappers and factories,
+curriculum declarations, particle-filter glue, and one ``Domain`` record per problem.
 
-One module per domain (``ant_tag``, later ``odd_even``). These modules import no env
-package and set no plotting backend, so they load without MuJoCo; registering the envs
-(``import pdomains``) is the caller's job.
+One module per domain (``ant_tag``, ``odd_even``). These modules import no plotting backend
+and load without MuJoCo (``import pdomains`` only registers env ids); the ``Domain`` record
+at the bottom of each (``ANT_TAG``, ``ODD_EVEN``) is what ``rl/train.py`` reads. Look a
+record up by name with :func:`get`; the module is imported on first use, so asking for
+``odd_even`` never imports the Ant-Tag particle filters.
+
+Adding a problem: ``rl/domains/<name>.py`` ending in ``<NAME> = Domain(...)`` (see
+``base.py``), plus one entry in :data:`DOMAIN_NAMES` below.
 """
+
+from __future__ import annotations
+
+import importlib
+
+from set_transformer.rl.domains.base import Domain
+
+#: ``--domain`` choices: domain name -> (module, record attribute).
+DOMAIN_NAMES: dict[str, tuple[str, str]] = {
+    "ant_tag": ("set_transformer.rl.domains.ant_tag", "ANT_TAG"),
+    "odd_even": ("set_transformer.rl.domains.odd_even", "ODD_EVEN"),
+}
+
+
+def get(name: str | Domain) -> Domain:
+    """The :class:`Domain` record for ``name`` (a record is returned as is)."""
+    if isinstance(name, Domain):
+        return name
+    try:
+        module_name, attribute = DOMAIN_NAMES[name]
+    except KeyError:
+        raise ValueError(f"Unknown domain {name!r}. Available: {sorted(DOMAIN_NAMES)}") from None
+    return getattr(importlib.import_module(module_name), attribute)
+
+
+__all__ = ["DOMAIN_NAMES", "Domain", "get"]

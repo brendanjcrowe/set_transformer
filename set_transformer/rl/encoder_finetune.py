@@ -137,6 +137,14 @@ class UnfreezeEncoderCallback(BaseCallback):
         if not self.done and self.num_timesteps >= self.unfreeze_at:
             n = 0
             for extractor in self._encoders():
+                unfreeze = getattr(extractor, "unfreeze", None)
+                if unfreeze is not None:
+                    # The shared encoder interface (change 4, 2026-09-12): every learned
+                    # extractor knows how to release itself (ST clears the no_grad flag,
+                    # CGF its eval-mode hold, the pooled arms their flag) and reports how
+                    # many tensors it released.
+                    n += int(unfreeze())
+                    continue
                 # The extractor's own flag wraps forward() in torch.no_grad()
                 # when set (st.py); requires_grad alone would leave the
                 # encoder trainable in name only.

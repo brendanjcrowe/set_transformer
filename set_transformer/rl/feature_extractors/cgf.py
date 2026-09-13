@@ -851,6 +851,17 @@ class WeightedCGFFeaturesExtractor(BaseFeaturesExtractor):
     def freeze(self) -> None:
         self.freeze_encoder()
 
+    def unfreeze(self) -> int:
+        """Undo `freeze()`: t, the norm statistics and the readout learn again (change 4,
+        2026-09-12). Returns the number of tensors released."""
+        self._frozen = False
+        released = 0
+        for param in self.parameters():
+            param.requires_grad_(True)
+            released += 1
+        self.train()
+        return released
+
     def encoder_state_dict(self) -> dict:
         return self.state_dict()
 

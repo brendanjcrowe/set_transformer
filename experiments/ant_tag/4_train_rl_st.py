@@ -435,21 +435,11 @@ def train_ant_tag_st(
         eval_vec_env.close()
 
 
-def _default_resume_vecnormalize(resume_from: str) -> str:
-    """The VecNormalize snapshot saved alongside a checkpoint zip.
-
-    CheckpointCallback(save_vecnormalize=True) writes
-    ``<prefix>_<N>_steps.zip`` next to ``<prefix>_vecnormalize_<N>_steps.pkl``;
-    the final ``st_agent.zip`` sits next to ``vecnormalize.pkl``.
-    """
-    d, base = os.path.split(resume_from)
-    m = re.fullmatch(r"(.+)_(\d+)_steps\.zip", base)
-    if m:
-        return os.path.join(d, f"{m.group(1)}_vecnormalize_{m.group(2)}_steps.pkl")
-    if base == "st_agent.zip":
-        return os.path.join(d, "vecnormalize.pkl")
-    raise ValueError(f"cannot derive the VecNormalize snapshot for {resume_from}; "
-                     "pass --resume_vecnormalize")
+# The snapshot-beside-checkpoint rule lives in the package since 2026-09-12 (change 4),
+# generalised to any <encoder>_agent.zip; imported back under the name the tests read.
+from set_transformer.rl.run_records import (  # noqa: E402
+    resume_vecnormalize_path as _default_resume_vecnormalize,
+)
 
 
 def main(encoder: str = "st"):

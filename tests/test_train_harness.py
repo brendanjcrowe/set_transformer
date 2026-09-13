@@ -1,0 +1,723 @@
+"""The shared trainer (change 4.1 of the harness centralisation, 2026-09-12).
+
+Pins four things about ``rl/train.py``, ``rl/encoders.py`` and the two ``Domain`` records
+while the numbered scripts still hold their own copies of the flag resolution:
+
+* the two Domain records and the encoder table are complete and name the same objects the
+  package exports;
+* every start-mode alias (``--pretrained_st_model_path`` and friends) stores the same value
+  as the generic spelling, and the shared refusals fire;
+* RESOLVER EQUIVALENCE: for a grid of command lines, the run record the shared command line
+  writes (``--dry_run``) carries every key of the record the arm's own script writes, with
+  the same value -- the evidence that the merged CGF / ST resolution reproduces both
+  domains' scripts. The keys that are new, renamed or deliberately different are listed
+  here, so any drift beyond that list fails;
+* a tiny training run per domain through the new function completes and saves what the
+  eval scripts need (model, VecNormalize, run_status.json, checkpoint + snapshot).
+
+Loading conventions follow tests/test_harness_behaviour_inventory.py.
+"""
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import importlib
+import importlib.util
+import sys
+from contextlib import contextmanager
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+_ST_ROOT = Path(__file__).resolve().parents[1]
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_ANT_TAG_DIR = _ST_ROOT / "experiments" / "ant_tag"
+_ODD_EVEN_DIR = _ST_ROOT / "experiments" / "odd_even"
+for _p in (str(_REPO_ROOT), str(_ST_ROOT)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+pytest.importorskip("stable_baselines3")
+pytest.importorskip("mujoco", reason="Ant-Tag needs MuJoCo")
+pytest.importorskip("pdomains", reason="envs are registered by pdomains")
+
+import gymnasium as gym  # noqa: E402
+import torch  # noqa: E402
+from stable_baselines3 import PPO  # noqa: E402
+
+from set_transformer.rl import domains  # noqa: E402
+from set_transformer.rl import encoders  # noqa: E402
+from set_transformer.rl import run_records  # noqa: E402
+from set_transformer.rl import train as train_mod  # noqa: E402
+from set_transformer.rl.curriculum import Schedule  # noqa: E402
+from set_transformer.rl.domains import ant_tag as ant_tag_domain  # noqa: E402
+from set_transformer.rl.domains import odd_even as odd_even_domain  # noqa: E402
+from set_transformer.rl.domains.base import Domain  # noqa: E402
+from set_transformer.rl.feature_extractors.cgf import WeightedCGFFeaturesExtractor  # noqa: E402
+from set_transformer.rl.feature_extractors.pooled import (  # noqa: E402
+    PointNetFeaturesExtractor,
+    WeightedDeepSetFeaturesExtractor,
+)
+from set_transformer.rl.feature_extractors.st import SetTransformerFeaturesExtractor  # noqa: E402
+
+
+# --------------------------------------------------------------------------
+# Loading the scripts (their own resolvers are the reference)
+# --------------------------------------------------------------------------
+
+@contextmanager
+def _sys_path(*directories):
+    saved = list(sys.path)
+    try:
+        for directory in directories:
+            sys.path.insert(0, str(directory))
+        yield
+    finally:
+        sys.path[:] = saved
+
+
+_ANT_TAG_MODULES = ("variants", "4_train_rl_frozen", "4_train_rl_cgf", "4_train_rl_st",
+                    "4_train_rl_gaussian", "4_train_rl_pool")
+
+
+@pytest.fixture(scope="module")
+def ant_tag():
+    preexisting = set(sys.modules)
+    with _sys_path(_ANT_TAG_DIR):
+        modules = {name: importlib.import_module(name) for name in _ANT_TAG_MODULES}
+    try:
+        yield modules
+    finally:
+        for name in set(sys.modules) - preexisting:
+            module = sys.modules.get(name)
+            file = getattr(module, "__file__", None) or ""
+            if str(_ST_ROOT / "experiments") in file or name in _ANT_TAG_MODULES:
+                sys.modules.pop(name, None)
+
+
+def _odd_even_sibling():
+    key = "_train_harness_oe_sibling_loader"
+    cached = sys.modules.get(key)
+    if cached is not None:
+        return cached
+    spec = importlib.util.spec_from_file_location(key, _ODD_EVEN_DIR / "_sibling.py")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[key] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.fixture(scope="module")
+def odd_even():
+    with _sys_path(_ODD_EVEN_DIR):
+        return {name: _odd_even_sibling().load(name) for name in
+                ("variants", "4_train_rl_cgf", "4_train_rl_st", "4_train_rl_gaussian")}
+
+
+# --------------------------------------------------------------------------
+# Helpers
+# --------------------------------------------------------------------------
+
+def _obs_space(particle_dim: int, num_particles: int, obs_dim: int) -> gym.spaces.Dict:
+    inf = np.float32(np.inf)
+    return gym.spaces.Dict({
+        "obs": gym.spaces.Box(-inf, inf, (obs_dim,), np.float32),
+        "particles": gym.spaces.Box(-inf, inf, (num_particles, particle_dim), np.float32),
+        "weights": gym.spaces.Box(0.0, 1.0, (num_particles,), np.float32),
+    })
+
+
+ANT_TAG_SPACE = _obs_space(2, 100, 31)
+ODD_EVEN_SPACE = _obs_space(1, 50, 1)
+ODD_EVEN_SCALE = 24.5          # state_scale("oe50_short") = (50 - 1) / 2
+ANT_TAG_SMART_SCALE = 4.5      # the smart env's cage half-width
+
+
+@pytest.fixture(scope="module")
+def checkpoints(tmp_path_factory):
+    """Tiny pretraining checkpoints in the two formats the resolvers read."""
+    root = tmp_path_factory.mktemp("checkpoints")
+    out = {}
+    torch.manual_seed(0)
+    cgf = WeightedCGFFeaturesExtractor(
+        ANT_TAG_SPACE, num_cgf_features=8, arena_scale=ANT_TAG_SMART_SCALE, t_param="polar",
+        t_bound=9.0, t_init_mode="spread", t_init_max=7.2, feature_mode="K_grad",
+        readout_hidden=16, readout_depth=1)
+    torch.save({"model_state_dict": cgf.state_dict(), "config": dict(cgf._cgf_geometry)},
+               root / "ant_tag_cgf.pt")
+    cgf = WeightedCGFFeaturesExtractor(
+        ODD_EVEN_SPACE, num_cgf_features=8, arena_scale=ODD_EVEN_SCALE, t_param="tanh",
+        t_bound=50.0, t_init_mode="spread_1d", t_init_max=40.0, feature_norm="running")
+    torch.save({"model_state_dict": cgf.state_dict(), "config": dict(cgf._cgf_geometry)},
+               root / "odd_even_cgf.pt")
+    # The Ant-Tag ST script cannot read geometry off a checkpoint (the new rule can), so the
+    # Ant-Tag checkpoint carries the Ant-Tag DEFAULT geometry and both sides agree.
+    st = SetTransformerFeaturesExtractor(
+        ANT_TAG_SPACE, num_encodings=8, dim_encoder=8, num_inds=32, dim_hidden=128,
+        num_heads=4, ln=True, arena_scale=ANT_TAG_SMART_SCALE, weight_channel=True)
+    torch.save({"model_state_dict": {f"set_transformer.{k}": v
+                                     for k, v in st.encoder.state_dict().items()},
+                "config": dict(st._st_geometry)}, root / "ant_tag_st.pt")
+    # The Odd-Even one is deliberately NOT the default geometry: both resolvers must take it
+    # from the checkpoint.
+    st = SetTransformerFeaturesExtractor(
+        ODD_EVEN_SPACE, num_encodings=8, dim_encoder=8, num_inds=8, dim_hidden=32,
+        num_heads=4, ln=True, arena_scale=ODD_EVEN_SCALE, weight_channel=True, num_post_sab=1)
+    torch.save({"model_state_dict": {f"set_transformer.{k}": v
+                                     for k, v in st.encoder.state_dict().items()},
+                "config": dict(st._st_geometry)}, root / "odd_even_st.pt")
+    for path in root.iterdir():
+        out[path.stem] = str(path)
+    return out
+
+
+def _drive_ant_tag_script(mods, monkeypatch, tmp_path, module_name, train_name, argv,
+                          encoder=None):
+    """The arm's own main(): run record and training call captured, nothing created."""
+    module = mods[module_name]
+    captured = {}
+    monkeypatch.setattr(module, "_default_run_dir", lambda *a, **k: str(tmp_path / "old_run"))
+    monkeypatch.setattr(module, "_git_provenance", lambda: {})
+    monkeypatch.setattr(module, "_tee_stdout_stderr", lambda path: None)
+    monkeypatch.setattr(module, "_write_run_config",
+                        lambda run_dir, **cfg: captured.setdefault("config", cfg))
+    monkeypatch.setattr(module, train_name,
+                        lambda *a, **kw: captured.setdefault(
+                            "train", {**kw, **({"encoder": a[0]} if a else {})}))
+    monkeypatch.setattr(sys, "argv", [module_name + ".py"] + list(argv))
+    if encoder is None:
+        module.main()
+    else:
+        module.main(encoder=encoder)
+    return captured["config"], captured["train"]
+
+
+def _drive_odd_even_script(oe, monkeypatch, tmp_path, arm, argv):
+    cgf, arm_mod = oe["4_train_rl_cgf"], oe[f"4_train_rl_{arm}"]
+    captured = {}
+    monkeypatch.setattr(cgf, "_default_run_dir", lambda *a, **k: str(tmp_path / "old_run"))
+    monkeypatch.setattr(cgf, "_git_provenance", lambda: {})
+    monkeypatch.setattr(cgf, "_tee_stdout_stderr", lambda path: None)
+    monkeypatch.setattr(cgf, "_write_run_config",
+                        lambda run_dir, **cfg: captured.setdefault("config", cfg))
+    monkeypatch.setattr(arm_mod, "train_odd_even", lambda **kw: captured.setdefault("train", kw))
+    monkeypatch.setattr(sys, "argv", [f"4_train_rl_{arm}.py"] + list(argv))
+    arm_mod.main()
+    return captured["config"], captured["train"]
+
+
+def _drive_shared(monkeypatch, tmp_path, domain, encoder, argv, *, legacy_layout=True):
+    """The shared command line with --dry_run: the run record it writes, and the training
+    call it would have made (captured by replacing train())."""
+    captured = {}
+    monkeypatch.setattr(run_records, "default_run_dir", lambda *a, **k: str(tmp_path / "new_run"))
+    monkeypatch.setattr(run_records, "git_provenance", lambda: {})
+    monkeypatch.setattr(run_records, "tee_stdout_stderr", lambda path: None)
+    monkeypatch.setattr(run_records, "write_run_config",
+                        lambda run_dir, **cfg: captured.setdefault("config", cfg))
+    train_mod.main(list(argv) + ["--dry_run"], domain=domain, encoder=encoder,
+                   legacy_layout=legacy_layout)
+    return captured["config"]
+
+
+#: Record keys that legitimately differ between the two sides.
+IGNORED_KEYS = {"log_dir", "model_save_path", "git"}
+#: Keys the shared record has and the scripts' records did not (plan 4d additions, the
+#: unified start-mode / resume / SAC flags on arms that lacked them, the derived values).
+NEW_KEYS = {
+    "domain", "encoder", "run_directory", "output_root", "pretrained_config",
+    "algorithm", "resume_from", "resume_vecnormalize", "init_policy",
+    "num_post_sab", "encoder_lr_scale", "unfreeze_at", "st_unfreeze_at",
+}
+#: Odd-Even ST stored two flags under its own names; the shared record uses the Ant-Tag
+#: names (2,000+ recorded runs). `ln` is the negation of `no_layer_norm`.
+ODD_EVEN_ST_RENAMES = {"no_layer_norm": ("ln", lambda v: not v),
+                       "st_weight_channel": ("weight_channel", lambda v: v)}
+
+
+#: Keys a script recorded as null because it resolved them INSIDE its train_* function
+#: (arena_scale on the Ant-Tag ST / Gaussian / pooled arms; the 2026-09-03 audit fixed only
+#: the CGF arm). The shared record carries the number that ran.
+RESOLVED_LATE = {"arena_scale"}
+
+
+def _assert_record_matches(old, new, *, renames=None, differ=None):
+    renames = renames or {}
+    differ = differ or {}
+    for key, value in old.items():
+        if key in IGNORED_KEYS:
+            continue
+        if key in renames:
+            new_key, convert = renames[key]
+            assert new[new_key] == convert(value), (key, value, new_key, new[new_key])
+            continue
+        assert key in new, f"key {key!r} of the script's record is missing from the shared one"
+        if key in differ:
+            assert new[key] == differ[key], (key, new[key], differ[key])
+            continue
+        if key in RESOLVED_LATE and value is None:
+            assert new[key] is not None, key
+            continue
+        assert new[key] == value, (key, value, new[key])
+    extra = set(new) - set(old) - IGNORED_KEYS - {r[0] for r in renames.values()}
+    assert extra <= NEW_KEYS, f"unexpected new record keys: {sorted(extra - NEW_KEYS)}"
+
+
+# --------------------------------------------------------------------------
+# 1. The records: two Domains, six Encoders
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("name,record,module", [
+    ("ant_tag", ant_tag_domain.ANT_TAG, ant_tag_domain),
+    ("odd_even", odd_even_domain.ODD_EVEN, odd_even_domain),
+])
+def test_domain_record_is_complete_and_names_the_module_objects(name, record, module):
+    assert isinstance(record, Domain) and record.name == name
+    assert domains.get(name) is record and domains.get(record) is record
+    for field in dataclasses.fields(Domain):
+        assert getattr(record, field.name) is not None, field.name
+    assert record.variants is module.VARIANTS
+    assert record.resolve is module.resolve and record.episode_cap is module.episode_cap
+    assert record.default_variant in record.variants
+    assert record.particle_dim in (1, 2)
+    assert set(record.encoder_defaults) <= set(encoders.ENCODERS)
+    assert record.default_num_particles(record.default_variant) > 0
+    # schedules(args) and encoder_callbacks(name) are callable on a bare namespace
+    assert record.encoder_callbacks("gaussian") == []
+
+
+def test_unknown_domain_is_refused_with_the_list():
+    with pytest.raises(ValueError, match="ant_tag"):
+        domains.get("cluster_hunt")
+
+
+def test_encoder_table_names_the_package_classes_and_their_checkpoint_kwarg():
+    assert sorted(encoders.ENCODERS) == ["cgf", "deepset", "gaussian", "kmoments", "pointnet", "st"]
+    assert encoders.ENCODERS["cgf"].extractor_class is WeightedCGFFeaturesExtractor
+    assert encoders.ENCODERS["st"].extractor_class is SetTransformerFeaturesExtractor
+    assert encoders.ENCODERS["deepset"].extractor_class is WeightedDeepSetFeaturesExtractor
+    assert encoders.ENCODERS["pointnet"].extractor_class is PointNetFeaturesExtractor
+    for name, enc in encoders.ENCODERS.items():
+        if enc.learned:
+            # The stored name of the checkpoint path IS the extractor's own constructor
+            # argument, which the shared reload blanks in policy_kwargs.
+            assert enc.pretrained_dest == enc.extractor_class.PRETRAINED_PATH_KWARG, name
+            assert enc.frozen_dest and enc.lr_scale_dest and enc.unfreeze_dest
+        else:
+            assert enc.pretrained_dest is None
+    with pytest.raises(ValueError, match="gaussian"):
+        encoders.get("moments")
+
+
+def test_odd_even_domain_attaches_the_sentinel_to_the_st_arm_only():
+    from set_transformer.rl.domains.odd_even import OddEvenSTFeatureSentinel
+    st_extra = odd_even_domain.ODD_EVEN.encoder_callbacks("st")
+    assert len(st_extra) == 1 and isinstance(st_extra[0], OddEvenSTFeatureSentinel)
+    assert odd_even_domain.ODD_EVEN.encoder_callbacks("cgf") == []
+    assert ant_tag_domain.ANT_TAG.encoder_callbacks("st") == []
+
+
+def test_sentinel_forwarding_file_hands_back_the_package_objects():
+    with _sys_path(_ODD_EVEN_DIR):
+        sentinel = _odd_even_sibling().load("st_feature_sentinel")
+    from set_transformer.rl.domains import odd_even as oe
+    assert sentinel.OddEvenSTFeatureSentinel is oe.OddEvenSTFeatureSentinel
+    assert sentinel.relative_feature_spread is oe.relative_feature_spread
+    assert sentinel.COLLAPSE_RELATIVE_SPREAD == oe.COLLAPSE_RELATIVE_SPREAD == 5e-3
+
+
+def test_ant_tag_make_schedules_matches_the_adapter():
+    """The trainer builds its Schedules through make_schedules; the scripts through the
+    CurriculumCallback adapter. Same waypoints, same order, for defaults and for given lists."""
+    cases = [
+        (None, None, None),
+        ([(0.0, 100.0), (0.5, 1.0), (1.0, 1.0)],
+         [(0.5, 0.0, 0.0, 50.0), (0.0, 1.0, 0.0, 0.0)],      # unsorted on purpose
+         [(0.0, 0.0), (0.5, 1.0), (1.0, 1.0)]),
+        ([(0.0, 2.0)], None, [(1.0, 0.3), (0.0, 0.3)]),
+    ]
+    for curriculum, reward, evasion in cases:
+        adapter = ant_tag_domain.CurriculumCallback(
+            1000, schedule=curriculum, reward_schedule=reward, evasion_schedule=evasion)
+        built = ant_tag_domain.make_schedules(curriculum, reward, evasion)
+        assert built == adapter.schedules
+        assert all(isinstance(s, Schedule) for s in built)
+        assert [s.target for s in built] == ["set_curriculum_radius", "set_reward_coeffs",
+                                             "set_evasion_scale"]
+
+
+# --------------------------------------------------------------------------
+# 2. Start mode: aliases and refusals
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("encoder,generic,aliases", [
+    ("st", ["--pretrained_path", "x.pt", "--frozen", "--encoder_lr_scale", "0.1",
+            "--unfreeze_at", "7"],
+     ["--pretrained_st_model_path", "x.pt", "--st_frozen", "--st_encoder_lr_scale", "0.1",
+      "--st_unfreeze_at", "7"]),
+    ("cgf", ["--pretrained_path", "x.pt", "--frozen"],
+     ["--pretrained_cgf_model_path", "x.pt", "--cgf_frozen"]),
+    ("deepset", ["--pretrained_path", "x.pt", "--frozen", "--encoder_lr_scale", "0.5"],
+     ["--pretrained_model_path", "x.pt", "--frozen", "--encoder_lr_scale", "0.5"]),
+])
+def test_start_mode_aliases_store_the_same_values_under_the_historical_names(
+        encoder, generic, aliases):
+    enc = encoders.ENCODERS[encoder]
+    parser = train_mod.build_parser(odd_even_domain.ODD_EVEN, enc)
+    a, b = parser.parse_args(generic), parser.parse_args(aliases)
+    assert vars(a) == vars(b)
+    assert getattr(a, enc.pretrained_dest) == "x.pt" and getattr(a, enc.frozen_dest) is True
+    start = enc.start_mode(a)
+    assert start.pretrained_path == "x.pt" and start.frozen and start.kind == "frozen"
+
+
+def test_odd_even_st_layer_norm_and_weight_channel_spellings_share_one_dest():
+    parser = train_mod.build_parser(odd_even_domain.ODD_EVEN, encoders.ENCODERS["st"])
+    assert parser.parse_args([]).ln is True and parser.parse_args([]).weight_channel is True
+    assert parser.parse_args(["--no_layer_norm"]).ln is False
+    assert parser.parse_args(["--no_ln"]).ln is False
+    assert parser.parse_args(["--no_st_weight_channel"]).weight_channel is False
+    assert parser.parse_args(["--no_weight_channel"]).weight_channel is False
+
+
+@pytest.mark.parametrize("argv", [
+    ["--frozen"],                                              # frozen without a checkpoint
+    ["--encoder_lr_scale", "0.1"],                             # finetune fix without a checkpoint
+    ["--unfreeze_at", "5"],                                    # unfreeze without a checkpoint
+    ["--pretrained_path", "CKPT", "--encoder_lr_scale", "0"],  # non-positive scale
+    ["--pretrained_path", "CKPT", "--frozen", "--encoder_lr_scale", "0.1"],
+    ["--pretrained_path", "CKPT", "--frozen", "--unfreeze_at", "5"],
+    ["--pretrained_path", "/nowhere/missing.pt"],              # missing file, refused early
+    ["--pretrained_path", "CKPT", "--encoder_lr_scale", "0.1", "--algorithm", "SAC"],
+])
+def test_start_mode_refusals_are_parser_errors(monkeypatch, tmp_path, checkpoints, argv):
+    argv = [checkpoints["odd_even_st"] if a == "CKPT" else a for a in argv]
+    with pytest.raises(SystemExit):
+        _drive_shared(monkeypatch, tmp_path, "odd_even", "st",
+                      ["--variant", "oe50_short"] + argv)
+
+
+def test_analytic_encoders_offer_no_start_mode_flags(monkeypatch, tmp_path):
+    for encoder in ("gaussian", "kmoments"):
+        with pytest.raises(SystemExit):
+            _drive_shared(monkeypatch, tmp_path, "odd_even", encoder,
+                          ["--variant", "oe50_short", "--frozen"])
+
+
+def test_init_policy_excludes_a_pretrained_encoder_and_resume(monkeypatch, tmp_path, checkpoints):
+    donor = tmp_path / "donor.zip"
+    donor.write_bytes(b"not a real zip; never opened in a dry run")
+    with pytest.raises(SystemExit):
+        _drive_shared(monkeypatch, tmp_path, "odd_even", "st",
+                      ["--variant", "oe50_short", "--init_policy", str(donor),
+                       "--pretrained_path", checkpoints["odd_even_st"]])
+    with pytest.raises(SystemExit):
+        _drive_shared(monkeypatch, tmp_path, "odd_even", "st",
+                      ["--variant", "oe50_short", "--init_policy", "/nowhere/donor.zip"])
+    config = _drive_shared(monkeypatch, tmp_path, "odd_even", "st",
+                           ["--variant", "oe50_short", "--init_policy", str(donor)])
+    assert config["init_policy"] == str(donor)
+
+
+# --------------------------------------------------------------------------
+# 3. Resolver equivalence: the shared record carries the script's record
+# --------------------------------------------------------------------------
+
+_ANT_TAG_GRID = [
+    # (script module, train fn, encoder name for main(encoder=), shared encoder, argv)
+    ("4_train_rl_cgf", "train_ant_tag_cgf", None, "cgf", ["--variant", "smart"]),
+    ("4_train_rl_cgf", "train_ant_tag_cgf", None, "cgf",
+     ["--variant", "cdens_terminal", "--reward_schedule", "none", "--entropy_coeff", "0.5",
+      "--lr_anneal", "--target_kl", "0.03", "--net_arch", "256,256", "--no_mask_target_obs",
+      "--target_speed_scale", "0", "--seed", "3", "--run_tag", "grid"]),
+    ("4_train_rl_cgf", "train_ant_tag_cgf", None, "cgf",
+     ["--variant", "smart", "--t_param", "polar", "--t_init_mode", "spread",
+      "--feature_mode", "K_grad", "--feature_norm", "running"]),
+    ("4_train_rl_cgf", "train_ant_tag_cgf", None, "cgf",
+     ["--variant", "smart", "--match_params", "5000", "--x_embed_dim", "4"]),
+    ("4_train_rl_cgf", "train_ant_tag_cgf", None, "cgf",
+     ["--variant", "smart", "--pretrained_cgf_model_path", "CKPT:ant_tag_cgf", "--cgf_frozen"]),
+    ("4_train_rl_st", "train_ant_tag_st", None, "st", ["--variant", "smart"]),
+    ("4_train_rl_st", "train_ant_tag_st", None, "st",
+     ["--variant", "smart", "--num_inds", "16", "--dim_hidden", "64", "--no_ln",
+      "--no_st_weight_channel", "--num_encodings", "4", "--dim_encoder", "16"]),
+    ("4_train_rl_st", "train_ant_tag_st", None, "st",
+     ["--variant", "smart", "--pretrained_st_model_path", "CKPT:ant_tag_st", "--st_frozen"]),
+    ("4_train_rl_st", "train_ant_tag_st", None, "st",
+     ["--variant", "smart", "--pretrained_st_model_path", "CKPT:ant_tag_st",
+      "--st_encoder_lr_scale", "0.1"]),
+    ("4_train_rl_gaussian", "train_ant_tag_gaussian", None, "gaussian",
+     ["--variant", "smart_mid_slow_v15", "--curriculum", "0:100,1:1"]),
+    ("4_train_rl_pool", "train_ant_tag_pool", "deepset", "deepset",
+     ["--variant", "smart", "--pooling", "mean", "--no_weight_channel"]),
+    ("4_train_rl_pool", "train_ant_tag_pool", "kmoments", "kmoments",
+     ["--variant", "smart", "--k", "2"]),
+]
+
+
+@pytest.mark.parametrize("module_name,train_name,main_encoder,encoder,argv", _ANT_TAG_GRID,
+                         ids=[f"{c[3]}:{' '.join(c[4][2:])}".strip(": ") or c[3]
+                              for c in _ANT_TAG_GRID])
+def test_ant_tag_shared_record_carries_the_scripts_record(
+        ant_tag, checkpoints, monkeypatch, tmp_path, module_name, train_name, main_encoder,
+        encoder, argv):
+    argv = [checkpoints[a.split(":", 1)[1]] if a.startswith("CKPT:") else a for a in argv]
+    old, old_train = _drive_ant_tag_script(ant_tag, monkeypatch, tmp_path, module_name,
+                                           train_name, argv, encoder=main_encoder)
+    new = _drive_shared(monkeypatch, tmp_path, "ant_tag", encoder, argv)
+    _assert_record_matches(old, new)
+    # derived values the scripts computed inside their train_* functions
+    assert new["env_id"] == old["env_id"] and new["run_subdir"] == old["run_subdir"]
+    if encoder == "cgf":
+        assert new["encoder_params"] == old["encoder_params"]
+
+
+_ODD_EVEN_GRID = [
+    ("cgf", ["--variant", "oe50_short"], {}),
+    ("cgf", ["--variant", "oe50", "--particle_filter", "bootstrap", "--num_particles", "60",
+             "--lr_anneal", "--target_kl", "0.02", "--net_arch", "64,64", "--seed", "5"], {}),
+    # clamp mode: the shared record stores t_bound as null (not in force), the script kept 50
+    ("cgf", ["--variant", "oe50_short", "--t_param", "clamp"], {"t_bound": None}),
+    ("cgf", ["--variant", "oe50_short", "--feature_mode", "K_grad", "--feature_norm", "none",
+             "--t_init_max", "30"], {}),
+    ("cgf", ["--variant", "oe50_short", "--match_params", "3000"], {}),
+    ("cgf", ["--variant", "oe50_short", "--pretrained_cgf_model_path", "CKPT:odd_even_cgf",
+             "--cgf_frozen"], {}),
+    ("st", ["--variant", "oe50_short"], {}),
+    ("st", ["--variant", "oe50_short", "--num_inds", "8", "--no_layer_norm",
+            "--no_st_weight_channel", "--num_post_sab", "0"], {}),
+    ("st", ["--variant", "oe50_short", "--pretrained_st_model_path", "CKPT:odd_even_st",
+            "--st_frozen"], {}),
+    ("st", ["--variant", "oe50_short", "--pretrained_st_model_path", "CKPT:odd_even_st",
+            "--st_encoder_lr_scale", "0.1", "--st_unfreeze_at", "1000"], {}),
+    ("gaussian", ["--variant", "oe50_long", "--run_tag", "g"], {}),
+]
+
+
+@pytest.mark.parametrize("encoder,argv,differ", _ODD_EVEN_GRID,
+                         ids=[f"{c[0]}:{' '.join(c[1][2:])}".strip(": ") for c in _ODD_EVEN_GRID])
+def test_odd_even_shared_record_carries_the_scripts_record(
+        odd_even, checkpoints, monkeypatch, tmp_path, encoder, argv, differ):
+    argv = [checkpoints[a.split(":", 1)[1]] if a.startswith("CKPT:") else a for a in argv]
+    old, old_train = _drive_odd_even_script(odd_even, monkeypatch, tmp_path, encoder, argv)
+    new = _drive_shared(monkeypatch, tmp_path, "odd_even", encoder, argv)
+    renames = ODD_EVEN_ST_RENAMES if encoder == "st" else {}
+    _assert_record_matches(old, new, renames=renames, differ=differ)
+    # The Odd-Even scripts hand policy_kwargs to train_odd_even: the extractor kwargs the
+    # shared command line builds from its resolved record must be exactly those.
+    resolved_args = argparse.Namespace(**new)
+    assert encoders.ENCODERS[encoder].extractor_kwargs(resolved_args) == \
+        old_train["policy_kwargs"]["features_extractor_kwargs"]
+
+
+def test_odd_even_cgf_checkpoint_at_another_arena_scale_is_now_refused(
+        monkeypatch, tmp_path, checkpoints):
+    """The one Odd-Even tightening: the script silently took a checkpoint's arena_scale; the
+    shared resolver applies Ant-Tag's rule and refuses (PITFALLS.md section 4)."""
+    with pytest.raises(SystemExit):
+        _drive_shared(monkeypatch, tmp_path, "odd_even", "cgf",
+                      ["--variant", "oe10", "--pretrained_path", checkpoints["odd_even_cgf"]])
+
+
+def test_ant_tag_st_takes_geometry_off_a_checkpoint_and_refuses_disagreement(
+        monkeypatch, tmp_path, checkpoints):
+    """New on Ant-Tag (the script had fixed 32 / 128 defaults and let the extractor raise
+    on a mismatch); the Odd-Even rule, applied to both domains."""
+    config = _drive_shared(monkeypatch, tmp_path, "ant_tag", "st",
+                           ["--variant", "smart", "--pretrained_path", checkpoints["odd_even_st"]])
+    assert (config["num_inds"], config["dim_hidden"], config["num_post_sab"]) == (8, 32, 1)
+    assert config["pretrained_config"]["num_inds"] == 8
+    with pytest.raises(SystemExit):
+        _drive_shared(monkeypatch, tmp_path, "ant_tag", "st",
+                      ["--variant", "smart", "--pretrained_path", checkpoints["odd_even_st"],
+                       "--num_inds", "32"])
+
+
+# --------------------------------------------------------------------------
+# 4. The run directory: root-level layout and the legacy switch
+# --------------------------------------------------------------------------
+
+def test_root_layout_and_run_subdir_override(monkeypatch, tmp_path):
+    monkeypatch.setattr(run_records, "git_provenance", lambda: {})
+    monkeypatch.setattr(run_records, "tee_stdout_stderr", lambda path: None)
+    root = tmp_path / "runs"
+    train_mod.main(["--variant", "oe50_short", "--seed", "2", "--run_tag", "a b",
+                    "--output_root", str(root), "--dry_run"],
+                   domain="odd_even", encoder="gaussian")
+    [record] = list(root.glob("odd_even/oe50_short/rl/gaussian/*_seed2_a_b/run_config.json"))
+    import json
+    config = json.loads(record.read_text())
+    assert config["run_directory"] == str(record.parent)
+    assert config["output_root"] == str(root.resolve())
+    assert config["run_subdir"] == "odd_even_gaussian_oe50_short"
+    assert "dry_run" not in config and "list_variants" not in config
+    train_mod.main(["--variant", "oe50_short", "--run_subdir", "sweep_x",
+                    "--output_root", str(root), "--dry_run"],
+                   domain="odd_even", encoder="gaussian")
+    assert list(root.glob("odd_even/sweep_x/*_seed0/run_config.json"))
+
+
+def test_legacy_layout_keeps_the_cwd_relative_run_dir(monkeypatch, tmp_path):
+    monkeypatch.setattr(run_records, "git_provenance", lambda: {})
+    monkeypatch.setattr(run_records, "tee_stdout_stderr", lambda path: None)
+    monkeypatch.chdir(tmp_path)
+    train_mod.main(["--variant", "oe50_short", "--dry_run"], domain="odd_even",
+                   encoder="gaussian", legacy_layout=True)
+    [record] = list((tmp_path / "runs" / "odd_even_gaussian_oe50_short").glob("*_seed0/run_config.json"))
+    import json
+    config = json.loads(record.read_text())
+    assert config["output_root"] is None and config["run_directory"] == str(record.parent)
+
+
+def test_module_entry_needs_domain_and_encoder_or_a_listing(capsys):
+    with pytest.raises(SystemExit):
+        train_mod.main(["--variant", "smart"])
+    assert train_mod.main(["--list_encoders"]) is None
+    assert "WeightedCGFFeaturesExtractor" in capsys.readouterr().out
+    assert train_mod.main(["--domain", "odd_even", "--encoder", "st", "--list_variants"]) is None
+    assert "oe50_short" in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------
+# 5. Small helpers
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("zip_name,expected", [
+    ("ant_tag_st_100000_steps.zip", "ant_tag_st_vecnormalize_100000_steps.pkl"),
+    ("odd_even_cgf_4096_steps.zip", "odd_even_cgf_vecnormalize_4096_steps.pkl"),
+    ("st_agent.zip", "vecnormalize.pkl"),
+    ("cgf_agent.zip", "vecnormalize.pkl"),
+])
+def test_resume_vecnormalize_path(zip_name, expected):
+    assert run_records.resume_vecnormalize_path(f"/x/models/{zip_name}") == f"/x/models/{expected}"
+
+
+def test_resume_vecnormalize_path_rejects_unknown():
+    with pytest.raises(ValueError, match="resume_vecnormalize"):
+        run_records.resume_vecnormalize_path("/x/models/best_model.zip")
+
+
+@dataclasses.dataclass
+class _Cfg:
+    """Stands in for a Trainer checkpoint's TrainingConfig (module-level so torch can pickle it)."""
+    num_inds: int = 4
+    dim_hidden: int = 8
+
+
+def test_checkpoint_config_reads_dicts_and_dataclasses(tmp_path):
+    torch.save({"model_state_dict": {}, "config": _Cfg()}, tmp_path / "dc.pt")
+    torch.save({"model_state_dict": {}, "config": {"num_inds": 3}}, tmp_path / "d.pt")
+    torch.save({"model_state_dict": {}}, tmp_path / "none.pt")
+    assert encoders.checkpoint_config(str(tmp_path / "dc.pt")) == {"num_inds": 4, "dim_hidden": 8}
+    assert encoders.checkpoint_config(str(tmp_path / "d.pt")) == {"num_inds": 3}
+    assert encoders.checkpoint_config(str(tmp_path / "none.pt")) is None
+    assert encoders.checkpoint_config(None) is None
+
+
+@pytest.mark.parametrize("build", [
+    lambda: SetTransformerFeaturesExtractor(ODD_EVEN_SPACE, num_encodings=2, dim_encoder=4,
+                                            num_inds=4, dim_hidden=16, num_heads=2,
+                                            arena_scale=ODD_EVEN_SCALE),
+    lambda: WeightedCGFFeaturesExtractor(ODD_EVEN_SPACE, num_cgf_features=8,
+                                         arena_scale=ODD_EVEN_SCALE, t_param="tanh",
+                                         t_bound=50.0, feature_norm="running",
+                                         readout_hidden=8, readout_depth=1),
+    lambda: WeightedDeepSetFeaturesExtractor(ANT_TAG_SPACE, num_encodings=2, dim_encoder=4,
+                                             dim_hidden=16, arena_scale=4.5),
+    lambda: PointNetFeaturesExtractor(ANT_TAG_SPACE, num_encodings=2, dim_encoder=4,
+                                      dim_hidden=16, arena_scale=4.5),
+], ids=["st", "cgf", "deepset", "pointnet"])
+def test_unfreeze_undoes_freeze_on_every_learned_extractor(build):
+    extractor = build()
+    params = extractor.encoder_parameters()
+    extractor.freeze()
+    assert not any(p.requires_grad for p in params)
+    released = extractor.unfreeze()
+    assert released == len(params) and released > 0
+    assert all(p.requires_grad for p in params)
+    assert not getattr(extractor, "st_frozen", False) and not getattr(extractor, "_frozen", False)
+    # a CGF held in eval mode by freeze() follows the policy's mode again
+    extractor.train()
+    assert extractor.training
+
+
+# --------------------------------------------------------------------------
+# 6. Smoke trains through the new function (slow; the real gate)
+# --------------------------------------------------------------------------
+
+@pytest.mark.slow
+def test_smoke_train_odd_even_gaussian_saves_everything_the_eval_needs(tmp_path):
+    from set_transformer.rl.run_records import read_run_status
+    log_dir = tmp_path / "logs"
+    model_path = tmp_path / "models" / "gaussian_agent.zip"
+    model = train_mod.train(
+        "odd_even", "oe50_short", "gaussian",
+        features_extractor_kwargs=dict(arena_scale=ODD_EVEN_SCALE),
+        num_particles=50, n_envs=1, seed=0, total_timesteps=64, ppo_n_steps=32,
+        batch_size=16, n_epochs=1, device="cpu", eval_freq=32, save_freq=32,
+        n_eval_episodes=1, log_dir=str(log_dir) + "/", model_save_path=str(model_path))
+    assert model.num_timesteps == 64 and model_path.exists()
+    assert (tmp_path / "models" / "vecnormalize.pkl").exists()
+    assert read_run_status(str(model_path))["status"] == "completed"
+    checkpoints = tmp_path / "models" / "checkpoints"
+    assert (checkpoints / "odd_even_gaussian_32_steps.zip").exists()
+    # the VecNormalize snapshot beside every checkpoint (new on Odd-Even, PITFALLS section 7)
+    assert (checkpoints / "odd_even_gaussian_vecnormalize_32_steps.pkl").exists()
+    assert (log_dir / "evaluations.npz").exists()
+    PPO.load(str(model_path), device="cpu")
+
+
+@pytest.mark.slow
+def test_smoke_train_odd_even_st_pretrained_frozen_and_unfreeze(monkeypatch, tmp_path,
+                                                                checkpoints, capsys):
+    """Through main(): reload-after-PPO with verification, the Odd-Even sentinel, the
+    unfreeze step -- the post-construction path a frozen and a finetune arm take."""
+    monkeypatch.setattr(run_records, "git_provenance", lambda: {})
+    monkeypatch.setattr(run_records, "tee_stdout_stderr", lambda path: None)
+    common = ["--variant", "oe50_short", "--total_timesteps", "64", "--n_envs", "1",
+              "--ppo_n_steps", "32", "--batch_size", "16", "--n_epochs", "1", "--device", "cpu",
+              "--eval_freq", "1000000", "--save_freq", "1000000", "--n_eval_episodes", "1",
+              "--output_root", str(tmp_path / "root"),
+              "--pretrained_path", checkpoints["odd_even_st"]]
+    train_mod.main(common + ["--frozen", "--log_dir", str(tmp_path / "frozen" / "logs") + "/",
+                             "--model_save_path", str(tmp_path / "frozen" / "models" / "st_agent.zip")],
+                   domain="odd_even", encoder="st")
+    out = capsys.readouterr().out
+    assert "RE-loaded after PPO construction" in out and "re-frozen" in out
+    assert "Verified: SetTransformerFeaturesExtractor encoder matches" in out
+    assert "ST geometry: num_inds=8 dim_hidden=32 num_post_sab=1 (checkpoint)" in out
+    train_mod.main(common + ["--unfreeze_at", "32", "--encoder_lr_scale", "0.5",
+                             "--log_dir", str(tmp_path / "unfreeze" / "logs") + "/",
+                             "--model_save_path", str(tmp_path / "unfreeze" / "models" / "st_agent.zip")],
+                   domain="odd_even", encoder="st")
+    out = capsys.readouterr().out
+    assert "encoder frozen until step 32, then finetuned" in out
+    assert "encoder UNFROZEN at step" in out
+    assert "encoder learning rate scaled by 0.5" in out
+
+
+@pytest.mark.slow
+def test_smoke_train_ant_tag_cgf_through_main_runs_the_schedules(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(run_records, "git_provenance", lambda: {})
+    monkeypatch.setattr(run_records, "tee_stdout_stderr", lambda path: None)
+    from set_transformer.rl.run_records import read_run_status
+    model_path = tmp_path / "models" / "cgf_agent.zip"
+    train_mod.main(
+        ["--variant", "cdens_terminal", "--total_timesteps", "256", "--n_envs", "1",
+         "--ppo_n_steps", "128", "--batch_size", "64", "--n_epochs", "1", "--num_particles", "32",
+         "--device", "cpu", "--eval_freq", "1000000000", "--save_freq", "128", "--n_eval_episodes", "1",
+         "--num_cgf_features", "8", "--t_init_mode", "spread",
+         "--curriculum", "0:100,0.5:1,1:1", "--reward_schedule", "0:1:0:0,0.5:0:0:50",
+         "--evasion_curriculum", "0:0,0.5:1,1:1", "--target_speed_scale", "0",
+         "--output_root", str(tmp_path / "root"),
+         "--log_dir", str(tmp_path / "logs") + "/", "--model_save_path", str(model_path)],
+        domain="ant_tag", encoder="cgf")
+    out = capsys.readouterr().out
+    assert "[Curriculum] step=0, progress=0.00, vis_radius=100.00" in out
+    assert model_path.exists() and read_run_status(str(model_path))["status"] == "completed"
+    assert (tmp_path / "models" / "checkpoints" / "ant_tag_cgf_128_steps.zip").exists()
+    assert (tmp_path / "models" / "checkpoints" / "ant_tag_cgf_vecnormalize_128_steps.pkl").exists()
+    # the record went to the derived run dir under --output_root, not beside the model
+    assert list((tmp_path / "root").glob("ant_tag/cdens_terminal/rl/cgf/*/run_config.json"))
+    PPO.load(str(model_path), device="cpu")

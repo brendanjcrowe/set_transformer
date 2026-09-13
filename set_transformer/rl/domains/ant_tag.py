@@ -67,7 +67,16 @@ from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize
 
 import pdomains  # noqa: F401 - registers the pdomains-ant-tag-* envs
-from set_transformer.rl.curriculum import Schedule, ScheduleCallback, ScheduleRouter, interpolate
+from set_transformer.rl.curriculum import (
+    Schedule,
+    ScheduleCallback,
+    ScheduleRouter,
+    interpolate,
+    parse_curriculum,
+    parse_reward_schedule,
+)
+from set_transformer.rl.curriculum import parse_reward_schedule as _parse_reward_schedule
+from set_transformer.rl.domains.base import Domain
 from set_transformer.rl.particle_filters.ant_tag import (
     AntTagParticleFilter,
     CounterweightedDenAntTagParticleFilter,
@@ -1049,3 +1058,226 @@ def _make_vec_env_from_fns(env_fns, n_envs: int):
     if n_envs > 1:
         return SubprocVecEnv(env_fns)
     return DummyVecEnv(env_fns)
+
+
+# ---------------------------------------------------------------------------
+# The Domain description (change 4, 2026-09-12): what the shared trainer needs from Ant-Tag
+# ---------------------------------------------------------------------------
+
+
+#: The SCRIPT defaults for the two schedule strings, used when neither the CLI nor the
+#: variant supplies one (precedence: CLI > variant > these). The strings every Ant-Tag
+#: training script has carried since the registry was written.
+DEFAULT_CURRICULUM = "0:100,0.3:100,0.7:3,1:3"
+DEFAULT_REWARD_SCHEDULE = "0:1:0:0,0.3:1:0:0,0.7:0:0:50,1:0:0:50"
+
+
+def _resolve_reward_shaping(parser, args) -> None:
+    """Reconcile --distance_coeff/--entropy_coeff with --reward_schedule, in place.
+
+    CurriculumCallback writes the schedule's interpolated coefficients into
+    every env on every step, so a coefficient flag given alongside a schedule
+    used to govern the first n_envs steps only, while run_config.json recorded
+    it as live. Nobody noticed because the default schedule's first waypoint
+    equals the flag defaults. Two outcomes now:
+
+    * ``--reward_schedule none`` (or empty): the flags (defaults 1.0 / 0.0)
+      become a constant schedule, so they really do hold for the whole run.
+    * a schedule plus an explicit flag: ``parser.error``. The user asked for
+      two things that cannot both happen.
+
+    In both cases ``args.distance_coeff`` / ``args.entropy_coeff`` are set to
+    the values in force at progress 0 and ``args.reward_schedule`` to a
+    parseable string, so ``run_config.json`` records what actually ran.
+    Shared by the Gaussian and ST arms.
+    """
+    explicit = [f"--{name}" for name in ("distance_coeff", "entropy_coeff")
+                if getattr(args, name) is not None]
+    schedule_str = (args.reward_schedule or "").strip()
+    if schedule_str.lower() in ("", "none"):
+        distance = 1.0 if args.distance_coeff is None else float(args.distance_coeff)
+        entropy = 0.0 if args.entropy_coeff is None else float(args.entropy_coeff)
+        args.reward_schedule = f"0:{distance}:{entropy}:0,1:{distance}:{entropy}:0"
+    else:
+        if explicit:
+            parser.error(
+                f"{' and '.join(explicit)} cannot be combined with "
+                "--reward_schedule: the schedule sets the shaping coefficients "
+                "on every step, so the flag would govern the first rollout "
+                "only. Either drop the flag and put the values in the schedule "
+                "(entries are frac:distance:entropy[:tag_bonus]) or pass "
+                "--reward_schedule none to run on constant coefficients."
+            )
+        first = _parse_reward_schedule(schedule_str)[0]
+        distance, entropy = float(first[1]), float(first[2])
+    args.distance_coeff = distance
+    args.entropy_coeff = entropy
+
+
+def make_schedules(curriculum_schedule=None, reward_schedule=None, evasion_schedule=None):
+    """The three Ant-Tag :class:`Schedule` values for one run, from parsed waypoint lists.
+
+    ``None`` for any of them means ANT_TAG_SCHEDULES' default waypoints. Exactly what the
+    :class:`CurriculumCallback` adapter builds from the same three arguments (waypoints sorted
+    by fraction), stated once so the trainer and the adapter cannot drift.
+    """
+    by_name = {s.name: s for s in ANT_TAG_SCHEDULES}
+    picked = []
+    for name, given in (("visibility", curriculum_schedule), ("reward", reward_schedule),
+                        ("evasion", evasion_schedule)):
+        waypoints = list(by_name[name].waypoints) if given is None else list(given)
+        picked.append(replace(by_name[name], waypoints=tuple(sorted(waypoints, key=lambda x: x[0]))))
+    return tuple(picked)
+
+
+def _add_arguments(parser) -> None:
+    """The flags that belong to the Ant-Tag problem (help texts from 4_train_rl_cgf.py)."""
+    parser.add_argument(
+        "--distance_coeff", type=float, default=None,
+        help="Constant PF-mean-distance shaping coefficient (default 1.0). "
+             "Only honoured with --reward_schedule none: the schedule sets "
+             "these coefficients on every step, so combining the two is an "
+             "error rather than a silent override.")
+    parser.add_argument(
+        "--entropy_coeff", type=float, default=None,
+        help="Constant PF belief-entropy shaping coefficient (default 0.0). "
+             "NOT PPO's entropy bonus. Same rule as --distance_coeff.")
+    parser.add_argument(
+        "--curriculum", type=str, default=None,
+        help="Visibility curriculum 'frac:radius,...'. Defaults to the "
+             "variant's own curriculum, else the base schedule "
+             f"'{DEFAULT_CURRICULUM}'.")
+    parser.add_argument(
+        "--reward_schedule", type=str, default=None,
+        help="Defaults to the variant's own recipe (Variant.default_reward_schedule), else "
+             f"'{DEFAULT_REWARD_SCHEDULE}' (PF-entropy 0 throughout). "
+             "Shaping schedule 'frac:distance:entropy[:tag_bonus[:spread_gain]],...' "
+             "(spread_gain pays gain*(spread_{t-1}-spread_t) of the belief's weighted std; "
+             "0 when omitted), interpolated over training progress and applied on every step. "
+             "Pass 'none' to run on the constant --distance_coeff / --entropy_coeff values "
+             "instead; giving both is an error.")
+    parser.add_argument(
+        "--evasion_curriculum", type=str, default=None,
+        help="Optional frac:scale schedule for SmartAntTagEnv.evasion_scale "
+             "(0=dumb-target behavior, 1=full smart evasion). E.g. "
+             "'0:0.2,0.5:1,1:1' ramps evasion strength up over the first "
+             "half of training. Default: the variant's, else constant 1.0 (full strength "
+             "throughout, i.e. no curriculum). No-op on envs without an "
+             "evasion_scale knob (e.g. the base AntTag env).")
+    parser.add_argument(
+        "--mask_target_obs", action="store_true", default=True,
+        help="Zero out obs[-2:] for the agent. Default on.")
+    parser.add_argument("--no_mask_target_obs", dest="mask_target_obs", action="store_false")
+    parser.add_argument(
+        "--target_speed_scale", type=float, default=None,
+        help="SmartAntTagEnv only. How much faster the target moves as it gets "
+             "cornered: step = target_step * (1 + urgency * scale). Omit to use "
+             "the env default (0.0 = constant speed; the target flees more often "
+             "when cornered but never faster). 1.0 restores the old up-to-2x "
+             "behavior. Applied to both the training and eval envs.")
+
+
+def _resolve_arguments(parser, args) -> dict:
+    """Fill the schedule strings (CLI > variant > script default), reconcile the shaping flags,
+    warn about evasion knobs on a non-evading env, and return the env factory's options.
+
+    Same order as the scripts' ``main``: the reward schedule is resolved BEFORE
+    ``_resolve_reward_shaping`` (which reads an empty schedule as "use the constant flags").
+    """
+    args.reward_schedule = resolve_schedule(
+        args.variant, args.reward_schedule, "default_reward_schedule", DEFAULT_REWARD_SCHEDULE)
+    _resolve_reward_shaping(parser, args)
+    args.curriculum = resolve_schedule(
+        args.variant, args.curriculum, "default_curriculum", DEFAULT_CURRICULUM)
+    warn_if_not_evading(args.variant, args.evasion_curriculum, args.target_speed_scale)
+    args.evasion_curriculum = resolve_schedule(
+        args.variant, args.evasion_curriculum, "default_evasion_curriculum", None)
+    curriculum_schedule = parse_curriculum(args.curriculum)
+    return dict(
+        distance_coeff=args.distance_coeff,
+        entropy_coeff=args.entropy_coeff,
+        tag_bonus_coeff=0.0,
+        # The FIRST entry of the string as written, not the smallest fraction: what every
+        # script did (`curriculum_schedule[0][1]`).
+        initial_visibility_radius=curriculum_schedule[0][1] if curriculum_schedule else 100.0,
+        obs_mask_indices=[-2, -1] if args.mask_target_obs else None,
+        target_speed_scale=args.target_speed_scale,
+    )
+
+
+def _schedules(args):
+    return make_schedules(
+        parse_curriculum(args.curriculum),
+        parse_reward_schedule(args.reward_schedule),
+        parse_curriculum(args.evasion_curriculum) if args.evasion_curriculum else None,
+    )
+
+
+def _make_env(variant: str, *, num_particles: int, particle_filter_class: type, seed: int,
+              rank: int, monitor_dir: str | None, training: bool, options: dict):
+    """One worker's env through `make_ant_tag_cgf_env`. The eval env (``training=False``)
+    runs at the env's real visibility radius and without reward shaping, exactly as the
+    scripts built it (``eval_env_kw`` in every ``train_ant_tag_*``)."""
+    env_id = resolve(variant).env_id
+    options = dict(options)
+    if not training:
+        options["initial_visibility_radius"] = get_env_visible_radius(env_id)
+        options["apply_reward_shaping"] = False
+    return make_ant_tag_cgf_env(
+        num_particles=num_particles, rank=rank, seed=seed, monitor_dir=monitor_dir,
+        env_id=env_id, particle_filter_class=particle_filter_class, **options)
+
+
+def _cgf_t_init_max_default(args):
+    """Ant-Tag's rule for a ``--t_init_max`` left unset (4_train_rl_cgf.resolve_cgf_encoder_args):
+    clamp mode keeps None (the extractor's legacy 2.8 ceiling, recorded as null as every old
+    run did); tanh / polar with the ``spread`` init take 0.8 * t_bound; otherwise None."""
+    if args.t_param == "clamp":
+        return None
+    if args.t_init_mode == "spread":
+        return 0.8 * float(args.t_bound)
+    return None
+
+
+def _cgf_t_bound_default(variant: str) -> float:
+    """Ant-Tag's default ``--t_bound`` for tanh / polar: the registry's ``cgf_t_bound``."""
+    bound = cgf_t_bound(variant)
+    print(f"CGF t_bound from the registry: {bound:.3g} "
+          f"(= {CGF_TILT_TARGET} / (tag_radius / arena half-width) "
+          f"for variant {variant!r})")
+    return bound
+
+
+ANT_TAG = Domain(
+    name="ant_tag",
+    particle_dim=2,
+    default_variant="base",
+    variants=VARIANTS,
+    resolve=resolve,
+    episode_cap=episode_cap,
+    run_subdir=run_subdir,
+    add_variant_argument=add_variant_argument,
+    print_variants=print_variants,
+    make_env=_make_env,
+    make_vec_env_from_fns=_make_vec_env_from_fns,
+    make_vec_normalize=_make_vec_normalize,
+    particle_filter=lambda args: resolve(args.variant).particle_filter,
+    add_arguments=_add_arguments,
+    resolve_arguments=_resolve_arguments,
+    schedules=_schedules,
+    run_config_extras=lambda args: {},
+    default_num_particles=lambda variant: 100,
+    default_arena_scale=lambda variant: get_ant_tag_arena_scale(resolve(variant).env_id),
+    default_device="cuda:1",
+    default_total_timesteps=3_000_000,
+    encoder_defaults={
+        # Every CGF default is the LEGACY value (clamp 2.0, K, no norm, linspace init), so a
+        # bare re-run reproduces recorded Ant-Tag runs (change_mds/ant_tag_cgf_port_2026-09-10.md).
+        "cgf": dict(t_param="clamp", t_bound=None, t_init_mode="linspace_all_dims",
+                    feature_norm="none",
+                    t_bound_default=_cgf_t_bound_default,
+                    t_init_max_default=_cgf_t_init_max_default),
+        # The Ant-Tag ST geometry: 32 inducing points, hidden 128, two post-PMA SABs.
+        "st": dict(num_inds=32, dim_hidden=128, num_post_sab=2),
+    },
+)

@@ -330,6 +330,20 @@ class SetTransformerFeaturesExtractor(BaseFeaturesExtractor):
         for param in self.encoder.parameters():
             param.requires_grad_(False)
 
+    def unfreeze(self) -> int:
+        """Undo `freeze()`: clear the flag, put the encoder back in train mode, let gradients
+        reach it again. Returns the number of tensors released (the unfreeze callback prints
+        it). Added for the shared trainer's ``--unfreeze_at`` (change 4, 2026-09-12); the body
+        is what UnfreezeEncoderCallback did inline for the ST arm.
+        """
+        self.st_frozen = False
+        self.encoder.train()
+        released = 0
+        for param in self.encoder.parameters():
+            param.requires_grad_(True)
+            released += 1
+        return released
+
     def encoder_state_dict(self) -> dict:
         """The live encoder tensors, keyed like `reference_state()`."""
         return self.encoder.state_dict()

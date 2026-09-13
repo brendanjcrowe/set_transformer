@@ -234,6 +234,16 @@ class _PooledFeaturesExtractor(BaseFeaturesExtractor):
     def freeze(self) -> None:
         self.freeze_encoder()
 
+    def unfreeze(self) -> int:
+        """Undo `freeze()` (change 4, 2026-09-12). Returns the number of tensors released."""
+        self._frozen = False
+        released = 0
+        for p in self.encoder.parameters():
+            p.requires_grad_(True)
+            released += 1
+        self.encoder.train()
+        return released
+
     def encoder_state_dict(self) -> dict:
         return self.encoder.state_dict()
 

@@ -364,46 +364,10 @@ def train_ant_tag_cgf(
         eval_vec_env.close()
 
 
-def _resolve_reward_shaping(parser, args) -> None:
-    """Reconcile --distance_coeff/--entropy_coeff with --reward_schedule, in place.
-
-    CurriculumCallback writes the schedule's interpolated coefficients into
-    every env on every step, so a coefficient flag given alongside a schedule
-    used to govern the first n_envs steps only, while run_config.json recorded
-    it as live. Nobody noticed because the default schedule's first waypoint
-    equals the flag defaults. Two outcomes now:
-
-    * ``--reward_schedule none`` (or empty): the flags (defaults 1.0 / 0.0)
-      become a constant schedule, so they really do hold for the whole run.
-    * a schedule plus an explicit flag: ``parser.error``. The user asked for
-      two things that cannot both happen.
-
-    In both cases ``args.distance_coeff`` / ``args.entropy_coeff`` are set to
-    the values in force at progress 0 and ``args.reward_schedule`` to a
-    parseable string, so ``run_config.json`` records what actually ran.
-    Shared by the Gaussian and ST arms.
-    """
-    explicit = [f"--{name}" for name in ("distance_coeff", "entropy_coeff")
-                if getattr(args, name) is not None]
-    schedule_str = (args.reward_schedule or "").strip()
-    if schedule_str.lower() in ("", "none"):
-        distance = 1.0 if args.distance_coeff is None else float(args.distance_coeff)
-        entropy = 0.0 if args.entropy_coeff is None else float(args.entropy_coeff)
-        args.reward_schedule = f"0:{distance}:{entropy}:0,1:{distance}:{entropy}:0"
-    else:
-        if explicit:
-            parser.error(
-                f"{' and '.join(explicit)} cannot be combined with "
-                "--reward_schedule: the schedule sets the shaping coefficients "
-                "on every step, so the flag would govern the first rollout "
-                "only. Either drop the flag and put the values in the schedule "
-                "(entries are frac:distance:entropy[:tag_bonus]) or pass "
-                "--reward_schedule none to run on constant coefficients."
-            )
-        first = _parse_reward_schedule(schedule_str)[0]
-        distance, entropy = float(first[1]), float(first[2])
-    args.distance_coeff = distance
-    args.entropy_coeff = entropy
+# _resolve_reward_shaping lives in the domain module since 2026-09-12 (change 4: the shared
+# trainer's Ant-Tag flag resolution needs it); imported back under the name the other arms
+# and the tests read off this module.
+from set_transformer.rl.domains.ant_tag import _resolve_reward_shaping  # noqa: E402
 
 
 #: Ant-Tag particles are the target's (x, y): 2-D by construction of every

@@ -195,6 +195,25 @@ def write_run_status(model_save_path: str, *, completed: bool, error,
     return status
 
 
+def resume_vecnormalize_path(resume_from: str) -> str:
+    """The VecNormalize snapshot saved alongside a checkpoint zip.
+
+    ``CheckpointCallback(save_vecnormalize=True)`` writes ``<prefix>_<N>_steps.zip`` next to
+    ``<prefix>_vecnormalize_<N>_steps.pkl``; the final ``<encoder>_agent.zip`` sits next to
+    ``vecnormalize.pkl``. Moved from ``experiments/ant_tag/4_train_rl_st.py``
+    (``_default_resume_vecnormalize``, 2026-09-08) for the shared trainer (change 4,
+    2026-09-12); generalised from ``st_agent.zip`` to any ``<encoder>_agent.zip``.
+    """
+    d, base = os.path.split(resume_from)
+    m = re.fullmatch(r"(.+)_(\d+)_steps\.zip", base)
+    if m:
+        return os.path.join(d, f"{m.group(1)}_vecnormalize_{m.group(2)}_steps.pkl")
+    if re.fullmatch(r"[A-Za-z0-9]+_agent\.zip", base):
+        return os.path.join(d, "vecnormalize.pkl")
+    raise ValueError(f"cannot derive the VecNormalize snapshot for {resume_from}; "
+                     "pass --resume_vecnormalize")
+
+
 def read_run_status(model_path: str) -> dict | None:
     """run_status.json for a saved agent, or None if the run predates it.
 
