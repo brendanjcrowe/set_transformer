@@ -1396,7 +1396,7 @@ def _drive_main(ant_tag, monkeypatch, tmp_path, module_name, argv):
     from set_transformer.rl import train as train_mod
     module = ant_tag[module_name]
     captured = {}
-    monkeypatch.setattr(run_records, "default_run_dir", lambda *a, **k: str(tmp_path / "run"))
+    monkeypatch.setattr(run_records, "output_root", lambda *a, **k: tmp_path / "runs")
     monkeypatch.setattr(run_records, "git_provenance", lambda: {})
     monkeypatch.setattr(run_records, "tee_stdout_stderr", lambda path: None)
     monkeypatch.setattr(run_records, "write_run_config",

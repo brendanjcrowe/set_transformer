@@ -35,4 +35,22 @@ def get(name: str | Domain) -> Domain:
     return getattr(importlib.import_module(module_name), attribute)
 
 
-__all__ = ["DOMAIN_NAMES", "Domain", "get"]
+def domain_of_variant(variant: str, env_id: str | None = None) -> Domain:
+    """The Domain whose registry has ``variant`` (and, when given, registers it under
+    ``env_id``). For scripts that start from a dataset rather than ``--domain``: the
+    collector records the variant key and env id in the dataset's metadata."""
+    matches = []
+    for name in DOMAIN_NAMES:
+        domain = get(name)
+        if variant in domain.variants and (
+                env_id is None or domain.resolve(variant).env_id == env_id):
+            matches.append(domain)
+    if len(matches) != 1:
+        raise ValueError(
+            f"variant {variant!r}" + (f" with env id {env_id!r}" if env_id else "")
+            + f" belongs to {len(matches)} domains (" + ", ".join(d.name for d in matches)
+            + f"); the choices are {sorted(DOMAIN_NAMES)}")
+    return matches[0]
+
+
+__all__ = ["DOMAIN_NAMES", "Domain", "domain_of_variant", "get"]

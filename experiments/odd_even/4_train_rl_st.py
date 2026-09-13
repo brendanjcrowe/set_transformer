@@ -40,9 +40,7 @@ Since 2026-09-12 (change 4.4 of the harness centralisation) this file is an
 ENTRY POINT: the flags, their resolution (geometry: CLI > checkpoint config >
 the small 16 / 64 / 2 default), the run record and the PPO loop are the shared
 ones in ``set_transformer.rl.train`` (domain ``odd_even``, encoder ``st``).
-Every flag this script ever took still works; the run directory is still the
-cwd-relative ``runs/odd_even_st_<variant>/...`` (``legacy_layout=True``) until
-change 5. The names below are re-exported for the tests and diagnostics that
+Every flag this script ever took still works; the run directory is ``<output root>/odd_even/<variant>/rl/st/<timestamp>_seed<seed>[_<run_tag>]/`` (change 5.2; the root is ``--output_root`` > ``$RL_BMDP_RUNS`` > the parent repo's ``runs/``, never the current directory). The names below are re-exported for the tests and diagnostics that
 read them off this module.
 
 Usage:
@@ -105,7 +103,7 @@ def assert_encoder_matches_checkpoint(model, path: str) -> None:
 
 def main(argv=None):
     """The shared command line with this arm's domain and encoder fixed."""
-    return _shared_main(argv, domain="odd_even", encoder="st", legacy_layout=True,
+    return _shared_main(argv, domain="odd_even", encoder="st",
                         prog="4_train_rl_st.py")
 
 

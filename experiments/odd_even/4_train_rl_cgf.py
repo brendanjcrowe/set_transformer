@@ -60,9 +60,7 @@ Since 2026-09-12 (change 4.4 of the harness centralisation) this file is an
 ENTRY POINT: the flags, their resolution, the run record and the PPO loop are
 the shared ones in ``set_transformer.rl.train`` (domain ``odd_even``, encoder
 ``cgf``), and the belief env lives in ``set_transformer.rl.domains.odd_even``.
-Every flag this script ever took still works; the run directory is still the
-cwd-relative ``runs/odd_even_cgf_<variant>/...`` (``legacy_layout=True``)
-until change 5. The three CGF flag helpers at the bottom
+Every flag this script ever took still works; the run directory is ``<output root>/odd_even/<variant>/rl/cgf/<timestamp>_seed<seed>[_<run_tag>]/`` (change 5.2; the root is ``--output_root`` > ``$RL_BMDP_RUNS`` > the parent repo's ``runs/``, never the current directory). The three CGF flag helpers at the bottom
 (``add_readout_and_pretrained_arguments``, ``resolve_cgf_geometry``,
 ``resolve_t_init_max``) are kept verbatim for ``3_pretrain_st_belief.py``,
 which imports them so a checkpoint's geometry is spelled the same way on the
@@ -117,7 +115,7 @@ from set_transformer.rl.train import main as _shared_main  # noqa: E402
 
 def main(argv=None):
     """The shared command line with this arm's domain and encoder fixed."""
-    return _shared_main(argv, domain="odd_even", encoder="cgf", legacy_layout=True,
+    return _shared_main(argv, domain="odd_even", encoder="cgf",
                         prog="4_train_rl_cgf.py")
 
 

@@ -234,7 +234,7 @@ def _drive_ant_tag_main(mods, monkeypatch, tmp_path, module_name, argv, encoder=
     from set_transformer.rl import train as train_mod
     module = mods[module_name]
     captured = {}
-    monkeypatch.setattr(run_records, "default_run_dir", lambda *a, **k: str(tmp_path / "run"))
+    monkeypatch.setattr(run_records, "output_root", lambda *a, **k: tmp_path / "runs")
     monkeypatch.setattr(run_records, "git_provenance", lambda: {})
     monkeypatch.setattr(run_records, "tee_stdout_stderr", lambda path: None)
     monkeypatch.setattr(run_records, "write_run_config",
@@ -273,7 +273,7 @@ def _drive_switched_odd_even_main(oe, monkeypatch, tmp_path, arm, argv):
     from set_transformer.rl import run_records
     from set_transformer.rl import train as train_mod
     captured = {}
-    monkeypatch.setattr(run_records, "default_run_dir", lambda *a, **k: str(tmp_path / "run"))
+    monkeypatch.setattr(run_records, "output_root", lambda *a, **k: tmp_path / "runs")
     monkeypatch.setattr(run_records, "git_provenance", lambda: {})
     monkeypatch.setattr(run_records, "tee_stdout_stderr", lambda path: None)
     monkeypatch.setattr(run_records, "write_run_config",
@@ -739,7 +739,7 @@ class _ZeroPolicy:
 
 
 def test_ant_tag_eval_defaults_the_cap_to_the_registry_and_reseeds_after_load(
-        ant_tag, monkeypatch, capsys):
+        ant_tag, monkeypatch, capsys, tmp_path):
     """The eval reads the episode cap off the variant's gym registration (a wrong cap
     counts timeouts as tags), builds the env at the real radius without shaping, and
     re-applies --seed to the vec env AFTER PPO.load (which would otherwise restore the
@@ -757,7 +757,8 @@ def test_ant_tag_eval_defaults_the_cap_to_the_registry_and_reseeds_after_load(
     monkeypatch.setattr(shared, "PPO", SimpleNamespace(load=lambda path, env=None: _ZeroPolicy()))
     monkeypatch.setattr(sys, "argv", ["eval_true_reward_cgf.py", "--variant", "smart",
                                       "--model_path", "/nonexistent/agent.zip",
-                                      "--num_particles", "16", "--n_episodes", "1", "--seed", "123"])
+                                      "--num_particles", "16", "--n_episodes", "1", "--seed", "123",
+                                      "--output_root", str(tmp_path / "runs")])
     module.main()
     out = capsys.readouterr().out
     assert "episode cap: 400" in out
@@ -765,6 +766,12 @@ def test_ant_tag_eval_defaults_the_cap_to_the_registry_and_reseeds_after_load(
     assert seeds == [123]
     assert "Success rate  : " in out
     assert "Median length : " in out    # the wave drivers grep this line
+    # Change 5.2: the report is also a JSON record under <root>/ant_tag/smart/eval/.
+    [summary] = list((tmp_path / "runs" / "ant_tag" / "smart" / "eval").glob("*_agent_seed123_1ep.json"))
+    record = json.loads(summary.read_text())
+    assert record["variant"] == "smart" and record["seed"] == 123 and record["episode_cap"] == 400
+    assert record["report"]["n_episodes"] == 1 and "success_rate" in record["report"]
+    assert record["references"] is None and record["run_status"] is None
 
 
 def test_ant_tag_eval_refuses_a_particle_count_that_contradicts_the_checkpoint(
@@ -816,6 +823,33 @@ def _walk(env):
     while cur is not None:
         yield cur
         cur = getattr(cur, "env", None)
+
+
+def test_bare_entry_points_write_under_the_root_layout(ant_tag, odd_even, monkeypatch, tmp_path):
+    """Change 5.2: a bare `4_train_rl_<enc>.py --variant v` writes to
+    <root>/<domain>/<variant>/rl/<encoder>/<timestamp>_seed<seed>[_<tag>]/, root = --output_root
+    > $RL_BMDP_RUNS > the parent repo's runs/, never the current directory. --run_subdir is a
+    raw override of the <variant>/rl/<encoder> part."""
+    from set_transformer.rl import run_records
+    monkeypatch.setattr(run_records, "git_provenance", lambda: {})
+    monkeypatch.setattr(run_records, "tee_stdout_stderr", lambda path: None)
+    monkeypatch.chdir(tmp_path / "elsewhere") if (tmp_path / "elsewhere").mkdir() is None else None
+    root = tmp_path / "root"
+    ant_tag["4_train_rl_cgf"].main(["--variant", "smart", "--seed", "3", "--run_tag", "t",
+                                    "--output_root", str(root), "--dry_run"])
+    [record] = list(root.glob("ant_tag/smart/rl/cgf/*_seed3_t/run_config.json"))
+    config = json.loads(record.read_text())
+    assert config["run_directory"] == str(record.parent) and config["output_root"] == str(root.resolve())
+    odd_even["4_train_rl_gaussian"].main(["--variant", "oe50_short", "--output_root", str(root), "--dry_run"])
+    assert list(root.glob("odd_even/oe50_short/rl/gaussian/*_seed0/run_config.json"))
+    ant_tag["4_train_rl_pool"].main(encoder="kmoments", argv=["--variant", "smart", "--run_subdir", "sweep",
+                                                              "--output_root", str(root), "--dry_run"])
+    assert list(root.glob("ant_tag/sweep/*_seed0/run_config.json"))
+    # The environment variable is the second choice, and nothing landed in the cwd.
+    monkeypatch.setenv(run_records.OUTPUT_ROOT_ENV, str(tmp_path / "env_root"))
+    ant_tag["4_train_rl_st"].main(["--variant", "smart", "--dry_run"])
+    assert list((tmp_path / "env_root").glob("ant_tag/smart/rl/st/*_seed0/run_config.json"))
+    assert not (tmp_path / "elsewhere" / "runs").exists()
 
 
 # ==========================================================================

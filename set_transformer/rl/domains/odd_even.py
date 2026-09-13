@@ -1168,8 +1168,9 @@ def _eval_references(args, variant) -> dict:
     return references
 
 
-def _eval_report(episodes, references, args, variant, cap) -> None:
-    """The policy's block and its placement on the oracle-to-naive span."""
+def _eval_report(episodes, references, args, variant, cap) -> dict:
+    """The policy's block and its placement on the oracle-to-naive span; returns the policy
+    metrics plus the placement for the JSON summary (the references travel separately)."""
     # The env's own reward is what is being measured, so the prediction is read back from
     # info rather than recomputed from the action -- the env owns the 0-indexed to 1-indexed
     # shift.
@@ -1188,12 +1189,17 @@ def _eval_report(episodes, references, args, variant, cap) -> None:
     span = oracle_steady - prev_steady
     print(f"\nSteady-state placement: oracle {oracle_steady:.3f}, "
           f"policy {policy_steady:.3f}, prev-obs {prev_steady:.3f}")
+    fraction = None
     if np.isfinite(span) and span != 0:
         # Where the policy sits on the oracle-to-naive span. This is the quantity the encoder
         # comparison is about: 0 means the belief bought nothing, 1 means the encoding
         # delivered the whole value of accumulating evidence.
-        print(f"  fraction of the oracle-to-naive span recovered: "
-              f"{(policy_steady - prev_steady) / span:.3f}")
+        fraction = (policy_steady - prev_steady) / span
+        print(f"  fraction of the oracle-to-naive span recovered: {fraction:.3f}")
+    return dict(metrics, collapse_step=args.collapse_step,
+                steady_state_placement=dict(oracle=oracle_steady, policy=policy_steady,
+                                            prev_obs=prev_steady,
+                                            fraction_of_span_recovered=fraction))
 
 
 # ---------------------------------------------------------------------------

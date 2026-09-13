@@ -41,14 +41,19 @@ What the script does, in order, and why each step is load-bearing (PITFALLS.md s
    by default the success-rate report below (an episode is a success when its final ``info``
    says ``is_success``, else when it ended strictly before the cap -- a terminal hazard can
    end an episode early without a tag, which is why ``info`` is consulted first); Odd-Even
-   supplies its transient / steady split against the Bayes oracle instead.
+   supplies its transient / steady split against the Bayes oracle instead. The report's
+   numbers, with what was evaluated and how, are also written as one JSON file under
+   ``<output root>/<domain>/<variant>/eval/`` (change 5.2; ``--summary_path`` /
+   ``--no_summary``), so a result is a record and not a line to grep out of a log.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
+from datetime import datetime
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -123,8 +128,9 @@ def rollout(model, env, n_episodes: int, cap: int, *, seed: int, deterministic: 
     return episodes
 
 
-def report_success_rate(episodes: Sequence[Episode], references, args, variant, cap: int) -> None:
-    """The success-rate report every Ant-Tag eval printed (the wave drivers grep its lines)."""
+def report_success_rate(episodes: Sequence[Episode], references, args, variant, cap: int) -> dict:
+    """The success-rate report every Ant-Tag eval printed (the wave drivers grep its lines).
+    Returns the same numbers as a dict for the JSON summary."""
     rewards = np.array([episode.total_reward for episode in episodes])
     lengths = np.array([episode.length for episode in episodes])
     successes = np.array([episode.is_success(cap) for episode in episodes], dtype=bool)
@@ -138,10 +144,21 @@ def report_success_rate(episodes: Sequence[Episode], references, args, variant, 
     print(f"Mean length   : {lengths.mean():.1f} ± {lengths.std():.1f}")
     print(f"Median length : {np.median(lengths):.1f}")
     print(f"Best episode  : reward={rewards[best_idx]:.2f}, length={lengths[best_idx]}")
+    summary = dict(
+        n_episodes=n, successes=tagged, success_rate=tagged / n,
+        mean_reward=float(rewards.mean()), std_reward=float(rewards.std()),
+        mean_length=float(lengths.mean()), std_length=float(lengths.std()),
+        median_length=float(np.median(lengths)),
+        best_episode=dict(reward=float(rewards[best_idx]), length=int(lengths[best_idx])),
+        episodes=[dict(reward=float(r), length=int(l), success=bool(ok))
+                  for r, l, ok in zip(rewards, lengths, successes)])
     if tagged > 0:
         tag_lens = lengths[successes]
         print(f"When tagged   : mean_len={tag_lens.mean():.1f}, "
               f"median_len={np.median(tag_lens):.1f}")
+        summary["tagged_mean_length"] = float(tag_lens.mean())
+        summary["tagged_median_length"] = float(np.median(tag_lens))
+    return summary
 
 
 def build_parser(domain: Domain, *, prog: str | None = None,
@@ -179,8 +196,58 @@ def build_parser(domain: Domain, *, prog: str | None = None,
              "every timeout as a success.")
     parser.add_argument("--deterministic", action="store_true", default=True)
     parser.add_argument("--stochastic", dest="deterministic", action="store_false")
+    parser.add_argument(
+        "--summary_path", type=str, default=None,
+        help="Where the JSON summary of this evaluation goes. Default: <output root>/"
+             f"{domain.name}/<variant>/eval/<timestamp>_<run dir name>_<model stem>_seed<seed>"
+             "_<n>ep.json (change 5.2); --no_summary writes none.")
+    parser.add_argument("--no_summary", action="store_true", help="Print only; write no JSON.")
+    parser.add_argument(
+        "--output_root", type=str, default=None,
+        help="Root of the shared run layout for the summary: $RL_BMDP_RUNS, else <parent "
+             "repo>/runs when this checkout is a submodule, else <checkout>/runs.")
     evaluation.add_arguments(parser)
     return parser
+
+
+def summary_path(domain: Domain, args) -> Path:
+    """`<root>/<domain>/<variant>/eval/<timestamp>_<run dir name>_<model stem>_seed<seed>_<n>ep.json`.
+    The run-dir name is the checkpoint's grandparent (``<run>/models/<zip>``) or parent
+    (``<run>/models/best_model/<zip>``), so a summary names the run it measured."""
+    if args.summary_path:
+        return Path(args.summary_path)
+    model = Path(args.model_path).resolve()
+    run_name = next((p.name for p in model.parents
+                     if p.name not in ("models", "best_model", "checkpoints")), model.parent.name)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    name = f"{stamp}_{run_name}_{model.stem}_seed{args.seed}_{args.n_episodes}ep.json"
+    return run_records.eval_dir(domain.name, args.variant, root=args.output_root) / name
+
+
+def write_summary(path: Path, domain: Domain, args, variant, cap: int, report: dict,
+                  references) -> None:
+    """The evaluation as a record: what was evaluated, how, and the report's numbers."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = dict(
+        domain=domain.name, variant=args.variant, env_id=variant.env_id,
+        particle_filter=variant.particle_filter.__name__, episode_cap=cap,
+        model_path=str(Path(args.model_path).resolve()),
+        vecnormalize_path=(str(Path(args.vecnormalize_path).resolve())
+                           if args.vecnormalize_path else None),
+        num_particles=args.num_particles, seed=args.seed, n_episodes=args.n_episodes,
+        deterministic=args.deterministic, timestamp=datetime.now().isoformat(timespec="seconds"),
+        run_status=run_records.read_run_status(args.model_path),
+        report=report, references=references)
+    path.write_text(json.dumps(payload, indent=1, default=_jsonable))
+    print(f"Summary written to {path}")
+
+
+def _jsonable(value):
+    if isinstance(value, (np.floating, np.integer)):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    return str(value)
 
 
 def _select_domain(argv: Sequence[str]) -> str | None:
@@ -288,7 +355,9 @@ def main(argv: Sequence[str] | None = None, *, domain: Domain | str | None = Non
                        deterministic=args.deterministic,
                        reseed_per_episode=evaluation.reseed_per_episode)
     report = evaluation.report or report_success_rate
-    report(episodes, references, args, variant, cap)
+    summary = report(episodes, references, args, variant, cap)
+    if not args.no_summary:
+        write_summary(summary_path(domain, args), domain, args, variant, cap, summary, references)
     env.close()
     return episodes
 

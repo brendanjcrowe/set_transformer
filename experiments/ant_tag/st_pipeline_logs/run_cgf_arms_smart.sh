@@ -33,8 +33,15 @@ DEVICES=${DEVICES:-"cuda:0 cuda:1"}
 EVAL_EPISODES=${EVAL_EPISODES:-100}
 EVAL_SEEDS=${EVAL_SEEDS:-"42"}
 EXTRA=${EXTRA:-}
+# Output root (change 5.2 of the harness centralisation, 2026-09-12): every RL run,
+# pretraining run and eval summary lands under $ROOT/ant_tag/<variant>/{rl,pretrain,eval}/;
+# the wave logs go to $ROOT/ant_tag/waves/. Default <parent repo>/runs; the RL_BMDP_RUNS
+# environment variable overrides it (set it for a smoke run).
+ROOT=$(PYTHONPATH=../.. python3 -m set_transformer.rl.run_records)
+RL_RUNS=$ROOT/ant_tag/${VARIANT}/rl/cgf
+LOGS=$ROOT/ant_tag/waves; mkdir -p "$LOGS"
 STAMP=$(date +%Y%m%d_%H%M%S)
-LOG=st_pipeline_logs/${VARIANT}_cgf_arms_${STAMP}.log
+LOG=$LOGS/${VARIANT}_cgf_arms_${STAMP}.log
 exec > >(tee -a "$LOG") 2>&1
 echo "[$(date)] launching CGF arms on $VARIANT (devices: $DEVICES; extra: '$EXTRA'); log $LOG"
 
@@ -70,7 +77,7 @@ for arm in $ARMS; do
     echo "[$(date)] start $arm seed $seed on $device"
     # shellcheck disable=SC2086
     python3 4_train_rl_cgf.py $COMMON ${ARM_FLAGS[$arm]} --seed "$seed" --device "$device" \
-      --run_tag "$arm" > "st_pipeline_logs/${VARIANT}_${arm}_seed${seed}_${STAMP}.launch.log" 2>&1 &
+      --run_tag "$arm" > "$LOGS/${VARIANT}_${arm}_seed${seed}_${STAMP}.launch.log" 2>&1 &
     pids+=($!)
     d=$(( (d + 1) % ${#DEVICE_LIST[@]} ))
     sleep 3
@@ -84,7 +91,7 @@ for pid in "${pids[@]}"; do
 done
 echo "[$(date)] all runs finished (fail=$fail); evaluating FINAL agents, $EVAL_EPISODES episodes x eval seeds [$EVAL_SEEDS]"
 
-RUNS_DIR=runs/ant_tag_cgf_${VARIANT}
+RUNS_DIR=$RL_RUNS
 printf '\n%-24s %-5s %-9s %-10s %s\n' arm seed evalseed success run_dir
 for arm in $ARMS; do
   for seed in $SEEDS; do

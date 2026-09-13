@@ -62,6 +62,50 @@ from set_transformer.models.cgf_arm_ae import (  # noqa: E402
 )
 
 
+def _dataset_metadata(data_path: str) -> dict:
+    """The collector's metadata JSON stored in an .npz dataset ({} for a legacy .npy or a
+    dataset without one). Lazy: reads one small member of the archive."""
+    if not data_path.endswith(".npz"):
+        return {}
+    with np.load(data_path, allow_pickle=True) as archive:
+        if "metadata" not in archive.files:
+            return {}
+        try:
+            return json.loads(str(archive["metadata"]))
+        except (TypeError, ValueError):
+            return {}
+
+
+def _resolve_base_dir(parser, args) -> Path:
+    """--base_dir as given, else <output root>/<domain>/<variant>/pretrain/ with the domain
+    and variant from the flags or the dataset's metadata (PITFALLS.md: the collector records
+    `variant` and `env_id`, so the output lands beside the RL runs of the same env)."""
+    if args.base_dir:
+        return Path(args.base_dir)
+    from set_transformer.rl import domains as _domains
+    from set_transformer.rl import run_records
+    metadata = _dataset_metadata(args.data_path)
+    variant = args.variant or metadata.get("variant")
+    if not variant:
+        parser.error("--base_dir not given and the dataset records no variant: pass "
+                     "--variant <registry key> (and --domain) or --base_dir <folder>")
+    if args.domain:
+        domain = _domains.get(args.domain)
+        if variant not in domain.variants:
+            parser.error(f"--variant {variant!r} is not a {args.domain} variant "
+                         f"({domain.variant_names()})")
+    else:
+        try:
+            domain = _domains.domain_of_variant(
+                variant, None if args.variant else metadata.get("env_id"))
+        except ValueError as exc:
+            parser.error(f"{exc}; pass --domain")
+    experiment_dir = run_records.pretrain_dir(domain.name, variant, args.experiment_name,
+                                              root=args.output_root)
+    print(f"Output root layout: {experiment_dir}/ (domain {domain.name}, variant {variant})")
+    return experiment_dir.parent
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Train Set Transformer on ant-tag PF dataset (pipeline step 3)"
@@ -175,9 +219,28 @@ def main() -> None:
     parser.add_argument("--save_freq", type=int, default=5000)
     parser.add_argument("--keep_last_n_checkpoints", type=int, default=5)
 
-    # Experiment management
+    # Experiment management. Output goes to <base_dir>/<experiment_name>/<loss>_<timestamp>/.
+    # Since change 5.2 of the harness centralisation --base_dir defaults to the shared root
+    # layout, <output root>/<domain>/<variant>/pretrain/ (run_records.pretrain_dir), with the
+    # domain and variant read from the dataset's metadata (the collector records both) or
+    # given explicitly. An explicit --base_dir still wins, so the old cwd-relative
+    # `experiments/` is one flag away.
     parser.add_argument("--experiment_name", type=str, default="ant_tag_st")
-    parser.add_argument("--base_dir", type=str, default="experiments")
+    parser.add_argument(
+        "--base_dir", type=str, default=None,
+        help="Default: <output root>/<domain>/<variant>/pretrain/ -- see --output_root.")
+    parser.add_argument(
+        "--domain", type=str, default=None,
+        help="Owner of the dataset's variant (ant_tag / odd_even). Default: looked up from the "
+             "variant recorded in the dataset's metadata. Only used to place the output.")
+    parser.add_argument(
+        "--variant", type=str, default=None,
+        help="Registry key of the env the dataset was collected on. Default: the dataset's "
+             "metadata. Only used to place the output.")
+    parser.add_argument(
+        "--output_root", type=str, default=None,
+        help="Root of the shared run layout when --base_dir is not given: $RL_BMDP_RUNS, else "
+             "<parent repo>/runs when this checkout is a submodule, else <checkout>/runs.")
 
     # Data loading
     parser.add_argument("--num_workers", type=int, default=0)
@@ -233,6 +296,7 @@ def main() -> None:
     )
 
     args = parser.parse_args()
+    base_dir = _resolve_base_dir(parser, args)
     if args.encoder == "cgf":
         if args.t_param in ("tanh", "polar") and (args.t_bound is None or args.t_bound <= 0):
             parser.error(f"--t_param {args.t_param} needs --t_bound > 0 (see its help "
@@ -414,7 +478,7 @@ def main() -> None:
     experiment_config = ExperimentConfig(
         experiment_name=args.experiment_name,
         run_name=run_name,
-        base_dir=Path(args.base_dir),
+        base_dir=base_dir,
     )
 
     print(f"Experiment: {experiment_config.run_dir}")

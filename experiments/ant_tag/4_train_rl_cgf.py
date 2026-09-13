@@ -15,8 +15,7 @@ and the PPO loop are the shared ones in ``set_transformer.rl.train`` (domain
 ``ant_tag``, encoder ``cgf``). Every flag this script ever took still works
 and every default is still the LEGACY value (clamp 2.0, K, no norm, linspace
 init), so a bare re-run of a recorded command trains what it recorded. The
-run directory is still the cwd-relative ``runs/ant_tag_cgf[_<variant>]/...``
-(``legacy_layout=True``) until change 5. Equivalently:
+the run directory is ``<output root>/ant_tag/<variant>/rl/cgf/<timestamp>_seed<seed>[_<run_tag>]/`` (change 5.2; the root is ``--output_root`` > ``$RL_BMDP_RUNS`` > the parent repo's ``runs/``, never the current directory). Equivalently:
 
     python3 -m set_transformer.rl.train --domain ant_tag --encoder cgf --variant smart ...
 
@@ -110,7 +109,7 @@ def _default_run_dir(seed: int, run_subdir: str = "ant_tag_cgf",
 def main(argv=None):
     """The shared command line with this arm's domain and encoder fixed. --variant
     selects env id, particle filter and run subdir together, so the three cannot disagree."""
-    return _shared_main(argv, domain="ant_tag", encoder="cgf", legacy_layout=True,
+    return _shared_main(argv, domain="ant_tag", encoder="cgf",
                         prog="4_train_rl_cgf.py")
 
 

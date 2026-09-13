@@ -10,8 +10,14 @@
 #   tmux new-session -d -s st_v15_gain "bash st_pipeline_logs/run_gain_arms_smart_mid_slow_v15.sh 2>&1 | tee st_pipeline_logs/smart_mid_slow_v15_gain_pipeline.log"
 set -euo pipefail
 cd /home/himanshu/Documents/Research/rl_for_beliefmdps/set_transformer/experiments/ant_tag
-LOGS=st_pipeline_logs
 VARIANT=smart_mid_slow_v15
+# Output root (change 5.2 of the harness centralisation, 2026-09-12): every RL run,
+# pretraining run and eval summary lands under $ROOT/ant_tag/<variant>/{rl,pretrain,eval}/;
+# the wave logs go to $ROOT/ant_tag/waves/. Default <parent repo>/runs; the RL_BMDP_RUNS
+# environment variable overrides it (set it for a smoke run).
+ROOT=$(PYTHONPATH=../.. python3 -m set_transformer.rl.run_records)
+RL_RUNS=$ROOT/ant_tag/${VARIANT}/rl/st
+LOGS=$ROOT/ant_tag/waves; mkdir -p "$LOGS"
 WAIT_FOR="${WAIT_FOR:-$LOGS/smart_mid_slow_v15_pipeline.log}"   # start once this log says PIPELINE DONE
 GAIN="${GAIN:-10}"
 SEEDS="${SEEDS:-0 1 2}"
@@ -84,7 +90,7 @@ for seed in $SEEDS; do
 done
 wait
 stamp "all gain runs done; evaluating (true sparse reward, 5 seeds x 100 episodes, best + final)"
-for r in $(find runs/ant_tag_st_${VARIANT} -maxdepth 1 -mindepth 1 -type d -newermt "@$before" -name "*_gain${GAIN}_*"); do
+for r in $(find "$RL_RUNS" -maxdepth 1 -mindepth 1 -type d -newermt "@$before" -name "*_gain${GAIN}_*"); do
   eval_run "$r" > "$LOGS/${VARIANT}_eval_$(basename "$r").log" 2>&1 &
 done
 wait

@@ -23,9 +23,7 @@ extractor says so.
 Since 2026-09-12 (change 4.5 of the harness centralisation) this file is an ENTRY POINT:
 the flags, their resolution, the run record and the PPO loop are the shared ones in
 ``set_transformer.rl.train`` (domain ``ant_tag``, encoder ``deepset`` / ``pointnet`` /
-``kmoments``). Every flag these scripts ever took still works; the run directory is still
-the cwd-relative ``runs/ant_tag_<encoder>[_<variant>]/<timestamp>_seed<seed>[_<run_tag>]/``
-(``legacy_layout=True``) until change 5, model ``<encoder>_agent.zip``. Equivalently:
+``kmoments``). Every flag these scripts ever took still works; the run directory is ``<output root>/ant_tag/<variant>/rl/<encoder>/<timestamp>_seed<seed>[_<run_tag>]/`` (change 5.2; the root is ``--output_root`` > ``$RL_BMDP_RUNS`` > the parent repo's ``runs/``, never the current directory), model ``<encoder>_agent.zip``. Equivalently:
 
     python3 -m set_transformer.rl.train --domain ant_tag --encoder deepset --variant smart ...
 
@@ -98,7 +96,7 @@ def main(encoder: str = "deepset", argv=None):
     selects env id, particle filter and run subdir together, so the three cannot disagree."""
     if encoder not in ENCODERS:
         raise ValueError(f"encoder must be one of {sorted(ENCODERS)}, got {encoder!r}")
-    return _shared_main(argv, domain="ant_tag", encoder=encoder, legacy_layout=True,
+    return _shared_main(argv, domain="ant_tag", encoder=encoder,
                         prog=f"4_train_rl_{encoder}.py")
 
 

@@ -20,8 +20,15 @@
 # Record:  domain_mds/smart_ant_tag.md, 2026-09-11 entry.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+# Output root (change 5.2 of the harness centralisation, 2026-09-12): every RL run,
+# pretraining run and eval summary lands under $ROOT/ant_tag/<variant>/{rl,pretrain,eval}/;
+# the wave logs go to $ROOT/ant_tag/waves/. Default <parent repo>/runs; the RL_BMDP_RUNS
+# environment variable overrides it (set it for a smoke run).
+ROOT=$(PYTHONPATH=../.. python3 -m set_transformer.rl.run_records)
+PRETRAIN=$ROOT/ant_tag/smart/pretrain       # 3_train_st.py's default --base_dir for the smart dataset
+LOGS=$ROOT/ant_tag/waves; mkdir -p "$LOGS"
 STAMP=$(date +%Y%m%d_%H%M%S)
-LOG=st_pipeline_logs/smart_cgf_recon_${STAMP}.log
+LOG=$LOGS/smart_cgf_recon_${STAMP}.log
 exec > >(tee -a "$LOG") 2>&1
 echo "[$(date)] CGF reconstruction pretraining + RL arms on smart; log $LOG"
 
@@ -32,7 +39,7 @@ EXP_NAME=${EXP_NAME:-smart_cgf_recon}
 GEOM="--t_param polar --t_bound 9.0 --t_init_mode spread --feature_mode K_grad --feature_norm none --num_cgf_features 64"
 
 # START_AT=2 (or EXPORT=<path>) skips the pretraining and reuses the newest export
-# under experiments/$EXP_NAME -- used 2026-09-11 after the first launch died between
+# under $PRETRAIN/$EXP_NAME -- used 2026-09-11 after the first launch died between
 # the two steps (the export pickled a dataclass; fixed in models/cgf_arm_ae.py).
 START_AT=${START_AT:-1}
 EXPORT=${EXPORT:-}
@@ -43,13 +50,13 @@ CUDA_VISIBLE_DEVICES=$PRETRAIN_GPU WANDB_MODE=offline python3 3_train_st.py \
   --loss_type sinkhorn --sinkhorn_blur 0.01 --sinkhorn_scaling 0.5 \
   --num_epochs "$PRETRAIN_EPOCHS" --batch_size 32 --learning_rate 1e-3 \
   --num_encodings 8 --dim_hidden 128 --seed 0 --eval_freq 1000 --save_freq 5000 \
-  --experiment_name "$EXP_NAME" 2>&1 | tee "st_pipeline_logs/smart_cgf_recon_pretrain_${STAMP}.log"
+  --experiment_name "$EXP_NAME" 2>&1 | tee "$LOGS/smart_cgf_recon_pretrain_${STAMP}.log"
 else
 echo "[$(date)] step 1 skipped (START_AT=$START_AT, EXPORT=${EXPORT:-<newest>})"
 fi
 
-[ -n "$EXPORT" ] || EXPORT=$(ls -t experiments/${EXP_NAME}/*/checkpoints/checkpoint_best_cgf_arm.pt | head -1)
-[ -f "$EXPORT" ] || { echo "no export found under experiments/${EXP_NAME}"; exit 2; }
+[ -n "$EXPORT" ] || EXPORT=$(ls -t "$PRETRAIN/${EXP_NAME}"/*/checkpoints/checkpoint_best_cgf_arm.pt | head -1)
+[ -f "$EXPORT" ] || { echo "no export found under $PRETRAIN/${EXP_NAME}"; exit 2; }
 EXPORT=$(readlink -f "$EXPORT")
 echo "[$(date)] step 1 done; export: $EXPORT"
 # the scripts bootstrap sys.path themselves; this snippet must too (the editable

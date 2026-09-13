@@ -166,7 +166,8 @@ def _run(script, extra, tmp_path, tag):
     env = {**os.environ, "WANDB_MODE": "offline", "CUDA_VISIBLE_DEVICES": ""}
     out_dir = tmp_path / tag
     cmd = [sys.executable, str(ANT_TAG / script), *TINY, *extra,
-           "--log_dir", str(out_dir / "logs") + "/", "--model_save_path", str(out_dir / "models" / "agent.zip")]
+           "--log_dir", str(out_dir / "logs") + "/", "--model_save_path", str(out_dir / "models" / "agent.zip"),
+           "--output_root", str(tmp_path / "runs")]
     proc = subprocess.run(cmd, cwd=tmp_path, env=env, capture_output=True, text=True, timeout=1500)
     text = proc.stdout + proc.stderr
     assert proc.returncode == 0, text[-4000:]
@@ -182,8 +183,9 @@ def _run(script, extra, tmp_path, tag):
 def test_arm_script_trains_and_saves(tmp_path, encoder, marker):
     text = _run(f"4_train_rl_{encoder}.py", [], tmp_path, encoder)
     assert marker in text
-    cfg = next(Path(tmp_path).glob("runs/ant_tag_*_smart/*/run_config.json"), None)
-    assert cfg is not None and f"ant_tag_{encoder}_smart" in str(cfg)
+    # The run record goes to the root layout (change 5.2): <root>/ant_tag/smart/rl/<encoder>/.
+    cfg = next(Path(tmp_path).glob(f"runs/ant_tag/smart/rl/{encoder}/*/run_config.json"), None)
+    assert cfg is not None, list(Path(tmp_path).rglob("run_config.json"))
 
 
 def test_deepset_script_loads_a_pretrained_ae_and_verifies_the_reload(tmp_path):

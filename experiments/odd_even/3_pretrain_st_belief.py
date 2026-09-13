@@ -366,7 +366,14 @@ def main(argv=None):
     parser.add_argument("--probe_splits", type=int, default=5)
     parser.add_argument("--skip_probe", action="store_true")
     parser.add_argument("--out_dir", default=None,
-                        help="Default experiments/<encoder>_belief_pretrain/")
+                        help="Default: <output root>/odd_even/<variant>/pretrain/"
+                             "<encoder>_belief_pretrain/ (change 5.2; see --output_root). "
+                             "Before 2026-09-12: experiments/<encoder>_belief_pretrain/ beside "
+                             "this script, where the recorded checkpoints still are.")
+    parser.add_argument("--output_root", default=None,
+                        help="Root of the shared run layout when --out_dir is not given: "
+                             "$RL_BMDP_RUNS, else <parent repo>/runs when this checkout is a "
+                             "submodule, else <checkout>/runs.")
     parser.add_argument("--run_tag", default="")
     parser.add_argument("--init_from", default=None,
                         help="ST only: warm-start the encoder from a 3_train_st.py (Sinkhorn) "
@@ -379,7 +386,9 @@ def main(argv=None):
         variants.print_variants()
         return None
     if args.out_dir is None:
-        args.out_dir = str(_HERE / "experiments" / f"{args.encoder}_belief_pretrain")
+        from set_transformer.rl import run_records
+        args.out_dir = str(run_records.pretrain_dir(
+            "odd_even", args.variant, f"{args.encoder}_belief_pretrain", root=args.output_root))
     if args.encoder == "cgf":
         if args.pretrained_cgf_model_path or args.cgf_frozen:
             parser.error("--pretrained_cgf_model_path / --cgf_frozen are RL-side flags; "

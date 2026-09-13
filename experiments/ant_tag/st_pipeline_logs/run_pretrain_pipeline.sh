@@ -3,7 +3,13 @@
 # Sequential by necessity (each stage consumes the previous stage's output).
 set -euo pipefail
 cd /home/himanshu/Documents/Research/rl_for_beliefmdps/set_transformer/experiments/ant_tag
-LOGS=st_pipeline_logs
+# Output root (change 5.2 of the harness centralisation, 2026-09-12): every RL run,
+# pretraining run and eval summary lands under $ROOT/ant_tag/<variant>/{rl,pretrain,eval}/;
+# the wave logs go to $ROOT/ant_tag/waves/. Default <parent repo>/runs; the RL_BMDP_RUNS
+# environment variable overrides it (set it for a smoke run).
+ROOT=$(PYTHONPATH=../.. python3 -m set_transformer.rl.run_records)
+PRETRAIN=$ROOT/ant_tag/cdens_terminal/pretrain
+LOGS=$ROOT/ant_tag/waves; mkdir -p "$LOGS"
 
 # ---- Stage 1: collect ------------------------------------------------------
 # visibility_radius_min 1.0 matches the RL curriculum's FINAL radius, so the
@@ -38,7 +44,7 @@ WANDB_MODE=offline CUDA_VISIBLE_DEVICES=1 python3 3_train_st.py \
   --experiment_name st_pretrain_cdens_terminal 2>&1 | tee "$LOGS/pretrain.log"
 
 # Newest run dir for this experiment; prefer best, fall back to latest.
-RUN_DIR=$(ls -td experiments/st_pretrain_cdens_terminal/*/ | head -1)
+RUN_DIR=$(ls -td "$PRETRAIN"/st_pretrain_cdens_terminal/*/ | head -1)
 CKPT="${RUN_DIR}checkpoints/checkpoint_best.pt"
 [ -f "$CKPT" ] || CKPT="${RUN_DIR}checkpoints/checkpoint_latest.pt"
 [ -f "$CKPT" ] || { echo "FATAL: no checkpoint under ${RUN_DIR}checkpoints/"; exit 1; }

@@ -10,8 +10,14 @@
 #   tmux new-session -d -s st_v15_lr1x "bash st_pipeline_logs/run_lr1x_arms_smart_mid_slow_v15.sh 2>&1 | tee st_pipeline_logs/smart_mid_slow_v15_lr1x_pipeline.log"
 set -euo pipefail
 cd /home/himanshu/Documents/Research/rl_for_beliefmdps/set_transformer/experiments/ant_tag
-LOGS=st_pipeline_logs
 VARIANT=smart_mid_slow_v15
+# Output root (change 5.2 of the harness centralisation, 2026-09-12): every RL run,
+# pretraining run and eval summary lands under $ROOT/ant_tag/<variant>/{rl,pretrain,eval}/;
+# the wave logs go to $ROOT/ant_tag/waves/. Default <parent repo>/runs; the RL_BMDP_RUNS
+# environment variable overrides it (set it for a smoke run).
+ROOT=$(PYTHONPATH=../.. python3 -m set_transformer.rl.run_records)
+RL_RUNS=$ROOT/ant_tag/${VARIANT}/rl/st
+LOGS=$ROOT/ant_tag/waves; mkdir -p "$LOGS"
 CK_PLAIN=/home/himanshu/Documents/Research/rl_for_beliefmdps/set_transformer/experiments/ant_tag/experiments/st_pretrain_smart_mid_slow_v15_plain/sinkhorn_2026-09-07_15-53-26/checkpoints/checkpoint_best.pt
 CK_ALIGN=/home/himanshu/Documents/Research/rl_for_beliefmdps/set_transformer/experiments/ant_tag/experiments/st_pretrain_smart_mid_slow_v15_align/sinkhorn_2026-09-07_16-40-10/checkpoints/checkpoint_best.pt
 export WANDB_MODE=offline
@@ -69,7 +75,7 @@ for seed in 0 1 2; do
 done
 wait
 stamp "all 6 runs done; evaluating (true sparse reward, 5 seeds x 100 episodes, best + final)"
-for r in $(find runs/ant_tag_st_${VARIANT} -maxdepth 1 -mindepth 1 -type d -newermt "@$before" -name "*_lr1x"); do
+for r in $(find "$RL_RUNS" -maxdepth 1 -mindepth 1 -type d -newermt "@$before" -name "*_lr1x"); do
   eval_run "$r" > "$LOGS/${VARIANT}_eval_$(basename "$r").log" 2>&1 &
 done
 wait

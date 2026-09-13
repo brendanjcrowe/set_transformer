@@ -64,6 +64,9 @@ def run_side(label: str, checkout: Path, domain: str, script: str, flags: list[s
     cmd = [sys.executable, str(script_path), *flags,
            "--log_dir", str(log_dir) + "/", "--model_save_path", str(model_path)]
     env = dict(os.environ)
+    # The root layout (change 5.2) writes the record under $RL_BMDP_RUNS; the legacy scripts
+    # wrote it under cwd/runs. Pointing the root at cwd/runs puts both under one glob.
+    env["RL_BMDP_RUNS"] = str(cwd / "runs")
     env.setdefault("WANDB_MODE", "offline")
     env.setdefault("OMP_NUM_THREADS", "1")
     env.setdefault("MKL_NUM_THREADS", "1")
@@ -72,7 +75,7 @@ def run_side(label: str, checkout: Path, domain: str, script: str, flags: list[s
         proc = subprocess.run(cmd, cwd=str(cwd), env=env, stdout=handle, stderr=subprocess.STDOUT)
     if proc.returncode != 0:
         raise RuntimeError(f"[{label}] {script} exited {proc.returncode}; see {side / 'stdout.txt'}")
-    records = sorted(cwd.glob("runs/*/*/run_config.json"))
+    records = sorted(cwd.glob("runs/**/run_config.json"))
     return dict(label=label, log_dir=log_dir, model_path=model_path,
                 record=records[0] if records else None)
 
@@ -233,7 +236,7 @@ def main(argv=None) -> int:
     for label, checkout in (("a", args.a.resolve()), ("b", args.b.resolve())):
         model = args.out / label / "models" / f"{stem}_agent.zip"
         if args.reuse and model.exists():
-            records = sorted((args.out / label / "cwd").glob("runs/*/*/run_config.json"))
+            records = sorted((args.out / label / "cwd").glob("runs/**/run_config.json"))
             sides.append(dict(label=label, log_dir=args.out / label / "logs", model_path=model,
                               record=records[0] if records else None))
             print(f"[{label}] reusing {model}")

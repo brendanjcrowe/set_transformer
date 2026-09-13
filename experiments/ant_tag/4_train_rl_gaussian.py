@@ -18,9 +18,7 @@ parameters -- it is a fixed, closed-form summary of the particle set.
 Since 2026-09-12 (change 4.5 of the harness centralisation) this file is an
 ENTRY POINT: the flags, their resolution, the run record and the PPO loop are
 the shared ones in ``set_transformer.rl.train`` (domain ``ant_tag``, encoder
-``gaussian``). Every flag this script ever took still works; the run
-directory is still the cwd-relative ``runs/ant_tag_gaussian[_<variant>]/...``
-(``legacy_layout=True``) until change 5. Equivalently:
+``gaussian``). Every flag this script ever took still works; the run directory is ``<output root>/ant_tag/<variant>/rl/gaussian/<timestamp>_seed<seed>[_<run_tag>]/`` (change 5.2; the root is ``--output_root`` > ``$RL_BMDP_RUNS`` > the parent repo's ``runs/``, never the current directory). Equivalently:
 
     python3 -m set_transformer.rl.train --domain ant_tag --encoder gaussian --variant smart ...
 
@@ -89,7 +87,7 @@ def _default_run_dir(seed: int, run_subdir: str = "ant_tag_gaussian",
 def main(argv=None):
     """The shared command line with this arm's domain and encoder fixed. --variant
     selects env id, particle filter and run subdir together, so the three cannot disagree."""
-    return _shared_main(argv, domain="ant_tag", encoder="gaussian", legacy_layout=True,
+    return _shared_main(argv, domain="ant_tag", encoder="gaussian",
                         prog="4_train_rl_gaussian.py")
 
 

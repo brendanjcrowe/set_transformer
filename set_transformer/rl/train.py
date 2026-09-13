@@ -31,9 +31,9 @@ the VecNormalize statistics and ``run_status.json``.
 Run directory (plan section 2b): when ``log_dir`` / ``model_save_path`` are not given, the
 root-level layout ``<output root>/<domain>/<variant>/rl/<encoder>/<timestamp>_seed<seed>[_<tag>]``
 (``run_records.output_root`` resolves the root: ``--output_root`` > ``$RL_BMDP_RUNS`` > the
-parent repo's ``runs/`` > this checkout's ``runs/``; never the current directory). The
-numbered scripts pass ``legacy_layout=True`` and keep today's cwd-relative
-``runs/<run_subdir>/...`` until change 5.
+parent repo's ``runs/`` > this checkout's ``runs/``; never the current directory). Since
+change 5.2 the numbered scripts use it too; ``legacy_layout=True`` (the cwd-relative
+``runs/<run_subdir>/...`` of the pre-2026-09-12 scripts) remains available to callers.
 """
 
 from __future__ import annotations

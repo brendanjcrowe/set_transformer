@@ -23,10 +23,7 @@ of the reward.
 Since 2026-09-12 (change 4.3 of the harness centralisation) this file is an
 ENTRY POINT ONLY: the flags, their resolution, the run record and the PPO loop
 are the shared ones in ``set_transformer.rl.train`` (domain ``odd_even``,
-encoder ``gaussian``). Every flag this script ever took still works; the run
-directory is still the cwd-relative ``runs/odd_even_gaussian_<variant>/...``
-(``legacy_layout=True``) until change 5 moves every run under the root-level
-``runs/`` folder. Equivalently:
+encoder ``gaussian``). Every flag this script ever took still works; the run directory is ``<output root>/odd_even/<variant>/rl/gaussian/<timestamp>_seed<seed>[_<run_tag>]/`` (change 5.2; the root is ``--output_root`` > ``$RL_BMDP_RUNS`` > the parent repo's ``runs/``, never the current directory). Equivalently:
 
     python3 -m set_transformer.rl.train --domain odd_even --encoder gaussian --variant oe50 ...
 
@@ -53,7 +50,7 @@ from set_transformer.rl.train import main as _shared_main  # noqa: E402
 
 def main(argv=None):
     """The shared command line with this arm's domain and encoder fixed."""
-    return _shared_main(argv, domain="odd_even", encoder="gaussian", legacy_layout=True,
+    return _shared_main(argv, domain="odd_even", encoder="gaussian",
                         prog="4_train_rl_gaussian.py")
 
 

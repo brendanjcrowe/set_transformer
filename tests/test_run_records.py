@@ -167,3 +167,26 @@ def test_run_dir_shape_is_variant_first_and_keeps_todays_leaf(tmp_path):
     # Without an explicit root it goes under output_root(), never the cwd.
     default = rr.run_dir("ant_tag", "smart", "cgf", 0, timestamp="t")
     assert default.is_absolute() and default.parts[-5:-1] == ("ant_tag", "smart", "rl", "cgf")
+
+
+def test_pretrain_and_eval_dirs_sit_beside_the_rl_runs_of_the_variant(tmp_path):
+    """Change 5.2: pretraining output and eval summaries share the variant's folder with
+    the RL runs, so everything about one env is in one place."""
+    assert rr.pretrain_dir("ant_tag", "smart_hard", "st_pretrain_smart_hard_plain", root=tmp_path) == (
+        tmp_path / "ant_tag" / "smart_hard" / "pretrain" / "st_pretrain_smart_hard_plain")
+    assert rr.eval_dir("odd_even", "oe50_short", root=tmp_path) == (
+        tmp_path / "odd_even" / "oe50_short" / "eval")
+    # Without an explicit root both go under output_root(), never the cwd.
+    assert rr.pretrain_dir("ant_tag", "smart", "x").is_absolute()
+    assert rr.eval_dir("ant_tag", "smart").parts[-3:] == ("ant_tag", "smart", "eval")
+
+
+def test_domain_of_variant_finds_the_owner_or_refuses():
+    from set_transformer.rl import domains
+    assert domains.domain_of_variant("smart").name == "ant_tag"
+    assert domains.domain_of_variant("oe50_short").name == "odd_even"
+    assert domains.domain_of_variant("smart", "pdomains-ant-tag-smart-v0").name == "ant_tag"
+    with pytest.raises(ValueError, match="belongs to 0 domains"):
+        domains.domain_of_variant("smart", "pdomains-odd-even-50-v0")
+    with pytest.raises(ValueError, match="belongs to 0 domains"):
+        domains.domain_of_variant("no_such_variant")

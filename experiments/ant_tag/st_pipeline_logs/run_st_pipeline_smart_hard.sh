@@ -13,11 +13,18 @@
 # Every PPO/env flag is the cdens_terminal / smart_hard CGF recipe (RECIPE
 # picks the reward schedule; arm A / arm B in domain_mds/smart_hard_ant_tag.md).
 #
-# Launched in tmux:  tmux new-session -d -s st_smart_hard "bash <this> 2>&1 | tee st_pipeline_logs/smart_hard_pipeline.log"
+# Launched in tmux:  tmux new-session -d -s st_smart_hard "bash <this> 2>&1 | tee <ROOT>/ant_tag/waves/smart_hard_pipeline.log"
 set -euo pipefail
 cd /home/himanshu/Documents/Research/rl_for_beliefmdps/set_transformer/experiments/ant_tag
-LOGS=st_pipeline_logs
 VARIANT="${VARIANT:-smart_hard}"    # registry key; env id, filter, cap and curriculum come from variants.py
+# Output root (change 5.2 of the harness centralisation, 2026-09-12): every RL run,
+# pretraining run and eval summary lands under $ROOT/ant_tag/<variant>/{rl,pretrain,eval}/;
+# the wave logs go to $ROOT/ant_tag/waves/. Default <parent repo>/runs; the RL_BMDP_RUNS
+# environment variable overrides it (set it for a smoke run).
+ROOT=$(PYTHONPATH=../.. python3 -m set_transformer.rl.run_records)
+RL_RUNS=$ROOT/ant_tag/${VARIANT}/rl/st        # 4_train_rl_st.py's run folders for this variant
+PRETRAIN=$ROOT/ant_tag/${VARIANT}/pretrain    # 3_train_st.py's experiment folders (its --base_dir default)
+LOGS=$ROOT/ant_tag/waves; mkdir -p "$LOGS"
 # Every size below is overridable from the environment so the whole script can
 # be exercised in miniature (SUFFIX=_SMOKE N_TRAJ=8 ... ) before the real run.
 SUFFIX="${SUFFIX:-}"                  # appended to dataset / experiment / run names
@@ -114,7 +121,7 @@ ST_COMMON=(
   --num_epochs "$PRETRAIN_EPOCHS" --batch_size 32 --learning_rate 1e-3
   --max_samples "$EMD_ROWS" --seed 0 --eval_freq "$ST_EVAL_FREQ"
 )
-have_best() { compgen -G "experiments/$1/*/checkpoints/checkpoint_best.pt" > /dev/null; }
+have_best() { compgen -G "$PRETRAIN/$1/*/checkpoints/checkpoint_best.pt" > /dev/null; }
 stamp "STAGE 2: EMD matrix (cuda:0) and plain pretraining (cuda:1) in parallel"
 if [[ -f "$EMD" ]]; then
   stamp "  $EMD exists, skipping"
@@ -153,8 +160,8 @@ else
     2>&1 | grep -vE "it/s\]?$" | tee "$LOGS/${VARIANT}_pretrain_align.log"
 fi
 
-latest_best() {  # newest experiment dir under experiments/<name>/ -> its checkpoint_best.pt
-  local d; d=$(ls -td "experiments/$1"/*/ | head -1)
+latest_best() {  # newest experiment dir under $PRETRAIN/<name>/ -> its checkpoint_best.pt
+  local d; d=$(ls -td "$PRETRAIN/$1"/*/ | head -1)
   local ck="${d}checkpoints/checkpoint_best.pt"
   [[ -f "$ck" ]] || { echo "missing $ck" >&2; exit 1; }
   realpath "$ck"
@@ -240,7 +247,7 @@ for wave in $WAVES; do
   stamp "  wave seeds=[$wave_seeds] done"
   stamp "  evaluating wave seeds=[$wave_seeds] (true sparse reward, 5 seeds x 100 episodes)"
   for seed in $wave_seeds; do
-    for r in $(find runs/ant_tag_st_${VARIANT} -maxdepth 1 -mindepth 1 -type d -newermt "@$before" -name "*_seed${seed}_*${SUFFIX}"); do
+    for r in $(find "$RL_RUNS" -maxdepth 1 -mindepth 1 -type d -newermt "@$before" -name "*_seed${seed}_*${SUFFIX}"); do
       eval_run "$r" > "$LOGS/${VARIANT}_eval_$(basename "$r").log" 2>&1 &
     done
   done

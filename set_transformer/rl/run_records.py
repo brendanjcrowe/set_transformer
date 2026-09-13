@@ -308,3 +308,23 @@ def run_dir(domain: str, variant: str, encoder: str, seed: int, run_tag: "str | 
     """
     root = output_root() if root is None else Path(root)
     return Path(root) / domain / variant / kind / encoder / run_leaf(seed, run_tag, timestamp)
+
+
+def pretrain_dir(domain: str, variant: str, experiment_name: str, *,
+                 root: "str | os.PathLike | None" = None) -> Path:
+    """`<root>/<domain>/<variant>/pretrain/<experiment_name>`: where the pretraining scripts
+    (`3_train_st.py`, `3_pretrain_st_belief.py`) put their run folders since change 5.2.
+    The run folder inside keeps each script's own naming."""
+    root = output_root() if root is None else Path(root)
+    return Path(root) / domain / variant / "pretrain" / experiment_name
+
+
+def eval_dir(domain: str, variant: str, *, root: "str | os.PathLike | None" = None) -> Path:
+    """`<root>/<domain>/<variant>/eval`: the evaluation script's JSON summaries."""
+    root = output_root() if root is None else Path(root)
+    return Path(root) / domain / variant / "eval"
+
+
+if __name__ == "__main__":
+    # The wave drivers (bash) ask where runs go:  ROOT=$(python3 -m set_transformer.rl.run_records)
+    print(output_root())

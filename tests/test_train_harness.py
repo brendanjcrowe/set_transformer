@@ -146,11 +146,12 @@ def checkpoints(tmp_path_factory):
     return out
 
 
-def _drive_shared(monkeypatch, tmp_path, domain, encoder, argv, *, legacy_layout=True):
+def _drive_shared(monkeypatch, tmp_path, domain, encoder, argv, *, legacy_layout=False):
     """The shared command line with --dry_run: the run record it writes, and the training
-    call it would have made (captured by replacing train())."""
+    call it would have made (captured by replacing train()). The run record lands under a
+    temporary output root."""
     captured = {}
-    monkeypatch.setattr(run_records, "default_run_dir", lambda *a, **k: str(tmp_path / "new_run"))
+    monkeypatch.setattr(run_records, "output_root", lambda *a, **k: tmp_path / "runs")
     monkeypatch.setattr(run_records, "git_provenance", lambda: {})
     monkeypatch.setattr(run_records, "tee_stdout_stderr", lambda path: None)
     monkeypatch.setattr(run_records, "write_run_config",

@@ -22,9 +22,17 @@
 #   tmux new-session -d -s st_v15_fork "bash st_pipeline_logs/run_fork3M_arms_smart_mid_slow_v15.sh 2>&1 | tee st_pipeline_logs/smart_mid_slow_v15_fork3M_pipeline.log"
 set -euo pipefail
 cd /home/himanshu/Documents/Research/rl_for_beliefmdps/set_transformer/experiments/ant_tag
-LOGS=st_pipeline_logs
 VARIANT=smart_mid_slow_v15
-RUNS=runs/ant_tag_st_${VARIANT}
+# Output root (change 5.2 of the harness centralisation, 2026-09-12): every RL run,
+# pretraining run and eval summary lands under $ROOT/ant_tag/<variant>/{rl,pretrain,eval}/;
+# the wave logs go to $ROOT/ant_tag/waves/. Default <parent repo>/runs; the RL_BMDP_RUNS
+# environment variable overrides it (set it for a smoke run).
+ROOT=$(PYTHONPATH=../.. python3 -m set_transformer.rl.run_records)
+RL_RUNS=$ROOT/ant_tag/${VARIANT}/rl/st        # where the forks launched here land
+LOGS=$ROOT/ant_tag/waves; mkdir -p "$LOGS"
+# The SOURCE runs (the 2026-09-07 main wave whose 3M checkpoints are forked) predate the
+# root layout and stay in the old cwd-relative folder.
+SOURCE_RUNS=runs/ant_tag_st_${VARIANT}
 FORK_STEP="${FORK_STEP:-3000000}"
 SEEDS="${SEEDS:-0 1 2}"
 ARMS="${ARMS:-none_e2e plain_finetune}"          # main-wave run tags to fork from
@@ -54,7 +62,7 @@ RL_COMMON=(
 
 source_ckpt() {  # source_ckpt <seed> <arm>  -> the main-wave run's checkpoint zip at FORK_STEP
   local matches
-  matches=$(ls -d ${RUNS}/*_seed$1_entropy_flat_$2 2>/dev/null)
+  matches=$(ls -d ${SOURCE_RUNS}/*_seed$1_entropy_flat_$2 2>/dev/null)
   [[ $(echo "$matches" | wc -l) == 1 && -n "$matches" ]] || { echo "expected exactly one source run for seed $1 arm $2, got: $matches" >&2; exit 1; }
   echo "$matches/models/checkpoints/ant_tag_st_${FORK_STEP}_steps.zip"
 }
@@ -106,7 +114,7 @@ wait
 stamp "all fork runs done; evaluating (true sparse reward, 5 seeds x 100 episodes, best + final)"
 launched=()
 for sched in $SCHEDULES; do for seed in $SEEDS; do for arm in $ARMS; do
-  for r in $(find $RUNS -maxdepth 1 -mindepth 1 -type d -newermt "@$before" -name "*_seed${seed}_entropy_flat_fork3M_${sched}_${arm}${TAG_SUFFIX:-}"); do
+  for r in $(find "$RL_RUNS" -maxdepth 1 -mindepth 1 -type d -newermt "@$before" -name "*_seed${seed}_entropy_flat_fork3M_${sched}_${arm}${TAG_SUFFIX:-}"); do
     launched+=("$r"); eval_run "$r" > "$LOGS/${VARIANT}_eval_$(basename "$r").log" 2>&1 &
   done
 done; done; done
