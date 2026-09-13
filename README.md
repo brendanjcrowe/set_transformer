@@ -39,16 +39,27 @@ set_transformer/
 │   ├── data/                         # POMDPDataset + raw_to_numpy
 │   ├── training/                     # config, trainer, main entry point
 │   └── rl/                           # OPTIONAL — needs the [rl] extra
+│       ├── train.py                  #   the ONE RL trainer (PPO/SAC over a Domain x Encoder pair)
+│       ├── eval_true_reward.py       #   the ONE evaluation script (+ JSON summary)
+│       ├── domains/                  #   one module per problem: registry, env factory,
+│       │   ├── base.py               #     curriculum schedules, flags, eval protocol -> Domain record
+│       │   ├── ant_tag.py            #     ANT_TAG
+│       │   └── odd_even.py           #     ODD_EVEN
+│       ├── encoders.py               #   Encoder table: cgf, st, gaussian, deepset, pointnet, kmoments
+│       ├── curriculum.py             #   generic schedules (interpolate -> apply to env)
+│       ├── run_records.py            #   output root / run dirs / run_config.json / run_status.json
+│       ├── pretrained_encoder.py     #   reload-after-PPO + verification
+│       ├── encoder_finetune.py       #   encoder LR scaling / unfreeze
 │       ├── particle_filters/         #   per-domain PF implementations
 │       ├── wrappers/                 #   gym observation wrappers
 │       ├── feature_extractors/       #   SB3 BaseFeaturesExtractor adapters
-│       └── evaluate.py
+│       └── benchmark/                #   Brendan's encoder benchmark (separate harness)
 │
-├── experiments/                      # per-domain pipeline scripts
+├── experiments/                      # per-domain pipeline scripts (entry points of rl/)
 │   ├── ant_tag/                      #   numbered to match the 4-step pipeline
 │   └── odd_even/
 │
-└── tests/                            # pytest suite for the core library
+└── tests/                            # pytest suite (core library, rl/, experiment scripts)
 ```
 
 ## Set Transformer architecture
@@ -92,72 +103,110 @@ measures) and `chamfer` (unweighted sets only). `emd` is the eval metric and
 `hausdorff` is broken upstream in geomloss. `--align_lambda` adds the latent
 metric-alignment term (see `2b_precompute_emd.py`).
 
-`set_transformer/training/main.py` is RETIRED (2026-09-06): on a weighted
+`set_transformer/training/main.py` was retired on 2026-09-06 (on a weighted
 dataset it scored the reconstruction against the weighted measure while
 feeding the encoder bare coordinates, and it took the set geometry from CLI
-defaults. Its banner has the details.
+defaults) and deleted on 2026-09-12; git history before commit `b6d020b` has it.
 
 ## RL pipeline (per domain)
 
-Each domain in `experiments/<domain>/` follows the same 4-step pipeline:
+Each domain in `experiments/<domain>/` follows the same numbered pipeline:
 
-1. **(MuJoCo only) Locomotion warm-start** — train a baseline policy that
-   can actually move toward goals so the data-collection rollouts cover
-   the state space.
-2. **Particle-filter dataset collection** — roll out a mix of random and
-   goal-directed policies, snapshot PF particle sets at each step.
-3. **Set Transformer pretraining** — train `PFSetTransformer` to reconstruct
-   the collected particle sets; the encoder bottleneck is the belief
-   feature.
-4. **RL training with the pretrained ST** — PPO / SAC over an augmented
-   observation `[base_obs ‖ st_features]`. ST weights can be either frozen
-   (`*_frozen.py`) or fine-tuned end-to-end (`*_finetune.py`).
+1. **(MuJoCo only) Locomotion warm-start** — `1_train_locomotion.py`: a baseline policy
+   that can move toward goals, so the data-collection rollouts cover the state space.
+2. **Particle-filter dataset collection** — `2_collect_pf_dataset.py --variant <v>`: roll
+   out the SAME belief env the RL scripts use, snapshot particles AND PF weights to an
+   `.npz` with metadata (env id, filter, variant, coordinate frame, git provenance).
+3. **Encoder pretraining** — `3_train_st.py` (weighted Sinkhorn reconstruction, ST or the
+   CGF block; env-generic, see above) or, on Odd-Even, `3_pretrain_st_belief.py`
+   (supervised on exact posteriors).
+4. **RL** — `4_train_rl_<encoder>.py --variant <v>`: PPO with the encoder inside the SB3
+   policy as a features extractor over the `{"obs", "particles", "weights"}` observation.
+
+**One harness (2026-09-12).** Every `4_train_rl_<encoder>.py` is a short entry point of
+`set_transformer/rl/train.py`, which reads one `Domain` record (`rl/domains/<domain>.py`)
+and one `Encoder` record (`rl/encoders.py`) and runs the same loop for every pair:
+
+```bash
+# any domain x encoder, no script needed
+python3 -m set_transformer.rl.train --domain ant_tag --encoder st --variant smart --seed 0
+python3 -m set_transformer.rl.train --list_encoders
+python3 -m set_transformer.rl.train --domain odd_even --encoder cgf --list_variants
+
+# start modes (every arm's historical flag spelling still works too)
+python3 -m set_transformer.rl.train --domain ant_tag --encoder st --variant smart      # end to end
+    --pretrained_path <ckpt> --frozen                                                  # frozen encoder
+    --pretrained_path <ckpt> --encoder_lr_scale 0.1 --unfreeze_at 1000000              # finetune
+```
+
+Runs go to `<root>/runs/<domain>/<variant>/rl/<encoder>/<timestamp>_seed<seed>[_<tag>]/`
+(`models/<encoder>_agent.zip`, `models/vecnormalize.pkl`, `run_config.json`,
+`run_status.json`, `logs/`); pretraining to `<variant>/pretrain/<experiment_name>/`, eval
+summaries to `<variant>/eval/`. The root is `--output_root` > `$RL_BMDP_RUNS` > the parent
+repo's `runs/` when this checkout is a git submodule, else this checkout's `runs/`; never the
+current directory (`rl/run_records.py`).
+
+Evaluation is one script as well:
+
+```bash
+python3 -m set_transformer.rl.eval_true_reward --domain ant_tag --variant smart \
+    --model_path <run>/models/st_agent.zip --vecnormalize_path <run>/models/vecnormalize.pkl \
+    --n_episodes 100 --seed 7
+```
+
+`experiments/<domain>/eval_scripts/eval_true_reward_*.py` are its entry points (they import
+the arm's training script first, so SB3 can unpickle the extractor class a recorded zip
+names). The env is the domain's eval env, the cap comes from the gym registration, the
+particle count off the checkpoint, `--seed` is re-applied after `PPO.load`, and the report
+is printed and written as JSON.
+
+Adding a problem: `rl/domains/<name>.py` ending in `<NAME> = Domain(...)` (see `base.py`)
+plus one line in `rl/domains/__init__.py`; nothing in it may refer to another domain.
+Adding an encoder: one `Encoder(...)` entry in `rl/encoders.py`.
 
 ### Ant-Tag
 
 POMDP environment from
 [`pomdp-domains`](https://github.com/brendanjcrowe/pomdp-domains)
-(`pdomains-ant-tag-v0`). 31-D obs (qpos 15 + qvel 14 + target xy 2);
-the agent only sees the target when the ant is within `vis_radius`
-of it.
+(`pdomains-ant-tag-*-v0`; the registry in `rl/domains/ant_tag.py` maps `--variant` to env id,
+particle filter, episode cap and default curricula). 31-D obs (qpos 15 + qvel 14 + target xy
+2); the agent only sees the target when the ant is within the env's visible radius.
 
 ```bash
+cd experiments/ant_tag
 # 1. Pre-train locomotion policy (dense reward wrapper on AntTag)
-python experiments/ant_tag/1_train_locomotion.py --total_timesteps 1000000
-
-# 2. Collect PF dataset (mix of random + pursuit with locomotion policy)
-python experiments/ant_tag/2_collect_pf_dataset.py \
-    --locomotion_policy_path models/ant_locomotion_policy.zip
-
-# 3. Pretrain ST autoencoder
-python experiments/ant_tag/3_train_st.py \
-    --data_path data/ant_tag_pf_dataset.npy
-
-# 4a. RL with frozen ST features
-python experiments/ant_tag/4_train_rl_frozen.py \
-    --pretrained_st_model_path models/ant_tag_st_pretrained.pt
-
-# 4b. RL with fine-tunable ST inside the policy
-python experiments/ant_tag/4_train_rl_finetune.py \
-    --pretrained_st_model_path models/ant_tag_st_pretrained.pt
+python3 1_train_locomotion.py --total_timesteps 1000000
+# 2. Collect PF dataset (mix of random + pursuit with the locomotion policy)
+python3 2_collect_pf_dataset.py --variant smart --locomotion_policy_path models/ant_locomotion_policy.zip
+# 3. Pretrain the ST autoencoder (output under <root>/runs/ant_tag/smart/pretrain/)
+WANDB_MODE=offline python3 3_train_st.py --data_path data/smart_pf_dataset.npz --num_encodings 8 --dim_encoder 8
+# 4. RL: the ST arm, encoder trained under PPO / frozen pretrained / finetuned pretrained
+python3 4_train_rl_st.py --variant smart --seed 0
+python3 4_train_rl_st.py --variant smart --pretrained_st_model_path <ckpt> --st_frozen
+python3 4_train_rl_st.py --variant smart --pretrained_st_model_path <ckpt> --st_encoder_lr_scale 0.1
+# the other arms: 4_train_rl_{cgf,gaussian,deepset,pointnet,kmoments}.py, same flags
+# 5. Evaluate on the true sparse tag reward
+python3 eval_scripts/eval_true_reward_st.py --variant smart --model_path <run>/models/st_agent.zip \
+    --vecnormalize_path <run>/models/vecnormalize.pkl --n_episodes 100
 ```
 
-Eval / rendering helpers in the same directory:
-- `eval_true_reward.py` — eval on the real sparse tag reward, no shaping.
-- `sample_and_render.py` — render trajectory snapshots with PF clouds.
-- `visualize_st_reconstruction.py` — original vs reconstructed particle sets.
-- `sanity_check_fully_observed.py` — fully-observed baseline.
+`st_pipeline_logs/run_st_pipeline_smart_hard.sh` runs collect -> EMD matrix -> pretraining ->
+RL arms -> evals for one variant (environment-variable parametrised; `SUFFIX=_SMOKE` with
+`RL_BMDP_RUNS=<scratch>` for a smoke run). `diagnostics/` holds the offline probes and
+gates; `4_train_rl_frozen.py` is a forwarding file for the shared wrappers, not an arm;
+`4_train_rl_finetune.py` is the pre-registry finetune script, not comparable with the arms.
 
 ### Odd-Even BeliefMDP
 
 Discrete POMDP test bed (also from `pomdp-domains`; four gym ids,
-`pdomains-odd-even-{10,50,50-long,50-short}-v0`). The pipeline lives in
-`experiments/odd_even/`: `2_collect_pf_dataset.py`, the shared `3_train_st.py`
-above for Sinkhorn pretraining, `3_pretrain_st_belief.py` for supervised
-pretraining on exact posteriors, `4_train_rl_{cgf,st,gaussian}.py`, and
-`eval_scripts/eval_true_reward_odd_even.py`. Results and run directories are
-recorded in the parent repo's `domain_mds/oddeven.md`.
-`experiments/odd_even/train_rl_pretrained.py` is retired (banner in file).
+`pdomains-odd-even-{10,50,50-long,50-short}-v0`, registry keys `oe10`, `oe50`, `oe50_long`,
+`oe50_short`). The pipeline lives in `experiments/odd_even/`: `2_collect_pf_dataset.py`, the
+shared `3_train_st.py` above for Sinkhorn pretraining, `3_pretrain_st_belief.py` for
+supervised pretraining on exact posteriors, `4_train_rl_{cgf,st,gaussian}.py`, and
+`eval_scripts/eval_true_reward_odd_even.py` (transient / steady split against the Bayes
+oracle; no "success" on this domain). Everything the scripts share is in
+`rl/domains/odd_even.py`. Results and run directories are recorded in the parent repo's
+`domain_mds/oddeven.md`.
 
 ```bash
 cd experiments/odd_even
@@ -171,9 +220,15 @@ python3 4_train_rl_st.py --variant oe50_short --total_timesteps 3000000 \
 pytest tests/
 ```
 
-The suite covers the core library (modules, models, loss, plots,
-dataset, raw_to_numpy). The RL subpackage and experiment scripts are
-not currently exercised by automated tests.
+The suite covers the core library (modules, models, loss, plots, dataset,
+raw_to_numpy), the `rl/` subpackage (trainer, domains, encoders, eval, run
+records, curriculum, particle filters, wrappers, extractors) and the experiment
+scripts (loaded by path; `tests/test_harness_behaviour_inventory.py` pins the
+command-line behaviour of every arm). `tests/tools/rl_parity.py` runs one short
+training command on two checkouts and compares the outputs bit for bit. Five
+tests of the benchmark harness fail since PR #6 (`test_benchmark_results.py`,
+`test_configs_current.py`, `test_probe_env.py`); see the parent repo's
+`domain_mds/PITFALLS.md` section 11.
 
 ## Reference
 
