@@ -23,7 +23,9 @@ the executable form of that requirement. It locks six things:
     hard-coded literals.
 4.  **A seeded dict-obs rollout** through the real belief env.
 5.  **The variant registry**: env id, filter class name and episode cap.
-6.  **A short real training run** for each of the three arms.
+6.  **A short real training run** for each of the three arms through the shared
+    trainer, ``set_transformer.rl.train.train`` (the scripts are its entry points
+    since change 4.5 of the harness centralisation, 2026-09-12).
 
 The related invariant from domain_mds/PITFALLS.md section 1 -- that a
 pretrained ST encoder survives PPO construction, because
@@ -167,7 +169,6 @@ _REQUIRED_SURFACE = {
         "get_env_visible_radius",
         "main",
         "make_ant_tag_cgf_env",
-        "train_ant_tag_cgf",
     ),
     "4_train_rl_st": (
         "PFDictWithWeightsObservationWrapper",
@@ -175,7 +176,6 @@ _REQUIRED_SURFACE = {
         "SetTransformerFeaturesExtractor",
         "main",
         "make_ant_tag_belief_env",
-        "train_ant_tag_st",
     ),
     "4_train_rl_gaussian": (
         "CurriculumVisibilityWrapper",
@@ -186,7 +186,6 @@ _REQUIRED_SURFACE = {
         "get_ant_tag_pf_kwargs",
         "main",
         "make_ant_tag_belief_env",
-        "train_ant_tag_gaussian",
     ),
     # The pooling arms (2026-09-11): one trainer, three two-line entry scripts
     # that re-export their extractor by name like the other arms.
@@ -196,14 +195,12 @@ _REQUIRED_SURFACE = {
         "PointNetFeaturesExtractor",
         "WeightedDeepSetFeaturesExtractor",
         "WeightedKMomentsFeaturesExtractor",
-        "build_extractor_kwargs",
         "main",
         "make_ant_tag_belief_env",
-        "train_ant_tag_pool",
     ),
-    "4_train_rl_deepset": ("WeightedDeepSetFeaturesExtractor", "main", "train_ant_tag_pool"),
-    "4_train_rl_pointnet": ("PointNetFeaturesExtractor", "main", "train_ant_tag_pool"),
-    "4_train_rl_kmoments": ("WeightedKMomentsFeaturesExtractor", "main", "train_ant_tag_pool"),
+    "4_train_rl_deepset": ("WeightedDeepSetFeaturesExtractor", "main"),
+    "4_train_rl_pointnet": ("PointNetFeaturesExtractor", "main"),
+    "4_train_rl_kmoments": ("WeightedKMomentsFeaturesExtractor", "main"),
     "variants": (
         "EVADING",
         "VARIANTS",
@@ -1365,13 +1362,13 @@ _SMOKE_KWARGS = dict(
     progress_bar=False,
 )
 
+#: encoder -> (extractor class name, its constructor kwargs beyond arena_scale)
 _SMOKE_ARMS = {
-    "cgf": ("train_ant_tag_cgf", "WeightedCGFFeaturesExtractor",
+    "cgf": ("WeightedCGFFeaturesExtractor",
             dict(num_cgf_features=8, t_init_mode="spread", t_init_scale=0.1,
                  t_clamp=2.0, exp_arg_clamp=20.0, t_frozen=False)),
-    "gaussian": ("train_ant_tag_gaussian", "WeightedGaussianFeaturesExtractor",
-                 {}),
-    "st": ("train_ant_tag_st", "SetTransformerFeaturesExtractor",
+    "gaussian": ("WeightedGaussianFeaturesExtractor", {}),
+    "st": ("SetTransformerFeaturesExtractor",
            dict(num_encodings=2, dim_encoder=4, num_inds=4, dim_hidden=16,
                 num_heads=2, ln=True, weight_channel=True)),
 }
@@ -1384,33 +1381,43 @@ _ENTROPY_FLAT_RECIPE = "0:1:2:0,0.2:1:2:0,0.5:0.15:2:50,1:0.15:2:50"
 #: test fails until someone acknowledges it in this table.
 _VARIANTS_WITH_RECIPE = {"smart": _ENTROPY_FLAT_RECIPE,
                          "smart_mid_slow_v15": _ENTROPY_FLAT_RECIPE}
-_TRAINERS = (("4_train_rl_cgf", "train_ant_tag_cgf"),
-             ("4_train_rl_gaussian", "train_ant_tag_gaussian"),
-             ("4_train_rl_st", "train_ant_tag_st"))
+_TRAINERS = ("4_train_rl_cgf", "4_train_rl_gaussian", "4_train_rl_st")
 
 
-def _drive_main(ant_tag, monkeypatch, tmp_path, module_name, train_name, argv):
-    """Run a trainer's main() through its real argparse path, intercepting
-    the run-dir, git and training calls so nothing is created under runs/
-    and no PPO starts. Returns (run_config kwargs, train kwargs)."""
+def _drive_main(ant_tag, monkeypatch, tmp_path, module_name, argv):
+    """Run an arm's main() through its real argparse path, intercepting the
+    run-dir, git and training calls so nothing is created under runs/ and no
+    PPO starts. The arms are entry points of set_transformer.rl.train since
+    change 4.5, so the run-record helpers are intercepted on the package and
+    the shared train() call is returned with the three schedules' waypoints at
+    top level, as the scripts' own train_* functions took them. Returns
+    (run_config kwargs, train kwargs)."""
+    from set_transformer.rl import run_records
+    from set_transformer.rl import train as train_mod
     module = ant_tag[module_name]
     captured = {}
-    monkeypatch.setattr(module, "_default_run_dir",
-                        lambda *a, **k: str(tmp_path / "run"))
-    monkeypatch.setattr(module, "_git_provenance", lambda: {})
-    monkeypatch.setattr(module, "_write_run_config",
+    monkeypatch.setattr(run_records, "default_run_dir", lambda *a, **k: str(tmp_path / "run"))
+    monkeypatch.setattr(run_records, "git_provenance", lambda: {})
+    monkeypatch.setattr(run_records, "tee_stdout_stderr", lambda path: None)
+    monkeypatch.setattr(run_records, "write_run_config",
                         lambda run_dir, **cfg: captured.setdefault("config", cfg))
-    monkeypatch.setattr(module, train_name,
-                        lambda **kw: captured.setdefault("train", kw))
-    monkeypatch.setattr(sys, "argv", [module_name + ".py"] + list(argv))
-    module.main()
+    schedule_keys = {"visibility": "curriculum_schedule", "reward": "reward_schedule",
+                     "evasion": "evasion_schedule"}
+
+    def fake_train(domain, variant, encoder, **kw):
+        flat = dict(kw)
+        for schedule in kw.get("schedules", ()):
+            flat[schedule_keys[schedule.name]] = list(schedule.waypoints)
+        captured.setdefault("train", flat)
+    monkeypatch.setattr(train_mod, "train", fake_train)
+    module.main(list(argv))
     return captured["config"], captured["train"]
 
 
-@pytest.mark.parametrize("module_name,train_name", _TRAINERS)
+@pytest.mark.parametrize("module_name", _TRAINERS)
 @pytest.mark.parametrize("name", sorted(_VARIANT_TABLE))
 def test_reward_schedule_default_per_variant(ant_tag, monkeypatch, tmp_path,
-                                             module_name, train_name, name):
+                                             module_name, name):
     """A bare `--variant <x>` gets the variant's recipe if it has one, else
     the historical script default -- byte-identical to what every run before
     2026-09-09 recorded when no --reward_schedule was passed.
@@ -1422,7 +1429,7 @@ def test_reward_schedule_default_per_variant(ant_tag, monkeypatch, tmp_path,
     constant distance term; this test catches that on all three arms.
     """
     config, train = _drive_main(ant_tag, monkeypatch, tmp_path, module_name,
-                                train_name, ["--variant", name])
+                                ["--variant", name])
     expected = _VARIANTS_WITH_RECIPE.get(name, _SCRIPT_DEFAULT_REWARD)
     assert config["reward_schedule"] == expected
     first = train["reward_schedule"][0]
@@ -1433,24 +1440,24 @@ def test_reward_schedule_default_per_variant(ant_tag, monkeypatch, tmp_path,
         2.0 if name in _VARIANTS_WITH_RECIPE else 0.0)
 
 
-@pytest.mark.parametrize("module_name,train_name", _TRAINERS)
+@pytest.mark.parametrize("module_name", _TRAINERS)
 def test_reward_schedule_cli_still_wins_and_none_still_means_constant(
-        ant_tag, monkeypatch, tmp_path, module_name, train_name):
+        ant_tag, monkeypatch, tmp_path, module_name):
     """On a variant WITH a recipe: an explicit --reward_schedule overrides it
     (so the Jul-30 `smart` runs recorded under the script default stay
     reproducible by flag), 'none' still yields the constant-flag schedule,
     and schedule + flag is still a parser error."""
     config, _ = _drive_main(ant_tag, monkeypatch, tmp_path, module_name,
-                            train_name, ["--variant", "smart",
-                                         "--reward_schedule", _SCRIPT_DEFAULT_REWARD])
+                            ["--variant", "smart",
+                             "--reward_schedule", _SCRIPT_DEFAULT_REWARD])
     assert config["reward_schedule"] == _SCRIPT_DEFAULT_REWARD
     config, _ = _drive_main(ant_tag, monkeypatch, tmp_path, module_name,
-                            train_name, ["--variant", "smart",
-                                         "--reward_schedule", "none",
-                                         "--entropy_coeff", "0.5"])
+                            ["--variant", "smart",
+                             "--reward_schedule", "none",
+                             "--entropy_coeff", "0.5"])
     assert config["reward_schedule"] == "0:1.0:0.5:0,1:1.0:0.5:0"
     with pytest.raises(SystemExit):
-        _drive_main(ant_tag, monkeypatch, tmp_path, module_name, train_name,
+        _drive_main(ant_tag, monkeypatch, tmp_path, module_name,
                     ["--variant", "smart", "--reward_schedule", _ENTROPY_FLAT_RECIPE,
                      "--entropy_coeff", "0.5"])
 
@@ -1469,33 +1476,47 @@ def test_recipe_variants_are_exactly_the_pinned_set(ant_tag):
 @pytest.mark.parametrize("arm", sorted(_SMOKE_ARMS))
 def test_smoke_train_completes_and_saves_a_loadable_policy(ant_tag, arm,
                                                             tmp_path):
-    """Each arm's real train_* function must run end to end and save a policy.
+    """The shared trainer must run each arm end to end and save a policy.
 
     This is the gate that catches everything the unit tests cannot: that the
     vec env, VecNormalize with norm_obs_keys=["obs"], the four callbacks, the
     curriculum router, the eval env and the save path still fit together
-    after a move. It calls the scripts' own train_* functions -- not a
-    hand-built PPO -- so the wiring under test is the wiring a real run uses.
-    Only log_dir and model_save_path are redirected, into tmp_path.
+    after a move. It calls set_transformer.rl.train.train -- the function
+    every numbered script's main() calls since change 4.5 -- not a hand-built
+    PPO, so the wiring under test is the wiring a real run uses. Only log_dir
+    and model_save_path are redirected, into tmp_path.
 
     It is marked slow but is NOT deselected by default: it is the real gate.
     All three arms together take well under a minute at these sizes.
     """
+    from set_transformer.rl import train as train_mod
+    from set_transformer.rl.domains.ant_tag import ANT_TAG, make_schedules
     module_name = {"cgf": "4_train_rl_cgf", "gaussian": "4_train_rl_gaussian",
                    "st": "4_train_rl_st"}[arm]
-    train_name, class_name, extra = _SMOKE_ARMS[arm]
+    class_name, extra = _SMOKE_ARMS[arm]
     module = ant_tag[module_name]
     variant = ant_tag["variants"].resolve("cdens_terminal")
+    kw = dict(_SMOKE_KWARGS)
+    env_options = dict(
+        distance_coeff=kw.pop("distance_coeff"), entropy_coeff=kw.pop("entropy_coeff"),
+        tag_bonus_coeff=0.0, initial_visibility_radius=kw["curriculum_schedule"][0][1],
+        obs_mask_indices=kw.pop("obs_mask_indices"),
+        target_speed_scale=kw.pop("target_speed_scale"))
+    schedules = make_schedules(kw.pop("curriculum_schedule"), kw.pop("reward_schedule"),
+                               kw.pop("evasion_schedule"))
 
     model_path = tmp_path / arm / "models" / f"{arm}_agent.zip"
-    getattr(module, train_name)(
+    train_mod.train(
+        "ant_tag", "cdens_terminal", arm,
+        features_extractor_kwargs=dict(
+            arena_scale=ANT_TAG.default_arena_scale("cdens_terminal"), **extra),
+        env_options=env_options, schedules=schedules,
         log_dir=str(tmp_path / arm / "logs") + "/",
         model_save_path=str(model_path),
-        env_id=variant.env_id,
         particle_filter_class=variant.particle_filter,
-        **_SMOKE_KWARGS, **extra)
+        **kw)
 
-    assert model_path.exists(), f"{train_name} saved no model"
+    assert model_path.exists(), f"train('ant_tag', 'cdens_terminal', {arm!r}) saved no model"
     # VecNormalize statistics land next to the model; the eval scripts need
     # them, and a policy trained with normalized obs is not evaluable without.
     assert (model_path.parent / "vecnormalize.pkl").exists()

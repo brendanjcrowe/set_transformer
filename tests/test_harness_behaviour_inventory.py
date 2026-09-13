@@ -6,9 +6,12 @@ changes, whichever file the code ends up in. The other test files already pin th
 extractors, the particle-filter seeding, the variant tables, the reload-after-PPO
 step and the finetune fixes; this file covers what they left out:
 
-* how each arm's ``main()`` resolves flags into the training call and the run record;
-* how each arm's ``train_*`` wires the training env, the eval env, VecNormalize, PPO
-  and the callbacks (checked with a fake PPO so nothing trains);
+* how each arm's ``main()`` resolves flags into the training call and the run record
+  (since changes 4.3-4.5 every arm is an entry point of ``set_transformer.rl.train``, so the
+  shared ``train()`` is intercepted and read back in the flat shape the scripts' own
+  ``train_*`` functions took);
+* how the training call wires the training env, the eval env, VecNormalize, PPO and the
+  callbacks (checked with a fake PPO so nothing trains);
 * the curriculum callback's interpolation and how it pushes values into the wrappers;
 * the run-record helpers (run-dir name, run_config.json, git provenance);
 * the Ant-Tag eval script's cap default and post-load re-seeding;
@@ -163,6 +166,12 @@ class _FakeModel:
         self.num_timesteps = 0
         self.learn_calls = []
         self.saved = []
+        # The real features extractor on the env's observation space, so the post-construction
+        # steps that read model.policy.features_extractor (the encoder parameter count) run.
+        pk = kwargs.get("policy_kwargs") or {}
+        cls = pk.get("features_extractor_class")
+        extractor = cls(env.observation_space, **pk.get("features_extractor_kwargs", {})) if cls else None
+        self.policy = SimpleNamespace(features_extractor=extractor)
         _FakeModel.instances.append(self)
 
     def learn(self, total_timesteps, callback=None, progress_bar=False, **kw):
@@ -193,25 +202,51 @@ def _install_fakes(monkeypatch, module):
     return evals, checkpoints
 
 
-def _drive_ant_tag_main(mods, monkeypatch, tmp_path, module_name, train_name, argv, encoder=None):
+_SCHEDULE_KEYS = {"visibility": "curriculum_schedule", "reward": "reward_schedule",
+                  "evasion": "evasion_schedule"}
+
+
+def _flat_ant_tag_train(kw: dict, variant: str, encoder) -> dict:
+    """The shared train() call in the FLAT shape the scripts' train_ant_tag_* functions took
+    (extractor kwargs, env options and the three schedules' waypoints at top level, plus the
+    derived env id), so the assertions written against those functions still read."""
+    from set_transformer.rl.domains.ant_tag import resolve
+    flat = {k: v for k, v in kw.items()
+            if k not in ("features_extractor_kwargs", "env_options", "schedules", "encoder_options")}
+    flat.update(kw["features_extractor_kwargs"])
+    options = kw.get("env_options") or {}
+    for key in ("distance_coeff", "entropy_coeff", "obs_mask_indices", "target_speed_scale"):
+        flat[key] = options.get(key)
+    for schedule in kw.get("schedules", ()):
+        flat[_SCHEDULE_KEYS[schedule.name]] = list(schedule.waypoints)
+    flat["env_id"] = resolve(variant).env_id
+    flat["variant"] = variant
+    flat["encoder"] = encoder if isinstance(encoder, str) else encoder.name
+    return flat
+
+
+def _drive_ant_tag_main(mods, monkeypatch, tmp_path, module_name, argv, encoder=None):
     """Run an Ant-Tag arm's main() through argparse; capture the run record and the
-    training call; create nothing under runs/ and start no PPO."""
+    training call (the shared train(), flattened); create nothing under runs/ and start no
+    PPO. The scripts are entry points of set_transformer.rl.train since change 4.5, so the
+    run-record helpers are intercepted on the package."""
+    from set_transformer.rl import run_records
+    from set_transformer.rl import train as train_mod
     module = mods[module_name]
     captured = {}
-    monkeypatch.setattr(module, "_default_run_dir", lambda *a, **k: str(tmp_path / "run"))
-    monkeypatch.setattr(module, "_git_provenance", lambda: {})
-    monkeypatch.setattr(module, "_tee_stdout_stderr", lambda path: None)
-    monkeypatch.setattr(module, "_write_run_config",
+    monkeypatch.setattr(run_records, "default_run_dir", lambda *a, **k: str(tmp_path / "run"))
+    monkeypatch.setattr(run_records, "git_provenance", lambda: {})
+    monkeypatch.setattr(run_records, "tee_stdout_stderr", lambda path: None)
+    monkeypatch.setattr(run_records, "write_run_config",
                         lambda run_dir, **cfg: captured.setdefault("config", cfg))
-    # 4_train_rl_pool passes the encoder name positionally; the other arms use keywords only.
-    monkeypatch.setattr(module, train_name,
-                        lambda *a, **kw: captured.setdefault(
-                            "train", {**kw, **({"encoder": a[0]} if a else {})}))
-    monkeypatch.setattr(sys, "argv", [module_name + ".py"] + list(argv))
+
+    def fake_train(domain, variant, enc, **kw):
+        captured.setdefault("train", _flat_ant_tag_train(kw, variant, enc))
+    monkeypatch.setattr(train_mod, "train", fake_train)
     if encoder is None:
-        module.main()
+        module.main(list(argv))
     else:
-        module.main(encoder=encoder)
+        module.main(encoder=encoder, argv=list(argv))
     return captured["config"], captured["train"]
 
 
@@ -272,13 +307,14 @@ def _drive_odd_even_main(oe, monkeypatch, tmp_path, arm, argv):
     return captured["config"], captured["train"]
 
 
+#: (script module, encoder name, the `encoder=` argument of the pool script's main())
 _ANT_TAG_ARMS = [
-    ("4_train_rl_cgf", "train_ant_tag_cgf", "cgf", None),
-    ("4_train_rl_st", "train_ant_tag_st", "st", None),
-    ("4_train_rl_gaussian", "train_ant_tag_gaussian", "gaussian", None),
-    ("4_train_rl_pool", "train_ant_tag_pool", "deepset", "deepset"),
+    ("4_train_rl_cgf", "cgf", None),
+    ("4_train_rl_st", "st", None),
+    ("4_train_rl_gaussian", "gaussian", None),
+    ("4_train_rl_pool", "deepset", "deepset"),
 ]
-_ANT_TAG_IDS = [arm[2] for arm in _ANT_TAG_ARMS]
+_ANT_TAG_IDS = [arm[1] for arm in _ANT_TAG_ARMS]
 
 #: Flags every Ant-Tag arm records in run_config.json for a bare `--variant smart`.
 _SHARED_RUN_CONFIG_KEYS = {
@@ -295,16 +331,15 @@ _SHARED_RUN_CONFIG_KEYS = {
 # 1. Ant-Tag main(): flags -> training call and run record  (inventory 5.1, 5.2)
 # ==========================================================================
 
-@pytest.mark.parametrize("module_name,train_name,encoder,main_encoder", _ANT_TAG_ARMS,
-                         ids=_ANT_TAG_IDS)
+@pytest.mark.parametrize("module_name,encoder,main_encoder", _ANT_TAG_ARMS, ids=_ANT_TAG_IDS)
 def test_ant_tag_bare_run_resolves_variant_defaults_and_records_them(
-        ant_tag, monkeypatch, tmp_path, module_name, train_name, encoder, main_encoder):
+        ant_tag, monkeypatch, tmp_path, module_name, encoder, main_encoder):
     """`--variant smart` alone: env id and filter from the registry, the variant's three
     schedules parsed into waypoints, the target masked, the historical PPO defaults, and
     a run record that carries every flag plus the derived env / filter / subdir."""
     variants = ant_tag["variants"]
     config, train = _drive_ant_tag_main(ant_tag, monkeypatch, tmp_path, module_name,
-                                        train_name, ["--variant", "smart"], encoder=main_encoder)
+                                        ["--variant", "smart"], encoder=main_encoder)
     smart = variants.VARIANTS["smart"]
     # derived from the registry
     assert train["env_id"] == smart.env_id == "pdomains-ant-tag-smart-v0"
@@ -345,18 +380,18 @@ def test_ant_tag_st_geometry_and_start_mode_defaults(ant_tag, monkeypatch, tmp_p
     points, hidden 128, 4 heads, layer norm and the weight channel on; trained from
     scratch under PPO (no checkpoint, not frozen, shared learning rate, no fork)."""
     _, train = _drive_ant_tag_main(ant_tag, monkeypatch, tmp_path, "4_train_rl_st",
-                                   "train_ant_tag_st", ["--variant", "smart"])
+                                   ["--variant", "smart"])
     assert (train["num_encodings"], train["dim_encoder"]) == (8, 8)
     assert (train["num_inds"], train["dim_hidden"], train["num_heads"]) == (32, 128, 4)
     assert train["ln"] is True and train["weight_channel"] is True
     assert train["pretrained_st_model_path"] is None and train["st_frozen"] is False
-    assert train["st_encoder_lr_scale"] == 1.0 and train["resume_from"] is None
+    assert train["pretrained_path"] is None and train["frozen"] is False
+    assert train["encoder_lr_scale"] == 1.0 and train["resume_from"] is None
 
 
-@pytest.mark.parametrize("module_name,train_name,encoder,main_encoder", _ANT_TAG_ARMS,
-                         ids=_ANT_TAG_IDS)
+@pytest.mark.parametrize("module_name,encoder,main_encoder", _ANT_TAG_ARMS, ids=_ANT_TAG_IDS)
 def test_ant_tag_ppo_flags_reach_the_training_call(
-        ant_tag, monkeypatch, tmp_path, module_name, train_name, encoder, main_encoder):
+        ant_tag, monkeypatch, tmp_path, module_name, encoder, main_encoder):
     """`--net_arch a,b` becomes a list, `--lr_anneal`, `--target_kl`, `--no_vec_normalize`,
     `--no_mask_target_obs` and `--target_speed_scale` reach train_* as the values the
     recorded runs used."""
@@ -364,7 +399,7 @@ def test_ant_tag_ppo_flags_reach_the_training_call(
             "--no_vec_normalize", "--no_mask_target_obs", "--target_speed_scale", "0.5",
             "--n_envs", "2", "--seed", "7", "--device", "cpu"]
     config, train = _drive_ant_tag_main(ant_tag, monkeypatch, tmp_path, module_name,
-                                        train_name, argv, encoder=main_encoder)
+                                        argv, encoder=main_encoder)
     assert train["net_arch"] == [256, 256]
     assert train["lr_anneal"] is True and train["target_kl"] == 0.03
     assert train["use_vec_normalize"] is False
@@ -399,42 +434,49 @@ def test_ant_tag_target_speed_scale_is_refused_on_an_env_without_the_knob(ant_ta
 
 
 # ==========================================================================
-# 2. Ant-Tag train_*(): env stack, eval env, VecNormalize, PPO kwargs, callbacks
+# 2. Ant-Tag training call: env stack, eval env, VecNormalize, PPO kwargs, callbacks
 # ==========================================================================
 
-def _ant_tag_train_kwargs(tmp_path, **extra):
-    kw = dict(
+def _ant_tag_train_kwargs(tmp_path, encoder_options=None, **extractor_kwargs):
+    """The shared train() call for a small `smart` run: what the scripts' train_ant_tag_*
+    functions received, in the shared shape (extractor kwargs, env options, Schedules)."""
+    from set_transformer.rl.domains.ant_tag import make_schedules
+    return dict(
+        features_extractor_kwargs=dict(arena_scale=4.5, **extractor_kwargs),
+        env_options=dict(distance_coeff=1.0, entropy_coeff=0.0, tag_bonus_coeff=0.0,
+                         initial_visibility_radius=100.0, obs_mask_indices=None,
+                         target_speed_scale=None),
+        schedules=make_schedules([(0.0, 100.0), (0.5, 1.5), (1.0, 1.5)],
+                                 [(0.0, 1.0, 2.0, 0.0, 0.0), (1.0, 0.15, 2.0, 50.0, 0.0)],
+                                 [(0.0, 0.0), (1.0, 1.0)]),
+        encoder_options=encoder_options or {},
         total_timesteps=1000, n_envs=1, num_particles=16, device="cpu", seed=3,
         log_dir=str(tmp_path / "logs") + "/",
         model_save_path=str(tmp_path / "models" / "agent.zip"),
         eval_freq=200, save_freq=400, n_eval_episodes=3,
-        curriculum_schedule=[(0.0, 100.0), (0.5, 1.5), (1.0, 1.5)],
-        reward_schedule=[(0.0, 1.0, 2.0, 0.0, 0.0), (1.0, 0.15, 2.0, 50.0, 0.0)],
-        evasion_schedule=[(0.0, 0.0), (1.0, 1.0)],
-        env_id="pdomains-ant-tag-smart-v0", particle_filter_class=SmartAntTagParticleFilter,
+        particle_filter_class=SmartAntTagParticleFilter,
         lr_anneal=True, target_kl=0.03, learning_rate=3e-4,
     )
-    kw.update(extra)
-    return kw
 
 
+#: The domain's three schedules ride in ONE ScheduleCallback where the scripts had their
+#: CurriculumCallback adapter (same waypoints; tests/test_curriculum.py pins the equivalence).
 _WIRING_ARMS = [
-    ("4_train_rl_cgf", "train_ant_tag_cgf", "cgf", dict(num_cgf_features=8),
-     [CheckpointCallback, EvalCallback, "CurriculumCallback", TNormLoggingCallback,
+    ("cgf", dict(num_cgf_features=8),
+     [CheckpointCallback, EvalCallback, "ScheduleCallback", TNormLoggingCallback,
       EncoderDriftLoggingCallback]),
-    ("4_train_rl_st", "train_ant_tag_st", "st",
-     dict(num_encodings=2, dim_encoder=4, num_inds=4, dim_hidden=16, num_heads=2),
-     [CheckpointCallback, EvalCallback, "CurriculumCallback", STFeatureLoggingCallback]),
-    ("4_train_rl_gaussian", "train_ant_tag_gaussian", "gaussian", {},
-     [CheckpointCallback, EvalCallback, "CurriculumCallback"]),
+    ("st", dict(num_encodings=2, dim_encoder=4, num_inds=4, dim_hidden=16, num_heads=2),
+     [CheckpointCallback, EvalCallback, "ScheduleCallback", STFeatureLoggingCallback]),
+    ("gaussian", {},
+     [CheckpointCallback, EvalCallback, "ScheduleCallback"]),
 ]
 
 
-@pytest.mark.parametrize("module_name,train_name,encoder,extra,expected_callbacks",
-                         _WIRING_ARMS, ids=[a[2] for a in _WIRING_ARMS])
-def test_ant_tag_train_wiring(ant_tag, monkeypatch, tmp_path, module_name, train_name,
-                              encoder, extra, expected_callbacks):
-    """What train_* builds around PPO, checked without training:
+@pytest.mark.parametrize("encoder,extra,expected_callbacks", _WIRING_ARMS,
+                         ids=[a[0] for a in _WIRING_ARMS])
+def test_ant_tag_train_wiring(ant_tag, monkeypatch, tmp_path, encoder, extra,
+                              expected_callbacks):
+    """What the shared train() builds around PPO for an Ant-Tag arm, checked without training:
 
     * training env: base -> visibility wrapper at the FIRST curriculum radius -> weighted
       PF dict wrapper seeded seed+rank -> reward shaping -> Monitor -> router, inside a
@@ -448,11 +490,11 @@ def test_ant_tag_train_wiring(ant_tag, monkeypatch, tmp_path, module_name, train
     * the arm's callback list, in order;
     * the final zip and vecnormalize.pkl are written on exit.
     """
-    module = ant_tag[module_name]
-    frozen = ant_tag["4_train_rl_frozen"]
-    evals, checkpoints = _install_fakes(monkeypatch, module)
+    from set_transformer.rl import train as train_mod
+    frozen, cgf = ant_tag["4_train_rl_frozen"], ant_tag["4_train_rl_cgf"]
+    evals, checkpoints = _install_fakes(monkeypatch, train_mod)
     kwargs = _ant_tag_train_kwargs(tmp_path, **extra)
-    getattr(module, train_name)(**kwargs)
+    train_mod.train("ant_tag", "smart", encoder, **kwargs)
 
     (model,) = _FakeModel.instances
     # --- PPO kwargs
@@ -480,7 +522,7 @@ def test_ant_tag_train_wiring(ant_tag, monkeypatch, tmp_path, module_name, train
     assert eval_vec.norm_obs_keys == ["obs"] and not eval_vec.norm_reward and not eval_vec.training
     eval_env = _inner_env(eval_vec)
     assert _find(eval_env, frozen.PFRewardShapingWrapper) is None
-    real_radius = module.get_env_visible_radius("pdomains-ant-tag-smart-v0")
+    real_radius = cgf.get_env_visible_radius("pdomains-ant-tag-smart-v0")
     assert _find(eval_env, frozen.CurriculumVisibilityWrapper).visibility_radius == real_radius == 3.0
     assert _find(eval_env, PFDictWithWeightsObservationWrapper).particle_filter_seed == 3 + 1 + 1
     assert eval_kw["eval_freq"] == 200 and eval_kw["n_eval_episodes"] == 3
@@ -507,11 +549,13 @@ def test_ant_tag_cgf_running_norm_adds_the_rollout_callback_only_when_live(
         ant_tag, monkeypatch, tmp_path):
     """feature_norm=running with running_norm_update=rollout attaches the
     RolloutFeatureNormCallback; feature_norm=none does not; a frozen CGF never does."""
-    module = ant_tag["4_train_rl_cgf"]
+    from set_transformer.rl import train as train_mod
 
-    def callbacks(**extra):
-        _install_fakes(monkeypatch, module)
-        module.train_ant_tag_cgf(**_ant_tag_train_kwargs(tmp_path, num_cgf_features=8, **extra))
+    def callbacks(running_norm_update="rollout", **extra):
+        _install_fakes(monkeypatch, train_mod)
+        train_mod.train("ant_tag", "smart", "cgf", **_ant_tag_train_kwargs(
+            tmp_path, encoder_options=dict(running_norm_update=running_norm_update),
+            num_cgf_features=8, **extra))
         (model,) = _FakeModel.instances
         return [type(cb).__name__ for cb in model.learn_calls[0]["callback"]]
 
@@ -523,16 +567,25 @@ def test_ant_tag_cgf_running_norm_adds_the_rollout_callback_only_when_live(
 
 
 def test_ant_tag_train_builds_the_requested_extractor(ant_tag, monkeypatch, tmp_path):
-    """policy_kwargs names the arm's extractor class and passes the resolved arena
-    scale; the arena scale defaults to the live env's half-width (4.5 on smart)."""
-    for module_name, train_name, cls, extra in (
-            ("4_train_rl_cgf", "train_ant_tag_cgf", WeightedCGFFeaturesExtractor,
-             dict(num_cgf_features=8)),
-            ("4_train_rl_st", "train_ant_tag_st", SetTransformerFeaturesExtractor,
-             dict(num_encodings=2, dim_encoder=4, num_inds=4, dim_hidden=16, num_heads=2))):
-        module = ant_tag[module_name]
-        _install_fakes(monkeypatch, module)
-        getattr(module, train_name)(**_ant_tag_train_kwargs(tmp_path, **extra))
+    """The arm's extractor class reaches PPO's policy_kwargs with the resolved arena scale,
+    which main() defaults to the live env's half-width (4.5 on smart) before the record is
+    written; no net_arch unless asked."""
+    from set_transformer.rl import train as train_mod
+    from set_transformer.rl.encoders import ENCODERS
+    for module_name, encoder, cls in (("4_train_rl_cgf", "cgf", WeightedCGFFeaturesExtractor),
+                                      ("4_train_rl_st", "st", SetTransformerFeaturesExtractor)):
+        # main() with train() intercepted (undone at the end of the block, so the real
+        # train() runs below)
+        with monkeypatch.context() as mp:
+            _, train = _drive_ant_tag_main(ant_tag, mp, tmp_path, module_name,
+                                           ["--variant", "smart"])
+        assert train["arena_scale"] == pytest.approx(4.5) and train["net_arch"] is None
+        assert ENCODERS[encoder].extractor_class is cls
+        _install_fakes(monkeypatch, train_mod)
+        train_mod.train("ant_tag", "smart", encoder, **_ant_tag_train_kwargs(
+            tmp_path, **{"cgf": dict(num_cgf_features=8),
+                         "st": dict(num_encodings=2, dim_encoder=4, num_inds=4, dim_hidden=16,
+                                    num_heads=2)}[encoder]))
         (model,) = _FakeModel.instances
         pk = model.kwargs["policy_kwargs"]
         assert pk["features_extractor_class"] is cls
@@ -820,14 +873,15 @@ def test_odd_even_gaussian_has_no_knobs_and_no_callbacks(odd_even, monkeypatch, 
 def test_every_arm_refuses_a_frozen_encoder_without_a_checkpoint(ant_tag, odd_even, monkeypatch, tmp_path):
     """--st_frozen / --cgf_frozen without a pretrained checkpoint would freeze a RANDOM
     encoder and train for hours as a capacity control nobody asked for. All four
-    learned-encoder arms refuse it before anything is built. KNOWN DRIFT in HOW: the
-    Ant-Tag ST arm raises ValueError from main(); the other three use parser.error
-    (SystemExit, code 2). Same outcome for a launcher; unified in change 4."""
+    learned-encoder arms refuse it before anything is built. Until change 4.5 (2026-09-12)
+    this pinned a KNOWN DRIFT in HOW: the Ant-Tag ST arm raised ValueError from main() while
+    the other three used parser.error. Every arm now goes through the shared start-mode
+    resolution, so all four are parser errors (SystemExit, code 2)."""
     cases = [
-        (ValueError, lambda: _drive_ant_tag_main(ant_tag, monkeypatch, tmp_path, "4_train_rl_st",
-                                                 "train_ant_tag_st", ["--variant", "smart", "--st_frozen"])),
+        (SystemExit, lambda: _drive_ant_tag_main(ant_tag, monkeypatch, tmp_path, "4_train_rl_st",
+                                                 ["--variant", "smart", "--st_frozen"])),
         (SystemExit, lambda: _drive_ant_tag_main(ant_tag, monkeypatch, tmp_path, "4_train_rl_cgf",
-                                                 "train_ant_tag_cgf", ["--variant", "smart", "--cgf_frozen"])),
+                                                 ["--variant", "smart", "--cgf_frozen"])),
         (SystemExit, lambda: _drive_odd_even_main(odd_even, monkeypatch, tmp_path, "st",
                                                   ["--variant", "oe50_short", "--st_frozen"])),
         (SystemExit, lambda: _drive_odd_even_main(odd_even, monkeypatch, tmp_path, "cgf",
@@ -836,10 +890,7 @@ def test_every_arm_refuses_a_frozen_encoder_without_a_checkpoint(ant_tag, odd_ev
     for expected, run in cases:
         with pytest.raises(expected) as exc:
             run()
-        if expected is SystemExit:
-            assert exc.value.code == 2
-        else:
-            assert "--st_frozen" in str(exc.value)
+        assert exc.value.code == 2
 
 
 # ==========================================================================

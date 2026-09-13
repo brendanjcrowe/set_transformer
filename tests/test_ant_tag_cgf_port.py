@@ -269,16 +269,23 @@ def test_registry_bound_is_three_over_normalised_tag_radius(ant_tag, name, scale
 # -------------------------------------------------------- argparse plumbing
 
 def _drive_main(ant_tag, monkeypatch, tmp_path, argv):
+    """The script's main() through argparse; the run record and the shared train() call
+    (the script is an entry point of set_transformer.rl.train since change 4.5), with the
+    extractor kwargs at top level as the script's own train_ant_tag_cgf took them."""
+    from set_transformer.rl import run_records
+    from set_transformer.rl import train as train_mod
     module = ant_tag["4_train_rl_cgf"]
     captured = {}
-    monkeypatch.setattr(module, "_default_run_dir", lambda *a, **k: str(tmp_path / "run"))
-    monkeypatch.setattr(module, "_git_provenance", lambda: {})
-    monkeypatch.setattr(module, "_write_run_config",
+    monkeypatch.setattr(run_records, "default_run_dir", lambda *a, **k: str(tmp_path / "run"))
+    monkeypatch.setattr(run_records, "git_provenance", lambda: {})
+    monkeypatch.setattr(run_records, "tee_stdout_stderr", lambda path: None)
+    monkeypatch.setattr(run_records, "write_run_config",
                         lambda run_dir, **cfg: captured.setdefault("config", cfg))
-    monkeypatch.setattr(module, "train_ant_tag_cgf",
-                        lambda **kw: captured.setdefault("train", kw))
-    monkeypatch.setattr(sys, "argv", ["4_train_rl_cgf.py"] + list(argv))
-    module.main()
+    monkeypatch.setattr(train_mod, "train",
+                        lambda domain, variant, encoder, **kw: captured.setdefault(
+                            "train", {**kw, **kw["features_extractor_kwargs"],
+                                      **(kw.get("encoder_options") or {})}))
+    module.main(list(argv))
     return captured["config"], captured["train"]
 
 
@@ -289,7 +296,7 @@ _PORTED = ("t_param", "t_bound", "t_init_max", "feature_mode", "feature_norm",
 
 
 def _extractor_from_train_kwargs(train):
-    """Build the extractor exactly as train_ant_tag_cgf's policy_kwargs would."""
+    """Build the extractor exactly as the shared trainer's policy_kwargs would."""
     return WeightedCGFFeaturesExtractor(
         _space(),
         num_cgf_features=train["num_cgf_features"], arena_scale=train["arena_scale"],

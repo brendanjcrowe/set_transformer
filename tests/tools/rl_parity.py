@@ -148,7 +148,7 @@ def parse_renames(specs: list[str]) -> dict:
 
 
 def compare_records(a: Path | None, b: Path | None, report: list, extra_ok: bool,
-                    renames: dict | None = None) -> None:
+                    renames: dict | None = None, resolved: set | None = None) -> None:
     if a is None or b is None:
         report.append(("run_config.json", False, "missing on one side"))
         return
@@ -160,7 +160,14 @@ def compare_records(a: Path | None, b: Path | None, report: list, extra_ok: bool
                    if k in ra and (new not in rb or rb[new] != conv(ra[k]))]
     ra = {k: v for k, v in ra.items() if k not in renames}
     rb = {k: v for k, v in rb.items() if k not in {new for new, _ in renames.values()}}
-    differ = renamed_bad + [k for k in ra if k not in RECORD_IGNORE and k in rb and ra[k] != rb[k]]
+    # A key A may have recorded as null because its script resolved it inside train_*
+    # (--record_resolved): where A has null, B must carry a value, any value; where A has a
+    # value, the two are compared as usual.
+    resolved = resolved or set()
+    late = {k for k in resolved if k in ra and ra[k] is None}
+    resolved_bad = [k for k in late if rb.get(k) is None]
+    differ = renamed_bad + resolved_bad + [
+        k for k in ra if k not in RECORD_IGNORE and k not in late and k in rb and ra[k] != rb[k]]
     missing = [k for k in ra if k not in RECORD_IGNORE and k not in rb]
     extra = sorted(k for k in rb if k not in RECORD_IGNORE and k not in ra)
     ok = not differ and not missing and (extra_ok or not extra)
@@ -175,7 +182,8 @@ def compare_records(a: Path | None, b: Path | None, report: list, extra_ok: bool
     report.append(("run_config.json", ok, "; ".join(note) or f"{len(ra)} keys equal"))
 
 
-def compare(a: dict, b: dict, extra_ok: bool, renames: dict | None = None) -> list:
+def compare(a: dict, b: dict, extra_ok: bool, renames: dict | None = None,
+            resolved: set | None = None) -> list:
     report = []
     compare_npz(a["log_dir"] / "evaluations.npz", b["log_dir"] / "evaluations.npz", report)
     compare_tensors(zip_tensors(a["model_path"]), zip_tensors(b["model_path"]), "final model", report)
@@ -188,7 +196,7 @@ def compare(a: dict, b: dict, extra_ok: bool, renames: dict | None = None) -> li
             compare_tensors(zip_tensors(pa), zip_tensors(pb), f"checkpoint {pa.name}", report)
     compare_vecnormalize(a["model_path"].parent / "vecnormalize.pkl",
                          b["model_path"].parent / "vecnormalize.pkl", report)
-    compare_records(a["record"], b["record"], report, extra_ok, renames)
+    compare_records(a["record"], b["record"], report, extra_ok, renames, resolved)
     return report
 
 
@@ -207,6 +215,10 @@ def main(argv=None) -> int:
     parser.add_argument("--record_rename", action="append", default=[], metavar="OLD=NEW",
                         help="A's record key OLD is B's key NEW; OLD=!NEW when B stores the "
                              "negation (e.g. no_layer_norm=!ln). Repeatable.")
+    parser.add_argument("--record_resolved", action="append", default=[], metavar="KEY",
+                        help="A recorded KEY as null (its script resolved it inside train_*) and B "
+                             "records the number that ran; accept null on A against any value on B. "
+                             "Repeatable (e.g. arena_scale on the Ant-Tag ST / Gaussian / pool arms).")
     parser.add_argument("--reuse", action="store_true",
                         help="skip a side whose final model already exists under --out")
     parser.add_argument("flags", nargs=argparse.REMAINDER, help="script flags after --")
@@ -229,7 +241,8 @@ def main(argv=None) -> int:
         print(f"[{label}] running {args.script} from {checkout} ...", flush=True)
         sides.append(run_side(label, checkout, args.domain, args.script, flags, args.out, stem))
 
-    report = compare(sides[0], sides[1], args.record_extra_ok, parse_renames(args.record_rename))
+    report = compare(sides[0], sides[1], args.record_extra_ok, parse_renames(args.record_rename),
+                     set(args.record_resolved))
     width = max(len(name) for name, _, _ in report)
     for name, ok, note in report:
         print(f"  {name:<{width}}  {'EQUAL' if ok else 'DIFFER'}  {note}")

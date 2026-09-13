@@ -1,7 +1,7 @@
 """
 RL training with the deepset belief encoder for Ant-Tag: WeightedDeepSetFeaturesExtractor.
 
-Entry point only. The trainer, argparse and run-dir conventions live in
+Entry point only. The argparse and run-dir conventions live in
 4_train_rl_pool.py (main(encoder="deepset")); this file exists so the arm has the
 numbered-script name every driver, eval script and record expects, and so the
 symbols below stay importable by name like the other arms' (see
@@ -23,7 +23,6 @@ _pool = importlib.import_module("4_train_rl_pool")
 WeightedDeepSetFeaturesExtractor = _pool.WeightedDeepSetFeaturesExtractor
 PFDictWithWeightsObservationWrapper = _pool.PFDictWithWeightsObservationWrapper
 make_ant_tag_belief_env = _pool.make_ant_tag_belief_env
-train_ant_tag_pool = _pool.train_ant_tag_pool
 ENCODER = "deepset"
 
 

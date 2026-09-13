@@ -1,21 +1,23 @@
-"""The shared trainer (change 4.1 of the harness centralisation, 2026-09-12).
+"""The shared trainer (change 4 of the harness centralisation, 2026-09-12).
 
-Pins four things about ``rl/train.py``, ``rl/encoders.py`` and the two ``Domain`` records
-while the numbered scripts still hold their own copies of the flag resolution:
+Pins four things about ``rl/train.py``, ``rl/encoders.py`` and the two ``Domain`` records:
 
 * the two Domain records and the encoder table are complete and name the same objects the
   package exports;
 * every start-mode alias (``--pretrained_st_model_path`` and friends) stores the same value
   as the generic spelling, and the shared refusals fire;
-* RESOLVER EQUIVALENCE: for a grid of command lines, the run record the shared command line
-  writes (``--dry_run``) carries every key of the record the arm's own script writes, with
-  the same value -- the evidence that the merged CGF / ST resolution reproduces both
-  domains' scripts. The keys that are new, renamed or deliberately different are listed
-  here, so any drift beyond that list fails;
+* the rules the merge tightened or added (a CGF checkpoint fitted at another arena_scale
+  is refused on Odd-Even too; the Ant-Tag ST arm takes its geometry off a checkpoint), the
+  two run-directory layouts, and the small helpers;
 * a tiny training run per domain through the new function completes and saves what the
   eval scripts need (model, VecNormalize, run_status.json, checkpoint + snapshot).
 
-Loading conventions follow tests/test_harness_behaviour_inventory.py.
+While the numbered scripts still held their own flag resolution (batches 4.1-4.4) this file
+also carried a RESOLVER-EQUIVALENCE grid: the run record the shared command line wrote had
+to carry every key of the record the arm's own script wrote, with the same value. Every
+script is an entry point of the shared command line since change 4.5, so that grid is gone;
+the before/after evidence is the parity driver, tests/tools/rl_parity.py, run against master
+at each switch (refactor_plans.md, section 6).
 """
 from __future__ import annotations
 
@@ -32,7 +34,6 @@ import pytest
 
 _ST_ROOT = Path(__file__).resolve().parents[1]
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-_ANT_TAG_DIR = _ST_ROOT / "experiments" / "ant_tag"
 _ODD_EVEN_DIR = _ST_ROOT / "experiments" / "odd_even"
 for _p in (str(_REPO_ROOT), str(_ST_ROOT)):
     if _p not in sys.path:
@@ -63,7 +64,7 @@ from set_transformer.rl.feature_extractors.st import SetTransformerFeaturesExtra
 
 
 # --------------------------------------------------------------------------
-# Loading the scripts (their own resolvers are the reference)
+# Loading the Odd-Even sentinel forwarding file
 # --------------------------------------------------------------------------
 
 @contextmanager
@@ -75,25 +76,6 @@ def _sys_path(*directories):
         yield
     finally:
         sys.path[:] = saved
-
-
-_ANT_TAG_MODULES = ("variants", "4_train_rl_frozen", "4_train_rl_cgf", "4_train_rl_st",
-                    "4_train_rl_gaussian", "4_train_rl_pool")
-
-
-@pytest.fixture(scope="module")
-def ant_tag():
-    preexisting = set(sys.modules)
-    with _sys_path(_ANT_TAG_DIR):
-        modules = {name: importlib.import_module(name) for name in _ANT_TAG_MODULES}
-    try:
-        yield modules
-    finally:
-        for name in set(sys.modules) - preexisting:
-            module = sys.modules.get(name)
-            file = getattr(module, "__file__", None) or ""
-            if str(_ST_ROOT / "experiments") in file or name in _ANT_TAG_MODULES:
-                sys.modules.pop(name, None)
 
 
 def _odd_even_sibling():
@@ -144,15 +126,14 @@ def checkpoints(tmp_path_factory):
         t_bound=50.0, t_init_mode="spread_1d", t_init_max=40.0, feature_norm="running")
     torch.save({"model_state_dict": cgf.state_dict(), "config": dict(cgf._cgf_geometry)},
                root / "odd_even_cgf.pt")
-    # The Ant-Tag ST script cannot read geometry off a checkpoint (the new rule can), so the
-    # Ant-Tag checkpoint carries the Ant-Tag DEFAULT geometry and both sides agree.
+    # The Ant-Tag checkpoint carries the Ant-Tag DEFAULT geometry.
     st = SetTransformerFeaturesExtractor(
         ANT_TAG_SPACE, num_encodings=8, dim_encoder=8, num_inds=32, dim_hidden=128,
         num_heads=4, ln=True, arena_scale=ANT_TAG_SMART_SCALE, weight_channel=True)
     torch.save({"model_state_dict": {f"set_transformer.{k}": v
                                      for k, v in st.encoder.state_dict().items()},
                 "config": dict(st._st_geometry)}, root / "ant_tag_st.pt")
-    # The Odd-Even one is deliberately NOT the default geometry: both resolvers must take it
+    # The Odd-Even one is deliberately NOT the default geometry: the resolver must take it
     # from the checkpoint.
     st = SetTransformerFeaturesExtractor(
         ODD_EVEN_SPACE, num_encodings=8, dim_encoder=8, num_inds=8, dim_hidden=32,
@@ -163,27 +144,6 @@ def checkpoints(tmp_path_factory):
     for path in root.iterdir():
         out[path.stem] = str(path)
     return out
-
-
-def _drive_ant_tag_script(mods, monkeypatch, tmp_path, module_name, train_name, argv,
-                          encoder=None):
-    """The arm's own main(): run record and training call captured, nothing created."""
-    module = mods[module_name]
-    captured = {}
-    monkeypatch.setattr(module, "_default_run_dir", lambda *a, **k: str(tmp_path / "old_run"))
-    monkeypatch.setattr(module, "_git_provenance", lambda: {})
-    monkeypatch.setattr(module, "_tee_stdout_stderr", lambda path: None)
-    monkeypatch.setattr(module, "_write_run_config",
-                        lambda run_dir, **cfg: captured.setdefault("config", cfg))
-    monkeypatch.setattr(module, train_name,
-                        lambda *a, **kw: captured.setdefault(
-                            "train", {**kw, **({"encoder": a[0]} if a else {})}))
-    monkeypatch.setattr(sys, "argv", [module_name + ".py"] + list(argv))
-    if encoder is None:
-        module.main()
-    else:
-        module.main(encoder=encoder)
-    return captured["config"], captured["train"]
 
 
 def _drive_shared(monkeypatch, tmp_path, domain, encoder, argv, *, legacy_layout=True):
@@ -198,43 +158,6 @@ def _drive_shared(monkeypatch, tmp_path, domain, encoder, argv, *, legacy_layout
     train_mod.main(list(argv) + ["--dry_run"], domain=domain, encoder=encoder,
                    legacy_layout=legacy_layout)
     return captured["config"]
-
-
-#: Record keys that legitimately differ between the two sides.
-IGNORED_KEYS = {"log_dir", "model_save_path", "git"}
-#: Keys the shared record has and the scripts' records did not (plan 4d additions, the
-#: unified start-mode / resume / SAC flags on arms that lacked them, the derived values).
-NEW_KEYS = {
-    "domain", "encoder", "run_directory", "output_root", "pretrained_config",
-    "algorithm", "resume_from", "resume_vecnormalize", "init_policy",
-    "num_post_sab", "encoder_lr_scale", "unfreeze_at", "st_unfreeze_at",
-}
-#: Keys a script recorded as null because it resolved them INSIDE its train_* function
-#: (arena_scale on the Ant-Tag ST / Gaussian / pooled arms; the 2026-09-03 audit fixed only
-#: the CGF arm). The shared record carries the number that ran.
-RESOLVED_LATE = {"arena_scale"}
-
-
-def _assert_record_matches(old, new, *, renames=None, differ=None):
-    renames = renames or {}
-    differ = differ or {}
-    for key, value in old.items():
-        if key in IGNORED_KEYS:
-            continue
-        if key in renames:
-            new_key, convert = renames[key]
-            assert new[new_key] == convert(value), (key, value, new_key, new[new_key])
-            continue
-        assert key in new, f"key {key!r} of the script's record is missing from the shared one"
-        if key in differ:
-            assert new[key] == differ[key], (key, new[key], differ[key])
-            continue
-        if key in RESOLVED_LATE and value is None:
-            assert new[key] is not None, key
-            continue
-        assert new[key] == value, (key, value, new[key])
-    extra = set(new) - set(old) - IGNORED_KEYS - {r[0] for r in renames.values()}
-    assert extra <= NEW_KEYS, f"unexpected new record keys: {sorted(extra - NEW_KEYS)}"
 
 
 # --------------------------------------------------------------------------
@@ -394,61 +317,12 @@ def test_init_policy_excludes_a_pretrained_encoder_and_resume(monkeypatch, tmp_p
 
 
 # --------------------------------------------------------------------------
-# 3. Resolver equivalence: the shared record carries the script's record
+# 3. Rules the merge tightened or added
 # --------------------------------------------------------------------------
 
-_ANT_TAG_GRID = [
-    # (script module, train fn, encoder name for main(encoder=), shared encoder, argv)
-    ("4_train_rl_cgf", "train_ant_tag_cgf", None, "cgf", ["--variant", "smart"]),
-    ("4_train_rl_cgf", "train_ant_tag_cgf", None, "cgf",
-     ["--variant", "cdens_terminal", "--reward_schedule", "none", "--entropy_coeff", "0.5",
-      "--lr_anneal", "--target_kl", "0.03", "--net_arch", "256,256", "--no_mask_target_obs",
-      "--target_speed_scale", "0", "--seed", "3", "--run_tag", "grid"]),
-    ("4_train_rl_cgf", "train_ant_tag_cgf", None, "cgf",
-     ["--variant", "smart", "--t_param", "polar", "--t_init_mode", "spread",
-      "--feature_mode", "K_grad", "--feature_norm", "running"]),
-    ("4_train_rl_cgf", "train_ant_tag_cgf", None, "cgf",
-     ["--variant", "smart", "--match_params", "5000", "--x_embed_dim", "4"]),
-    ("4_train_rl_cgf", "train_ant_tag_cgf", None, "cgf",
-     ["--variant", "smart", "--pretrained_cgf_model_path", "CKPT:ant_tag_cgf", "--cgf_frozen"]),
-    ("4_train_rl_st", "train_ant_tag_st", None, "st", ["--variant", "smart"]),
-    ("4_train_rl_st", "train_ant_tag_st", None, "st",
-     ["--variant", "smart", "--num_inds", "16", "--dim_hidden", "64", "--no_ln",
-      "--no_st_weight_channel", "--num_encodings", "4", "--dim_encoder", "16"]),
-    ("4_train_rl_st", "train_ant_tag_st", None, "st",
-     ["--variant", "smart", "--pretrained_st_model_path", "CKPT:ant_tag_st", "--st_frozen"]),
-    ("4_train_rl_st", "train_ant_tag_st", None, "st",
-     ["--variant", "smart", "--pretrained_st_model_path", "CKPT:ant_tag_st",
-      "--st_encoder_lr_scale", "0.1"]),
-    ("4_train_rl_gaussian", "train_ant_tag_gaussian", None, "gaussian",
-     ["--variant", "smart_mid_slow_v15", "--curriculum", "0:100,1:1"]),
-    ("4_train_rl_pool", "train_ant_tag_pool", "deepset", "deepset",
-     ["--variant", "smart", "--pooling", "mean", "--no_weight_channel"]),
-    ("4_train_rl_pool", "train_ant_tag_pool", "kmoments", "kmoments",
-     ["--variant", "smart", "--k", "2"]),
-]
-
-
-@pytest.mark.parametrize("module_name,train_name,main_encoder,encoder,argv", _ANT_TAG_GRID,
-                         ids=[f"{c[3]}:{' '.join(c[4][2:])}".strip(": ") or c[3]
-                              for c in _ANT_TAG_GRID])
-def test_ant_tag_shared_record_carries_the_scripts_record(
-        ant_tag, checkpoints, monkeypatch, tmp_path, module_name, train_name, main_encoder,
-        encoder, argv):
-    argv = [checkpoints[a.split(":", 1)[1]] if a.startswith("CKPT:") else a for a in argv]
-    old, old_train = _drive_ant_tag_script(ant_tag, monkeypatch, tmp_path, module_name,
-                                           train_name, argv, encoder=main_encoder)
-    new = _drive_shared(monkeypatch, tmp_path, "ant_tag", encoder, argv)
-    _assert_record_matches(old, new)
-    # derived values the scripts computed inside their train_* functions
-    assert new["env_id"] == old["env_id"] and new["run_subdir"] == old["run_subdir"]
-    if encoder == "cgf":
-        assert new["encoder_params"] == old["encoder_params"]
-
-
-# (The Odd-Even arms left this grid at their switches, changes 4.3 / 4.4: their scripts ARE
-# the shared command line now; the parity driver, tests/tools/rl_parity.py, covers them
-# against master.)
+# (The resolver-equivalence grid that compared each script's record with the shared one
+# left with the arm switches, changes 4.3-4.5: the scripts ARE the shared command line now;
+# the parity driver, tests/tools/rl_parity.py, covers them against master.)
 
 
 def test_odd_even_cgf_checkpoint_at_another_arena_scale_is_now_refused(
