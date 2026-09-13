@@ -190,8 +190,10 @@ def test_script_takes_a_device_flag_and_defaults_to_the_automatic_choice():
                           capture_output=True, text=True, timeout=300)
     assert proc.returncode == 0, proc.stderr[-2000:]
     assert "--device" in proc.stdout
-    source = script.read_text()
-    assert 'args.device or ("cuda" if torch.cuda.is_available() else "cpu")' in source
+    assert "Pass cpu for a bit-for-bit" in proc.stdout        # the default is the automatic choice
+    # Since 7.2 the choice is made by the shared command (rl/pretrain.py), not the script.
+    front = Path(__file__).resolve().parents[1] / "set_transformer" / "rl" / "pretrain.py"
+    assert 'args.device or ("cuda" if torch.cuda.is_available() else "cpu")' in front.read_text()
 
 
 def test_rl_script_accepts_the_export_and_reloads_it(tmp_path):

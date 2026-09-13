@@ -10,8 +10,8 @@ Behaviour list (section 7d of the plan). Each line names its test in THIS file, 
 test elsewhere, or says why it is not tested.
 
 experiments/ant_tag/3_train_st.py (reconstruction pretraining, any domain's dataset)
-  T1  --help exits 0 and lists the data / loss / alignment / geometry / CGF / placement flags
-        -> test_train_st_help_lists_every_flag_group
+  T1  --help exits 0 and lists the data / loss / alignment / geometry / placement flags; the CGF
+      flags with --help --encoder cgf (per-encoder help since 7.2) -> test_train_st_help_lists_every_flag_group
   T2  set geometry (num_particles, dim_particles) comes from the dataset; a contradicting flag
       is a parser error naming the dataset value -> test_train_st_refuses_a_geometry_flag_that_contradicts_the_dataset
   T3  PF weights are used by default; --loss_type chamfer on a weighted dataset is refused
@@ -263,9 +263,14 @@ def test_train_st_help_lists_every_flag_group(tmp):
     assert proc.returncode == 0, _tail(proc)
     for flag in ("--data_path", "--ignore_weights", "--loss_type", "--sinkhorn_blur", "--align_lambda",
                  "--emd_matrix_path", "--max_samples", "--num_encodings", "--dim_encoder", "--num_inds",
-                 "--dim_hidden", "--encoder", "--t_param", "--t_bound", "--feature_mode", "--readout_hidden",
-                 "--base_dir", "--domain", "--variant", "--output_root", "--experiment_name", "--seed",
-                 "--device"):
+                 "--dim_hidden", "--encoder", "--base_dir", "--domain", "--variant", "--output_root",
+                 "--experiment_name", "--seed", "--device"):
+        assert flag in proc.stdout, flag
+    # Since batch 7.2 the help page is per encoder, as the RL trainer's is: the CGF flags show
+    # with --encoder cgf (the old script listed both groups on one page).
+    proc = _run(TRAIN_ST, ["--help", "--encoder", "cgf"], tmp)
+    assert proc.returncode == 0, _tail(proc)
+    for flag in ("--t_param", "--t_bound", "--feature_mode", "--readout_hidden", "--match_params"):
         assert flag in proc.stdout, flag
 
 

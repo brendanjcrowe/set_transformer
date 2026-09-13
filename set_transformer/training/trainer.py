@@ -174,7 +174,7 @@ class Trainer:
             common["dim_particles"] = self.config.dim_particles + 1
             common["dim_output_particles"] = self.config.dim_particles
         if self.config.model_type == "pf_st":
-            model = PFSetTransformer(**common)
+            model = PFSetTransformer(**common, num_post_sab=self.config.num_post_sab)
         elif self.config.model_type == "set_vae":
             model = SetVAE(**common)
         elif self.config.model_type == "set_vqvae":

@@ -24,6 +24,8 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
 
 from set_transformer.rl.curriculum import Schedule
 
@@ -62,6 +64,104 @@ class Evaluation:
     #: ``episodes`` is the list of :class:`~set_transformer.rl.eval_true_reward.Episode`
     #: records (per-step rewards and infos). ``None`` selects the script's success-rate report.
     report: Callable | None = None
+
+
+@dataclass(frozen=True)
+class PretrainContext:
+    """What the shared pretraining command hands an :class:`Objective` when it runs it
+    (``rl/pretrain.py``, plan section 7, batch 7.2). Plain values only."""
+
+    domain: "Domain"
+    #: Registry key the run is filed under (``None`` when the dataset records none and the
+    #: user placed the output with ``--base_dir``).
+    variant: str | None
+    #: The :class:`~set_transformer.rl.encoders.Encoder` record being pretrained.
+    encoder: Any
+    #: Torch device string, resolved (``cpu`` / ``cuda`` / ``cuda:1``).
+    device: str
+    #: ``<base_dir>/<experiment_name>/<run_name>``: created, ``run_config.json`` already in it.
+    run_dir: Path
+    base_dir: Path
+    experiment_name: str
+    run_name: str
+    #: Whatever :attr:`Objective.prepare` returned (loaded data, validated matrix, ...).
+    data: Any = None
+
+
+@dataclass(frozen=True)
+class PretrainResult:
+    """What an :class:`Objective` hands back: where it wrote, and which file the RL side
+    loads (``--pretrained_path`` of ``rl/train.py``) so the command can prove it round-trips."""
+
+    run_dir: Path
+    #: The checkpoint ``rl/train.py --pretrained_path`` takes; ``None`` if the objective
+    #: produced nothing loadable (then no round-trip check runs).
+    rl_checkpoint: Path | None
+    #: Every file worth naming, by role (``best``, ``latest``, ``best_export``, ...).
+    checkpoints: Mapping[str, Path] = field(default_factory=dict)
+    #: Small numbers for the log (best validation loss, epoch, ...).
+    summary: Mapping[str, object] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class Objective:
+    """One pretraining objective: what an encoder is trained to do before RL.
+
+    Two kinds exist. A GENERIC objective needs nothing a problem must compute for it
+    (``reconstruction``: any collected particle dataset) and lives once, in
+    ``rl/pretrain_objectives/``; every domain gets it. A PROBLEM-SPECIFIC objective needs
+    something only that problem's env can provide (Odd-Even's exact posterior) and is
+    declared in that problem's own domain module through :class:`Pretraining`, nowhere
+    else. ``--objective`` of ``rl/pretrain.py`` offers the union for the chosen domain.
+
+    The command owns the command line around the objective (domain / encoder / objective
+    selection, seed, device, placement under the root layout, ``run_config.json``, the
+    round-trip check of the produced checkpoint into the RL extractor). The objective owns
+    its data and its training loop. Call order: :attr:`add_arguments` (parser assembly),
+    :attr:`locate` (before the domain is known, from the objective's own inputs),
+    :attr:`resolve_arguments` (cheap checks), :attr:`prepare` (data; sets the dataset-derived
+    ``num_particles`` / ``dim_particles`` / ``arena_scale`` on ``args`` so the encoder's own
+    resolution can run), then the encoder's resolution, then :attr:`run` and :attr:`report`.
+    """
+
+    name: str
+    description: str
+    #: ``add_arguments(parser, domain | None)``: the objective's flags. ``domain`` is None
+    #: during the first, selecting parse.
+    add_arguments: Callable
+    #: ``run(args, context) -> PretrainResult``: the training itself.
+    run: Callable
+    #: ``run_name(args, now: datetime) -> str``: the run folder's name under
+    #: ``<base_dir>/<experiment_name>/``.
+    run_name: Callable
+    #: ``locate(args) -> {"variant": str | None, "env_id": str | None}``: where the
+    #: objective's inputs say the run belongs (the collector records both in a dataset's
+    #: metadata). Used only when ``--domain`` / ``--variant`` are not given.
+    locate: Callable = lambda args: {"variant": None, "env_id": None}
+    #: ``resolve_arguments(parser, args, domain, encoder)``: checks that need no data.
+    resolve_arguments: Callable = lambda parser, args, domain, encoder: None
+    #: ``prepare(parser, args, domain, encoder, device) -> data``: load and validate the
+    #: inputs; MUST leave ``args.num_particles``, ``args.dim_particles`` and
+    #: ``args.arena_scale`` set.
+    prepare: Callable = lambda parser, args, domain, encoder, device: None
+    #: ``report(args, context, result) -> None``: optional end-of-run analysis (Odd-Even's
+    #: mode-readout probe).
+    report: Callable | None = None
+    #: Default ``--experiment_name`` when the user gives none: ``f(encoder_name) -> str``.
+    default_experiment_name: Callable = lambda encoder_name: encoder_name
+
+
+@dataclass(frozen=True)
+class Pretraining:
+    """The pretraining objectives a problem declares for itself (see :class:`Objective`).
+    The default, an empty record, means "the generic objectives only"."""
+
+    #: ``objective name -> Objective``. A name that collides with a generic objective is an
+    #: error at command assembly.
+    objectives: Mapping[str, Objective] = field(default_factory=dict)
+    #: The objective ``rl/pretrain.py`` picks for this domain when ``--objective`` is not
+    #: given; ``None`` means the generic default (``reconstruction``).
+    default_objective: str | None = None
 
 
 @dataclass(frozen=True)
@@ -134,6 +234,9 @@ class Domain:
     encoder_callbacks: Callable = lambda encoder_name: []
     #: What the shared evaluation script lets this problem decide (see :class:`Evaluation`).
     evaluation: Evaluation = field(default_factory=Evaluation)
+    #: The pretraining objectives this problem declares for itself (see :class:`Pretraining`);
+    #: the generic ones (reconstruction) need no declaration.
+    pretraining: Pretraining = field(default_factory=Pretraining)
 
     def variant_names(self) -> list[str]:
         return sorted(self.variants)

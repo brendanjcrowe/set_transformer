@@ -29,6 +29,11 @@ class TrainingConfig:
     dim_hidden: int = 128
     num_heads: int = 4
     use_layer_norm: bool = True
+    # SAB blocks between the PMA and the output Linear of the encoder (model_type "pf_st";
+    # SetTransformer.num_post_sab). Any count >= 0; 2 is the geometry every checkpoint
+    # written before 2026-09-13 has, when the field did not exist and the constructor
+    # default applied. Recorded in the checkpoint so the RL extractor builds the same shape.
+    num_post_sab: int = 2
 
     # Weighted particle sets (option B: mass in the measure, not the metric).
     # `dim_particles` always means the COORDINATE dimension D of a particle.
