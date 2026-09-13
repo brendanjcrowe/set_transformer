@@ -11,8 +11,7 @@ this script took still works; the output lines are unchanged (the wave drivers g
 The eval env is the domain's (``rl/domains/ant_tag.py``): the env's real visibility radius,
 no reward shaping, so Monitor sees the env's own -1/step, 0-on-tag reward. Importing
 ``4_train_rl_pool`` below is what lets SB3 unpickle ``WeightedDeepSetFeaturesExtractor`` out of a saved
-``policy_kwargs`` when the zip names that module. ``make_eval_env`` is re-exported for the
-diagnostics that build their env through this module.
+``policy_kwargs`` when the zip names that module.
 
 Usage:
     python3 eval_scripts/eval_true_reward_deepset.py --variant smart \\
@@ -37,11 +36,7 @@ import pdomains  # noqa: F401,E402 - registers pdomains-ant-tag-*
 # Registers the extractor class under the module name recorded in the checkpoint.
 importlib.import_module("4_train_rl_pool")  # noqa: F401
 
-from set_transformer.rl.domains.ant_tag import make_eval_env  # noqa: E402,F401
-from set_transformer.rl.eval_true_reward import (  # noqa: E402,F401
-    checkpoint_num_particles as _checkpoint_num_particles,
-    main as _shared_main,
-)
+from set_transformer.rl.eval_true_reward import main as _shared_main  # noqa: E402
 
 
 def main(argv=None):

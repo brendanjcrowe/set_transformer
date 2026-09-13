@@ -28,6 +28,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import importlib
 import sys
 import warnings
 from pathlib import Path
@@ -51,10 +52,9 @@ from sklearn.preprocessing import StandardScaler
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
-import _sibling
-
-belief_env = _sibling.load("odd_even_belief_env")
-variants = _sibling.load("variants")
+# The registry and the belief env live in the package.
+from set_transformer.rl.domains import odd_even as belief_env  # noqa: E402
+variants = belief_env
 
 
 def collect(agent_path: str, vecnorm: str | None, variant: str,
@@ -70,10 +70,11 @@ def collect(agent_path: str, vecnorm: str | None, variant: str,
         env.training = False
         env.norm_reward = False
 
-    # SB3 needs the arm's module importable to unpickle the extractor class
+    # SB3 needs the arm's module importable to unpickle the extractor class when a zip
+    # names the script (the Odd-Even zips name the package classes; harmless otherwise).
     for mod in ("4_train_rl_st", "4_train_rl_cgf", "4_train_rl_gaussian"):
         try:
-            _sibling.load(mod)
+            importlib.import_module(mod)
         except Exception:
             pass
 

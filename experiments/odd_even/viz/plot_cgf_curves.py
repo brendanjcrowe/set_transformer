@@ -44,8 +44,7 @@ import matplotlib.pyplot as plt
 import gymnasium as gym
 
 import pdomains  # noqa: F401
-import _sibling  # noqa: E402
-variants = _sibling.load("variants")
+from set_transformer.rl.domains import odd_even as variants  # noqa: E402 - the registry
 
 COLOURS = ("#3b6fb6", "#d1495b", "#2a9d8f")
 

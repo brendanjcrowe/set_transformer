@@ -53,11 +53,12 @@ _EVAL_DIR = _ANT_TAG_DIR / "eval_scripts"
 _DIAGNOSTICS_DIR = Path(__file__).resolve().parent
 _GIF_DIR = _DIAGNOSTICS_DIR / "gifs"
 _TRAJECTORY_DIR = _DIAGNOSTICS_DIR / "trajectories"
-for path in (_REPO_ROOT, _ANT_TAG_DIR, _EVAL_DIR):
+for path in (_REPO_ROOT, _ANT_TAG_DIR):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
 import pdomains  # noqa: E402,F401 - register environments
+from set_transformer.rl.domains.ant_tag import make_eval_env  # noqa: E402 - the eval env stack
 from set_transformer.rl.particle_filters.ant_tag import (  # noqa: E402
     CounterweightedDenAntTagParticleFilter,
 )
@@ -88,11 +89,10 @@ def _batch_obs(obs):
 
 
 def _record(args):
-    eval_module = importlib.import_module(
-        "eval_true_reward_cgf" if args.encoder == "cgf"
-        else "eval_true_reward_gaussian"
-    )
-    env_fn = eval_module.make_eval_env(
+    # SB3 unpickles the extractor class by module path; a recorded zip may name the arm's
+    # script, so make it importable before PPO.load.
+    importlib.import_module(f"4_train_rl_{args.encoder}")
+    env_fn = make_eval_env(
         num_particles=args.num_particles,
         obs_mask_indices=[-2, -1],
         seed=args.env_seed,

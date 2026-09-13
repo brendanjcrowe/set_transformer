@@ -97,8 +97,7 @@ import torch.nn as nn  # noqa: E402
 import torch.nn.functional as F  # noqa: E402
 
 import pdomains  # noqa: F401,E402 - registers the envs
-import _sibling  # noqa: E402
-variants = _sibling.load("variants")
+from set_transformer.rl.domains import odd_even as variants  # noqa: E402 - the registry
 from set_transformer.rl.feature_extractors.st import (  # noqa: E402
     SetTransformerFeaturesExtractor,
 )
@@ -107,9 +106,9 @@ from set_transformer.rl.feature_extractors.cgf import (  # noqa: E402
 )
 
 # The CGF arm's readout / pretrained flags and its geometry resolution
-# (--match_params sizing) come from the RL script, so a checkpoint is built
-# and later loaded with one spelling of every flag.
-_train_rl_cgf = _sibling.load("4_train_rl_cgf")
+# (--match_params sizing) come from the shared encoder table, so a checkpoint is
+# built and later loaded with one spelling of every flag.
+from set_transformer.rl import encoders as _cgf_flags  # noqa: E402
 
 
 def _load_probe_module():
@@ -348,7 +347,7 @@ def main(argv=None):
     parser.add_argument("--t_bound", type=float, default=50.0)
     parser.add_argument("--t_init_max", type=float, default=None,
                         help="Default 40 in tanh mode, t_clamp in clamp mode "
-                             "(4_train_rl_cgf.resolve_t_init_max).")
+                             "(rl/encoders.resolve_t_init_max).")
     parser.add_argument("--t_clamp", type=float, default=2.0)
     parser.add_argument("--t_frozen", action="store_true",
                         help="Fixed-t arm: t is a buffer, only the readout learns.")
@@ -357,7 +356,7 @@ def main(argv=None):
                         help="running (default): per-feature z-score with running "
                              "statistics, used for fixed AND learned t. layernorm is "
                              "the ablation (normalises across features per sample).")
-    _train_rl_cgf.add_readout_and_pretrained_arguments(parser)
+    _cgf_flags.add_readout_and_pretrained_arguments(parser)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--probe_episodes", type=int, default=300)
@@ -393,8 +392,8 @@ def main(argv=None):
         if args.pretrained_cgf_model_path or args.cgf_frozen:
             parser.error("--pretrained_cgf_model_path / --cgf_frozen are RL-side flags; "
                          "this script PRODUCES the checkpoint.")
-        _train_rl_cgf.resolve_cgf_geometry(args, parser)
-        _train_rl_cgf.resolve_t_init_max(args)
+        _cgf_flags.resolve_cgf_geometry(args, parser)
+        _cgf_flags.resolve_t_init_max(args)
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)

@@ -66,19 +66,13 @@ from pdomains.odd_even_pomdp import OddEvenPOMDP, OddEvenPOMDPConfig
 from set_transformer.rl.feature_extractors.cgf import WeightedCGFFeaturesExtractor
 from set_transformer.rl.feature_extractors.st import SetTransformerFeaturesExtractor
 
-# Load the Odd-Even registry BY PATH, never by flat name. experiments/ant_tag/
-# has a variants.py too, and any test or launcher that leaves that directory on
-# sys.path makes `import variants` return the ANT-TAG registry -- which fails
-# here as "Unknown variant 'oe50'". That is Gap 12 in domain_mds/oddeven.md,
-# and it bit this very file in the full test suite.
-sys.path.insert(0, str(_ODD_EVEN_DIR))
-import _sibling  # noqa: E402 - path-based sibling loader
-
-variants = _sibling.load("variants")
+# The Odd-Even registry lives in the package (no flat-name `variants` to collide with
+# experiments/ant_tag/'s, the Gap 12 trap of domain_mds/oddeven.md).
+from set_transformer.rl.domains import odd_even as variants  # noqa: E402
 
 #: Below this relative spread an encoding is effectively constant, so a policy
 #: head has nothing to learn from however well it probes. Matches
-#: st_feature_sentinel.COLLAPSE_RELATIVE_SPREAD.
+#: set_transformer.rl.domains.odd_even.COLLAPSE_RELATIVE_SPREAD.
 COLLAPSE_RELATIVE_SPREAD = 5e-3
 
 

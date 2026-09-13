@@ -74,6 +74,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import importlib
 import sys
 import warnings
 from pathlib import Path
@@ -113,13 +114,10 @@ from set_transformer.rl.feature_extractors.st import (  # noqa: E402
     SetTransformerFeaturesExtractor,
 )
 
-# Siblings BY PATH, never by flat name: experiments/ant_tag/ holds a
-# variants.py and a 4_train_rl_cgf.py too, and sys.modules is process-wide
-# (Gap 12 in domain_mds/oddeven.md -- measured biting the test suite).
-import _sibling  # noqa: E402
-
-variants = _sibling.load("variants")
-belief_env = _sibling.load("odd_even_belief_env")
+# The registry and the belief env live in the package (no flat-name sibling to collide
+# with experiments/ant_tag/'s -- Gap 12 in domain_mds/oddeven.md).
+from set_transformer.rl.domains import odd_even as variants  # noqa: E402
+belief_env = variants
 
 #: The transient/steady split. Steps 1..21 are the transient -- the belief is
 #: still sharpening and the encodings provably differ there; 22..cap is the
@@ -301,7 +299,7 @@ def _learned_t_cgf(agent_path: str, space, arena_scale):
 
     # SB3 pickles the extractor CLASS by module path, so the arm's module
     # must be importable before the zip can be unpickled.
-    _sibling.load("4_train_rl_cgf")
+    importlib.import_module("4_train_rl_cgf")   # experiments/odd_even/ is on sys.path
     model = PPO.load(agent_path, device="cpu")
     extractor = model.policy.features_extractor
     if not isinstance(extractor, WeightedCGFFeaturesExtractor):
@@ -399,7 +397,7 @@ def _e2e_st_extractor(agent_path: str, arena_scale):
     """
     from stable_baselines3 import PPO
 
-    _sibling.load("4_train_rl_st")
+    importlib.import_module("4_train_rl_st")
     model = PPO.load(agent_path, device="cpu")
     extractor = model.policy.features_extractor
     if not isinstance(extractor, SetTransformerFeaturesExtractor):

@@ -58,7 +58,7 @@ importlib.import_module("4_train_rl_st")
 
 
 def _make_belief_env(env_id, particle_filter_class, num_particles, seed):
-    """Same construction as eval_scripts/eval_true_reward_cgf.make_eval_env."""
+    """Same construction as set_transformer.rl.domains.ant_tag.make_eval_env."""
     def _init():
         env = gym.make(env_id, rendering=False)
         env.reset(seed=seed)

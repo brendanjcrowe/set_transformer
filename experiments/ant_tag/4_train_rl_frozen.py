@@ -5,13 +5,14 @@ The code that lived here (reward shaping, visibility / evasion curriculum, the c
 callback, PF glue) is now ``set_transformer.rl.domains.ant_tag`` (change 1a of the harness
 centralisation; ``refactor_plans.md`` in the parent repo). This file re-exports the same
 objects under its historical name because 4_train_rl_cgf.py (and through it the ST /
-Gaussian / pool arms), 4_train_rl_finetune.py, sample_and_render.py,
-eval_scripts/eval_true_reward.py and several tests import it by flat name
+Gaussian / pool arms), 4_train_rl_finetune.py, sample_and_render.py and several tests
+import it by flat name
 (``importlib.import_module("4_train_rl_frozen")``; the digit makes ``import`` impossible).
 
 History: until 2026-09-11 this was the May-2026 "pretrained Set Transformer as a fixed
-feature processor inside the env" arm; that runnable half is parked in
-to_be_deleted/ant_tag_4_train_rl_frozen_legacy_main.py. The live frozen arm is
+feature processor inside the env" arm; that runnable half was parked in to_be_deleted/ and
+deleted on 2026-09-12 (change 5.3a; git history before that commit has it). The live frozen
+arm is
     python3 4_train_rl_st.py --variant <variant> --pretrained_st_model_path <ckpt> --st_frozen
 
 Side effects kept on purpose, because importers have relied on them: the package-root

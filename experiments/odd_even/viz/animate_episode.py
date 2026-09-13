@@ -358,11 +358,8 @@ def main(argv=None):
 
     n, steps = args.n, args.steps
     if args.variant is not None:
-        # variants.py lives in the sibling experiments/odd_even dir and is
-        # imported by flat name; the ant_tag registry shares that name, so
-        # load it by path (see CLAUDE.md, Gap 12).
-        import _sibling
-        variants = _sibling.load("variants")
+        # The Odd-Even registry lives in the package (set_transformer/rl/domains/odd_even.py).
+        from set_transformer.rl.domains import odd_even as variants
         v = variants.resolve(args.variant)
         n = n if n is not None else v.n_dist_size
         steps = steps if steps is not None else variants.episode_cap(args.variant)

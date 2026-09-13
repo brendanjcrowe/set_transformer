@@ -242,6 +242,121 @@ CGF_GEOMETRY_FLAGS = ("num_cgf_features", "feature_mode", "t_param", "t_bound",
                       "x_embed_dim", "x_embed_hidden", "x_embed_depth")
 
 
+def add_readout_and_pretrained_arguments(parser) -> None:
+    """The readout MLP and the pretrained-encoder flags (2026-09-05), for
+    ``3_pretrain_st_belief.py --encoder cgf``: the pretraining side spells a
+    checkpoint's geometry with the same flags the RL side reads, so a checkpoint
+    built there loads here without translation. The shared RL command line has
+    its own copy of these flags in :func:`_cgf_add_arguments`; this trio is what
+    the pretraining script borrows (moved from
+    ``experiments/odd_even/4_train_rl_cgf.py`` in change 5.3a, verbatim).
+    """
+    parser.add_argument(
+        "--readout_hidden", type=int, default=0,
+        help="Width of the readout MLP between the (normalised) CGF block and "
+             "the policy. 0 (default) = no readout, the extractor as before. "
+             "This is where a parameter-matched CGF arm keeps its budget; see "
+             "--match_params.")
+    parser.add_argument(
+        "--readout_depth", type=int, default=0,
+        help="Hidden layers in the readout MLP. 0 = none. --match_params "
+             "with depth 0 uses 2 (ClusterHunt's).")
+    parser.add_argument(
+        "--readout_dim", type=int, default=None,
+        help="Readout output width. Default 64, the ST arm's feature width, "
+             "whatever --num_cgf_features is, so the policy heads are "
+             "identical across arms.")
+    parser.add_argument(
+        "--match_params", type=int, default=None,
+        help="Pick --readout_hidden so the encoder's parameter total (learned "
+             "t + norm affine + readout) lands closest to this count, e.g. "
+             "109448 for the small 2-SAB ST encoder. The chosen width and "
+             "the exact total are printed and recorded in run_config.json.")
+    parser.add_argument(
+        "--pretrained_cgf_model_path", type=str, default=None,
+        help="Checkpoint from 3_pretrain_st_belief.py --encoder cgf. Loaded "
+             "into the extractor, RE-loaded after PPO construction and "
+             "verified max|delta| == 0 (PITFALLS.md section 1). Geometry "
+             "flags left at their defaults are taken from it.")
+    parser.add_argument(
+        "--x_embed_dim", type=int, default=0,
+        help="Learned per-particle embedding phi: R^D -> R^d before the CGF, "
+             "with t in R^d (idea 3, 2026-09-05). 0 = off, the plain CGF. NOTE "
+             "this makes the arm a learned Deep-Set-family encoder, not a "
+             "parameter-free statistic; report it as such.")
+    parser.add_argument("--x_embed_hidden", type=int, default=64)
+    parser.add_argument("--x_embed_depth", type=int, default=1)
+    parser.add_argument(
+        "--cgf_frozen", action="store_true",
+        help="Freeze the WHOLE pretrained encoder: t, the running-norm "
+             "statistics and the readout. Only PPO's heads learn -- the arm "
+             "that matches the ST's --st_frozen. Requires a checkpoint.")
+
+
+def resolve_t_init_max(args, tanh_default: float = 40.0) -> None:
+    """Fill a None --t_init_max: ``tanh_default`` in tanh mode, t_clamp in
+    clamp mode. Called AFTER resolve_cgf_geometry so a checkpoint's value
+    wins, and BEFORE resolve_common so run_config.json records the number
+    that ran. The extractor refuses t_init_max > t_clamp in clamp mode; this
+    is what keeps a bare ``--t_param clamp`` run legal."""
+    if args.t_init_max is None:
+        args.t_init_max = (float(tanh_default) if args.t_param != "clamp"
+                           else float(args.t_clamp))
+
+
+def resolve_cgf_geometry(args, parser, particle_dim: int = 1) -> None:
+    """CLI > checkpoint config > default for the geometry flags, then size
+    the readout if --match_params asks for it. Prints the resulting encoder
+    parameter total so every run's size is on record. ``particle_dim`` is the
+    problem's (Odd-Even: 1, a scalar state)."""
+    from_ckpt = {}
+    if args.pretrained_cgf_model_path:
+        import torch
+        checkpoint = torch.load(args.pretrained_cgf_model_path,
+                                map_location="cpu", weights_only=False)
+        config = checkpoint.get("config", {}) if isinstance(checkpoint, dict) else {}
+        from_ckpt = {k: config[k] for k in CGF_GEOMETRY_FLAGS if k in config}
+        for key, ckpt_value in from_ckpt.items():
+            given = getattr(args, key)
+            if given == parser.get_default(key):
+                setattr(args, key, ckpt_value)
+            elif given != ckpt_value:
+                parser.error(
+                    f"--{key} {given!r} disagrees with the checkpoint's {key}="
+                    f"{ckpt_value!r} ({args.pretrained_cgf_model_path}). Drop the "
+                    "flag to take the checkpoint's geometry.")
+        if args.match_params is not None:
+            parser.error("--match_params sizes a NEW readout; with a pretrained "
+                         "checkpoint the readout shape comes from the checkpoint.")
+    t_dim = args.x_embed_dim if args.x_embed_dim > 0 else particle_dim
+    raw_dim = cgf_raw_dim(args.num_cgf_features, t_dim, args.feature_mode)
+    fixed = non_readout_param_count(args.num_cgf_features, particle_dim,
+                                    args.feature_mode, args.t_frozen, args.feature_norm,
+                                    args.x_embed_dim, args.x_embed_hidden, args.x_embed_depth)
+    if args.match_params is not None:
+        if args.readout_depth <= 0:
+            args.readout_depth = 2
+        out_dim = (args.readout_dim if args.readout_dim is not None
+                   else WeightedCGFFeaturesExtractor.DEFAULT_READOUT_DIM)
+        args.readout_hidden, total = matched_readout_hidden(
+            args.match_params, raw_dim, args.readout_depth, out_dim, fixed)
+        print(f"CGF readout sized to match {args.match_params:,} params: "
+              f"hidden={args.readout_hidden} depth={args.readout_depth} "
+              f"-> encoder total {total:,} ({100 * (total - args.match_params) / args.match_params:+.2f}%)")
+    else:
+        out_dim = args.readout_dim if args.readout_dim is not None else (
+            WeightedCGFFeaturesExtractor.DEFAULT_READOUT_DIM if args.readout_depth > 0 else raw_dim)
+        total = fixed + readout_param_count(raw_dim, args.readout_hidden,
+                                            args.readout_depth, out_dim)
+        print(f"CGF encoder parameters: {total:,} (raw block {raw_dim}, "
+              f"readout hidden={args.readout_hidden} depth={args.readout_depth})")
+    args.encoder_params = int(total)
+    if from_ckpt:
+        print(f"CGF geometry taken from checkpoint: "
+              + ", ".join(f"{k}={getattr(args, k)!r}" for k in from_ckpt))
+
+
+
 def _cgf_add_arguments(parser: argparse.ArgumentParser, domain: Domain) -> None:
     d = domain.encoder_defaults.get("cgf", {})
     planar = domain.particle_dim >= 2

@@ -79,45 +79,23 @@ def _sys_path(*directories):
             sys.modules.pop(name, None)
 
 
-def _odd_even_sibling():
-    """The pipeline's OWN sibling loader, experiments/odd_even/_sibling.py.
-
-    Tests load the pipeline modules through the same loader the scripts use,
-    rather than through a private spec_from_file_location key. Two reasons:
-
-    * The module identities then match what a run really produces. A private
-      key gave the classes a module name no fresh process can import, and
-      SubprocVecEnv cloudpickles the env factory BY REFERENCE -- so the test
-      failed in a way the scripts did not, and would have masked the reverse.
-    * There is one definition of how the Gap 12 collision is avoided.
-    """
-    key = "_oe_pipe_sibling_loader"
-    cached = sys.modules.get(key)
-    if cached is not None:
-        return cached
-    path = _ODD_EVEN_DIR / "_sibling.py"
-    spec = importlib.util.spec_from_file_location(key, path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[key] = module
-    spec.loader.exec_module(module)
-    return module
+#: Names that were forwarding files in experiments/odd_even/ until change 5.3a (2026-09-12);
+#: the objects live in the package module, which is what these names now resolve to.
+_PACKAGE_NAMES = {"variants", "odd_even_belief_env", "st_feature_sentinel", "pretrained_encoder"}
 
 
 def _load(name, directory=_ODD_EVEN_DIR):
-    """Import experiments/<directory>/<name>.py under an unambiguous key.
+    """Import experiments/<directory>/<name>.py BY PATH under a unique key.
 
-    Odd-Even modules go through their own _sibling loader (see above).
-    Anything else -- e.g. eval_scripts/ -- is loaded by explicit path, with
-    the directory on sys.path only while the module executes so a
-    digit-leading sibling import inside it can resolve.
+    The two experiment directories hold same-named numbered scripts, so a flat-name
+    import is ambiguous (Gap 12); the directory is on sys.path only while the module
+    executes so a digit-leading sibling import inside it can resolve. The old Odd-Even
+    forwarding names resolve to the package module that holds the objects.
     """
+    if name in _PACKAGE_NAMES:
+        from set_transformer.rl.domains import odd_even
+        return odd_even
     directory = Path(directory)
-    if directory == _ODD_EVEN_DIR:
-        # The odd_even directory must be importable for `import _sibling`
-        # inside those modules; the loader itself never adds a SIBLING
-        # experiment directory.
-        with _sys_path(_ODD_EVEN_DIR):
-            return _odd_even_sibling().load(name)
     path = directory / f"{name}.py"
     if not path.exists():
         raise ModuleNotFoundError(f"{path} does not exist")

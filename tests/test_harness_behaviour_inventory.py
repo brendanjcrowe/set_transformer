@@ -19,7 +19,7 @@ step and the finetune fixes; this file covers what they left out:
 
 Loading conventions follow tests/test_ant_tag_shared_pieces_regression.py (Ant-Tag
 scripts under their flat names, on sys.path only while importing) and
-tests/test_odd_even_pipeline.py (Odd-Even scripts through their own _sibling loader).
+tests/test_odd_even_pipeline.py (Odd-Even scripts loaded by path under unique keys).
 """
 from __future__ import annotations
 
@@ -109,21 +109,27 @@ def ant_tag():
                 sys.modules.pop(name, None)
 
 
-def _odd_even_sibling():
-    key = "_inventory_oe_sibling_loader"
-    cached = sys.modules.get(key)
-    if cached is not None:
-        return cached
-    spec = importlib.util.spec_from_file_location(key, _ODD_EVEN_DIR / "_sibling.py")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[key] = module
-    spec.loader.exec_module(module)
-    return module
+#: Names that were forwarding files in experiments/odd_even/ until change 5.3a (2026-09-12);
+#: the objects live in the package module, which is what these names now resolve to.
+_PACKAGE_NAMES = {"variants", "odd_even_belief_env", "st_feature_sentinel", "pretrained_encoder"}
 
 
 def _load_odd_even(name):
+    """experiments/odd_even/<name>.py by path under a unique key (never by flat name: the
+    Ant-Tag directory holds same-named scripts); the old forwarding names resolve to the
+    package module."""
+    if name in _PACKAGE_NAMES:
+        from set_transformer.rl.domains import odd_even
+        return odd_even
+    key = f"_inventory_oe_{name}"
+    if key in sys.modules:
+        return sys.modules[key]
+    spec = importlib.util.spec_from_file_location(key, _ODD_EVEN_DIR / f"{name}.py")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[key] = module
     with _sys_path(_ODD_EVEN_DIR):
-        return _odd_even_sibling().load(name)
+        spec.loader.exec_module(module)
+    return module
 
 
 @pytest.fixture(scope="module")
@@ -786,10 +792,11 @@ def test_ant_tag_eval_refuses_a_particle_count_that_contradicts_the_checkpoint(
 
 
 def test_ant_tag_eval_env_is_the_domain_eval_env(ant_tag):
-    """`make_eval_env` (what the diagnostics call) and `Domain.make_env(training=False)`
-    (what the shared script calls) build the same stack: real visibility radius, no shaping,
+    """`rl.domains.ant_tag.make_eval_env` (what the diagnostics call) and
+    `Domain.make_env(training=False)` (what the shared script calls) build the same stack: real visibility radius, no shaping,
     Monitor on the env's own reward, seeded particle filter."""
-    from set_transformer.rl.domains.ant_tag import ANT_TAG, PFRewardShapingWrapper, resolve
+    from set_transformer.rl.domains.ant_tag import (
+        ANT_TAG, PFRewardShapingWrapper, make_eval_env, resolve)
 
     def _layers(env):
         names = []
@@ -799,10 +806,9 @@ def test_ant_tag_eval_env_is_the_domain_eval_env(ant_tag):
             cur = getattr(cur, "env", None)
         return names
 
-    module, _shared = _load_ant_tag_eval(ant_tag)
     variant = resolve("smart")
-    a = module.make_eval_env(16, [-2, -1], 5, env_id=variant.env_id,
-                             particle_filter_class=variant.particle_filter)()
+    a = make_eval_env(16, [-2, -1], 5, env_id=variant.env_id,
+                      particle_filter_class=variant.particle_filter)()
     b = ANT_TAG.make_env("smart", num_particles=16, particle_filter_class=variant.particle_filter,
                          seed=5, rank=0, monitor_dir=None, training=False,
                          options=ANT_TAG.evaluation.options(SimpleNamespace(no_mask=False)))()

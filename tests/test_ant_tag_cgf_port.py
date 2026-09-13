@@ -425,12 +425,10 @@ def test_checkpoint_geometry_is_taken_and_its_frame_checked(ant_tag, monkeypatch
                     ["--variant", "cdens_terminal", "--pretrained_cgf_model_path", str(ckpt)])
 
 
-def test_reload_helper_lives_in_the_package_and_the_odd_even_shim_re_exports_it():
+def test_reload_helper_lives_in_the_package():
+    """The reload-after-PPO helpers are package code (rl/pretrained_encoder.py), importable
+    without any experiment directory on sys.path. (The Odd-Even shim that re-exported them
+    was deleted in change 5.3a; every script imports the package.)"""
     from set_transformer.rl import pretrained_encoder as pkg
-    spec = importlib.util.spec_from_file_location(
-        "odd_even_pretrained_encoder_shim",
-        _ST_ROOT / "experiments" / "odd_even" / "pretrained_encoder.py")
-    shim = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(shim)
-    assert shim.reload_pretrained_cgf is pkg.reload_pretrained_cgf
-    assert shim.verify_matches_checkpoint is pkg.verify_matches_checkpoint
+    assert callable(pkg.reload_pretrained_cgf) and callable(pkg.verify_matches_checkpoint)
+    assert pkg.reload_pretrained_cgf.__module__ == "set_transformer.rl.pretrained_encoder"

@@ -20,7 +20,7 @@ undo it:
 
 Each test below would fail if one of those regressions came back. Modelled on
 tests/test_odd_even_pipeline.py: modules are loaded through the pipeline's
-own _sibling loader, never by flat-name import (Gap 12 collision).
+by path under a unique key, never by flat-name import (Gap 12 collision).
 """
 
 import importlib.util
@@ -61,21 +61,19 @@ def _sys_path(*directories):
             sys.modules.pop(name, None)
 
 
-def _odd_even_sibling():
-    key = "_oe_pipe_sibling_loader"
-    cached = sys.modules.get(key)
-    if cached is not None:
-        return cached
-    spec = importlib.util.spec_from_file_location(key, _ODD_EVEN_DIR / "_sibling.py")
+def _load(name):
+    """experiments/odd_even/<name>.py by path under a unique key (the Ant-Tag directory
+    holds a same-named script, so never by flat name), with the directory on sys.path
+    only while it executes."""
+    key = f"_st_fix_{name}"
+    if key in sys.modules:
+        return sys.modules[key]
+    spec = importlib.util.spec_from_file_location(key, _ODD_EVEN_DIR / f"{name}.py")
     module = importlib.util.module_from_spec(spec)
     sys.modules[key] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-def _load(name):
     with _sys_path(_ODD_EVEN_DIR):
-        return _odd_even_sibling().load(name)
+        spec.loader.exec_module(module)
+    return module
 
 
 @pytest.fixture(scope="module")

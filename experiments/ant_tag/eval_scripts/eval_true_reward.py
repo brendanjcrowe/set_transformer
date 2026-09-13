@@ -21,7 +21,6 @@ for _path in (_REPO_ROOT, _ANT_TAG_DIR):
 
 import pdomains  # noqa: F401,E402 - registers pdomains-ant-tag-*
 
-from set_transformer.rl.domains.ant_tag import make_eval_env  # noqa: E402,F401
 from set_transformer.rl.eval_true_reward import main as _shared_main  # noqa: E402
 
 

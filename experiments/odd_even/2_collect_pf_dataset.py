@@ -50,25 +50,15 @@ from pathlib import Path
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
-# This directory too, so `import _sibling` works when a test loads this file
-# by path rather than running it as a script (where it is sys.path[0]).
-# ONLY this directory -- never a sibling experiment directory (Gap 12).
-_THIS_DIR = Path(__file__).resolve().parent
-if str(_THIS_DIR) not in sys.path:
-    sys.path.insert(0, str(_THIS_DIR))
 
 import numpy as np
 from tqdm import tqdm
 
 import pdomains  # noqa: F401,E402 - registers the pdomains-odd-even-* envs
-# `variants` is loaded BY PATH, not as a flat name: experiments/ant_tag/ has a
-# variants.py too, and sys.modules is process-wide, so a plain
-# `import variants` returns whichever one was imported first anywhere in the
-# process. See _sibling.py -- this was measured happening in the test suite.
-import _sibling  # noqa: E402
-variants = _sibling.load("variants")
-make_odd_even_belief_env = _sibling.load(
-    "odd_even_belief_env").make_odd_even_belief_env
+# The registry and the belief env live in the package (change 5.3a retired the by-path
+# sibling loader that used to keep this `variants` apart from experiments/ant_tag/'s).
+from set_transformer.rl.domains import odd_even as variants  # noqa: E402
+from set_transformer.rl.domains.odd_even import make_odd_even_belief_env  # noqa: E402
 from set_transformer.rl.run_records import git_provenance as _git_provenance  # noqa: E402
 
 #: Steps below this still carry a genuinely BROAD belief. Measured at n=50:

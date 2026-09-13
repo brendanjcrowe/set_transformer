@@ -78,18 +78,6 @@ def _sys_path(*directories):
         sys.path[:] = saved
 
 
-def _odd_even_sibling():
-    key = "_train_harness_oe_sibling_loader"
-    cached = sys.modules.get(key)
-    if cached is not None:
-        return cached
-    spec = importlib.util.spec_from_file_location(key, _ODD_EVEN_DIR / "_sibling.py")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[key] = module
-    spec.loader.exec_module(module)
-    return module
-
-
 # --------------------------------------------------------------------------
 # Helpers
 # --------------------------------------------------------------------------
@@ -213,15 +201,6 @@ def test_odd_even_domain_attaches_the_sentinel_to_the_st_arm_only():
     assert len(st_extra) == 1 and isinstance(st_extra[0], OddEvenSTFeatureSentinel)
     assert odd_even_domain.ODD_EVEN.encoder_callbacks("cgf") == []
     assert ant_tag_domain.ANT_TAG.encoder_callbacks("st") == []
-
-
-def test_sentinel_forwarding_file_hands_back_the_package_objects():
-    with _sys_path(_ODD_EVEN_DIR):
-        sentinel = _odd_even_sibling().load("st_feature_sentinel")
-    from set_transformer.rl.domains import odd_even as oe
-    assert sentinel.OddEvenSTFeatureSentinel is oe.OddEvenSTFeatureSentinel
-    assert sentinel.relative_feature_spread is oe.relative_feature_spread
-    assert sentinel.COLLAPSE_RELATIVE_SPREAD == oe.COLLAPSE_RELATIVE_SPREAD == 5e-3
 
 
 def test_ant_tag_make_schedules_matches_the_adapter():

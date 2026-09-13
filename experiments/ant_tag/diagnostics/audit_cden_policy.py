@@ -22,27 +22,24 @@ from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _ANT_TAG_DIR = Path(__file__).resolve().parents[1]
 _EVAL_DIR = _ANT_TAG_DIR / "eval_scripts"
-for path in (_REPO_ROOT, _ANT_TAG_DIR, _EVAL_DIR):
+for path in (_REPO_ROOT, _ANT_TAG_DIR):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
 import pdomains  # noqa: E402,F401 - register environments
 import variants  # noqa: E402 - env/filter/cap registry
+from set_transformer.rl.domains.ant_tag import make_eval_env  # noqa: E402 - the eval env stack
 from set_transformer.rl.particle_filters.ant_tag import (  # noqa: E402
     CounterweightedDenAntTagParticleFilter,
 )
 
 
 def _build_env(kind, env_id, vecnormalize_path, num_particles, seed):
-    # All three arms share the same dict-obs eval env; importing the arm's
-    # own eval module is what makes SB3 able to unpickle that arm's feature
-    # extractor class out of the saved policy_kwargs.
-    module = importlib.import_module({
-        "cgf": "eval_true_reward_cgf",
-        "gaussian": "eval_true_reward_gaussian",
-        "st": "eval_true_reward_st",
-    }[kind])
-    env_fn = module.make_eval_env(
+    # All three arms share the same dict-obs eval env; importing the arm's own
+    # training script is what makes SB3 able to unpickle that arm's feature
+    # extractor class out of the saved policy_kwargs when the zip names it.
+    importlib.import_module(f"4_train_rl_{kind}")
+    env_fn = make_eval_env(
         num_particles=num_particles,
         obs_mask_indices=[-2, -1],
         seed=seed,

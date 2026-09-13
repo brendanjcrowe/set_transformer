@@ -979,7 +979,7 @@ def test_odd_even_variants_registry_is_consistent():
     unreachable-by-default-wrong. Odd-Even needs the same, keyed on
     n_dist_size and obs_per_step rather than visibility curricula.
     """
-    variants = _load_experiment_module(_ODD_EVEN_DIR, "variants")
+    from set_transformer.rl.domains import odd_even as variants   # the registry (change 5.3a)
     assert hasattr(variants, "VARIANTS") and variants.VARIANTS
     for name in variants.VARIANTS:
         variant = variants.resolve(name)

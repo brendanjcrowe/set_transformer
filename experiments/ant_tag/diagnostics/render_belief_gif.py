@@ -38,14 +38,14 @@ from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize  # noqa: 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _ANT_TAG_DIR = Path(__file__).resolve().parents[1]
 _DIAG = Path(__file__).resolve().parent
-for p in (_REPO_ROOT, _ANT_TAG_DIR, _ANT_TAG_DIR / "eval_scripts"):
+for p in (_REPO_ROOT, _ANT_TAG_DIR):
     if str(p) not in sys.path:
         sys.path.insert(0, str(p))
 
 import pdomains  # noqa: E402,F401
 import variants  # noqa: E402
 importlib.import_module("4_train_rl_st")          # registers the ST extractor class for PPO.load
-_eval = importlib.import_module("eval_true_reward_cgf")
+from set_transformer.rl.domains.ant_tag import make_eval_env  # noqa: E402 - the eval env stack
 
 
 def _find_pf_wrapper(env):
@@ -64,7 +64,7 @@ def _moments(P, W):
 
 
 def record(args, variant, cap):
-    env_fn = _eval.make_eval_env(num_particles=args.num_particles, obs_mask_indices=[-2, -1], seed=args.seed,
+    env_fn = make_eval_env(num_particles=args.num_particles, obs_mask_indices=[-2, -1], seed=args.seed,
                                  env_id=variant.env_id, particle_filter_class=variant.particle_filter)
     dummy = DummyVecEnv([env_fn])
     vecnorm = VecNormalize.load(args.vecnormalize_path, dummy); vecnorm.training = False; vecnorm.norm_reward = False

@@ -54,10 +54,8 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
 import pdomains  # noqa: F401 - registers the pdomains-odd-even-* envs
-import _sibling  # noqa: E402 - siblings by path, never flat name (Gap 12)
-variants = _sibling.load("variants")
-make_odd_even_belief_env = _sibling.load(
-    "odd_even_belief_env").make_odd_even_belief_env
+from set_transformer.rl.domains import odd_even as variants  # noqa: E402 - the registry
+from set_transformer.rl.domains.odd_even import make_odd_even_belief_env  # noqa: E402
 
 BAR_COLOUR = "#3b6fb6"
 GUESS_COLOUR = "#ff7f0e"
