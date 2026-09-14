@@ -108,6 +108,20 @@ def build_parser(domain: Domain, *, prog: str | None = None,
                    help="Stop once this many belief snapshots are collected.")
     g.add_argument("--no_rebalance", action="store_true",
                    help="Skip rebalancing and keep the raw visit distribution.")
+    b = parser.add_argument_group("behaviour (plan 10.8b, 2026-09-14)")
+    b.add_argument("--behaviour", choices=("scripted", "policy"), default="scripted",
+                   help="scripted (default): the domain's own collection behaviour. policy: a trained "
+                        "agent (--policy_path) acts in the SAME belief env; the domain still resets "
+                        "the episode and labels the rows -- the DAgger step 'the beliefs the trained "
+                        "policy visits'.")
+    b.add_argument("--policy_path", type=str, default=None, help="The saved agent (<encoder>_agent.zip).")
+    b.add_argument("--vecnormalize_path", type=str, default=None,
+                   help="The run's vecnormalize.pkl; default: the one beside the agent zip if it exists. "
+                        "The policy sees the normalised observation it was trained on; the rows stay raw.")
+    b.add_argument("--deterministic", action="store_true",
+                   help="Act with the policy's mean action. Default: sample (the record's DAgger kept the "
+                        "exploration noise).")
+    b.add_argument("--policy_device", type=str, default="cpu")
     p = parser.add_argument_group("placement")
     p.add_argument("--output_file", "--output", dest="output_file", type=str, default=None,
                    help="Where to write the .npz. Default: "
@@ -121,6 +135,70 @@ def build_parser(domain: Domain, *, prog: str | None = None,
                         "submodule, else <checkout>/runs.")
     collection.add_arguments(parser)
     return parser
+
+
+# ---------------------------------------------------------------------------
+# The policy behaviour (plan 10.8b): a trained agent acts, the domain keeps resetting and labelling
+# ---------------------------------------------------------------------------
+
+def resolve_policy_arguments(parser, args, domain: Domain) -> None:
+    """Refuse the contradictions of ``--behaviour policy`` before an env is built: a path is
+    needed, the agent's particle count must be this collection's, and the VecNormalize file
+    defaults to the one beside the zip."""
+    if args.behaviour != "policy":
+        if args.policy_path or args.vecnormalize_path:
+            parser.error("--policy_path / --vecnormalize_path belong to --behaviour policy")
+        return
+    if not args.policy_path:
+        parser.error("--behaviour policy needs --policy_path <agent.zip>")
+    if not os.path.isfile(args.policy_path):
+        parser.error(f"--policy_path {args.policy_path} does not exist")
+    from set_transformer.rl.eval_true_reward import checkpoint_num_particles   # noqa: PLC0415
+    trained = checkpoint_num_particles(args.policy_path)
+    if trained is not None:
+        if args.num_particles is None:
+            args.num_particles = int(trained)
+        elif int(args.num_particles) != int(trained):
+            parser.error(f"--num_particles {args.num_particles} contradicts the agent, trained with "
+                         f"{trained} particles; omit the flag or match it")
+    if args.vecnormalize_path is None:
+        candidate = run_records.resume_vecnormalize_path(args.policy_path)
+        if candidate and os.path.isfile(candidate):
+            args.vecnormalize_path = candidate
+            print(f"VecNormalize: {candidate} (beside the agent)")
+        else:
+            print("VecNormalize: none found beside the agent; the policy sees RAW observations. If "
+                  "training normalised them this rollout is off-distribution (pass --vecnormalize_path).")
+    elif not os.path.isfile(args.vecnormalize_path):
+        parser.error(f"--vecnormalize_path {args.vecnormalize_path} does not exist")
+
+
+def make_policy_actor(domain: Domain, args):
+    """``act(obs) -> action`` from the saved agent: the raw Dict observation of the collection env,
+    normalised as the training run normalised it (VecNormalize's statistics on the ``obs`` key, no
+    venv needed), one ``predict`` call. Built once per collection."""
+    import pickle   # noqa: PLC0415
+    from stable_baselines3 import PPO   # noqa: PLC0415
+    from set_transformer.rl.eval_true_reward import _make_extractor_classes_importable   # noqa: PLC0415
+    _make_extractor_classes_importable(domain)
+    model = PPO.load(args.policy_path, device=args.policy_device)
+    normalizer = None
+    if args.vecnormalize_path:
+        with open(args.vecnormalize_path, "rb") as f:
+            normalizer = pickle.load(f)
+        normalizer.training = False
+    deterministic = bool(args.deterministic)
+
+    def act(obs):
+        batched = {k: np.asarray(v)[None] for k, v in obs.items()}
+        if normalizer is not None:
+            batched = normalizer.normalize_obs(batched)
+        action, _ = model.predict(batched, deterministic=deterministic)
+        return action[0]
+
+    print(f"Behaviour: policy {args.policy_path} ({'deterministic' if deterministic else 'stochastic'}; "
+          f"normalised obs: {'yes' if normalizer is not None else 'no'})")
+    return act
 
 
 # ---------------------------------------------------------------------------
@@ -145,6 +223,7 @@ def collect_arrays(domain: Domain, args, options: dict, *, progress: bool = True
     state = collection.prepare(args, options)
     env = collection.make_env(args, options, state)
     centre = collection.particle_centre(args, options)
+    policy_act = make_policy_actor(domain, args) if getattr(args, "behaviour", "scripted") == "policy" else None
 
     all_particles: list[np.ndarray] = []
     all_weights: list[np.ndarray] = []
@@ -174,6 +253,8 @@ def collect_arrays(domain: Domain, args, options: dict, *, progress: bool = True
     bar = tqdm(episodes, desc=collection.progress_desc) if progress else episodes
     for episode in bar:
         reset_kwargs, act = collection.begin_episode(args, options, state, env, episode)
+        if policy_act is not None:
+            act = policy_act          # the domain still resets (seeds, task size) and labels; the agent acts
         obs, _info = env.reset(**reset_kwargs)
         _record(obs, 0)   # the prior / b0 is a legitimate belief state
 
@@ -224,6 +305,12 @@ def build_metadata(domain: Domain, args, options: dict, particles, weights, step
         "particle_scale": collection.particle_scale(args, options),
     }
     metadata.update(collection.metadata_extras(args, options, particles, weights, steps))
+    metadata["behaviour"] = getattr(args, "behaviour", "scripted")
+    if metadata["behaviour"] == "policy":
+        metadata["policy"] = {"policy_path": os.path.abspath(args.policy_path),
+                              "vecnormalize_path": (os.path.abspath(args.vecnormalize_path)
+                                                    if args.vecnormalize_path else None),
+                              "deterministic": bool(args.deterministic)}
     metadata["args"] = vars(args) if record_args else None
     metadata["command"] = command
     metadata["threads"] = run_records.thread_settings()
@@ -282,6 +369,7 @@ def main(argv: Sequence[str] | None = None, *, domain: Domain | str | None = Non
         if required not in options:
             raise RuntimeError(f"domain {domain.name!r}'s collection.resolve_arguments returned "
                                f"no {required!r}")
+    resolve_policy_arguments(parser, args, domain)
     for required in ("timesteps", "num_particles"):
         if getattr(args, required, None) is None:
             parser.error(f"--{required} is required for {domain.name} (the domain resolved no default)")

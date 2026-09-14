@@ -515,7 +515,7 @@ def test_collect_npz_contract(collect_smart):
         meta = json.loads(str(z["metadata"]))
     # 7.5 added command + threads (the run records' provenance) to the metadata.
     assert set(meta) == {"variant", "env_id", "particle_filter_class", "num_particles", "dim_particles",
-                         "particle_scale", "args", "command", "threads", "git"}
+                         "particle_scale", "args", "command", "threads", "git", "behaviour"}
     assert meta["variant"] == "smart" and meta["env_id"] == "pdomains-ant-tag-smart-v0"
     assert meta["particle_filter_class"] == "SmartAntTagParticleFilter"
     assert (meta["num_particles"], meta["dim_particles"], meta["particle_scale"]) == (100, 2, SCALE)

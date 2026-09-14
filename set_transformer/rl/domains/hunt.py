@@ -720,7 +720,10 @@ class TaskData:
                 raise ValueError(f"{path} is not a hunt dataset: missing arrays {missing} "
                                  "(collect it with python -m set_transformer.rl.collect --domain hunt)")
             self.metadata = json.loads(str(z["metadata"])) if "metadata" in z.files else {}
-            arrays = {k: np.asarray(z[k]) for k in ("particles", "weights", "agent", *self.LABELS)}
+            # 10.8a: an imported / merged file marks every row's source (0 = scripted collection,
+            # r = the beliefs the round r-1 policy visited); the report then splits its metrics by it
+            optional = [k for k in ("source_round",) if k in z.files]
+            arrays = {k: np.asarray(z[k]) for k in ("particles", "weights", "agent", *self.LABELS, *optional)}
         n = len(arrays["particles"])
         n_val = int(val_frac * n)
         if n_val < 1 or n - n_val < 1:
@@ -979,11 +982,30 @@ def _task_run(args, ctx: PretrainContext) -> PretrainResult:
             chunks.append(task_metrics(model(TaskData.obs(data.val, s)), b, task, n_clusters,
                                        data.particle_scale))
     metrics = {k: float(np.mean([c[k] for c in chunks])) for k in chunks[0]}
+    # 10.8a: the same metrics per source of the validation rows (a DAgger file mixes the scripted
+    # collection with the states each round's policy visited; the record misread round 1 because
+    # its validation set changed composition between rounds)
+    by_source = {}
+    if "source_round" in data.val:
+        src = data.val["source_round"].cpu().numpy()
+        for r in np.unique(src):
+            rows = np.flatnonzero(src == r)
+            parts = []
+            with torch.no_grad():
+                for i in range(0, len(rows), 4096):
+                    idx = torch.as_tensor(rows[i:i + 4096], device=data.device)
+                    b = {k: v[idx] for k, v in data.val.items()}
+                    parts.append(task_metrics(model(TaskData.obs(data.val, idx)), b, task, n_clusters,
+                                              data.particle_scale))
+            by_source[str(int(r))] = {"rows": int(len(rows)),
+                                      **{k: float(np.mean([c[k] for c in parts])) for k in parts[0]}}
+        for r, m in by_source.items():
+            print(f"  val source {r}: rows={m['rows']}  " + "  ".join(f"{k}={v:.4f}" for k, v in m.items() if k != "rows"))
     save_task_checkpoint(model, checkpoint_dir / "checkpoint_best.pt", args, best_epoch,
                          {"loss": best, **metrics}, geometry, task)
     (run_dir / "metrics.json").write_text(json.dumps(
         dict(best_val=best, best_epoch=best_epoch, epochs=len(hist), minutes=(time.time() - t0) / 60,
-             val_metrics=metrics, history=hist), indent=2))
+             val_metrics=metrics, val_metrics_by_source=by_source, history=hist), indent=2))
     print(f"[{args.variant}/task/{args.encoder}] best_val={best:.5f} (epoch {best_epoch})  "
           + "  ".join(f"{k}={v:.4f}" for k, v in metrics.items())
           + f"  ({(time.time() - t0) / 60:.1f} min) -> {checkpoint_dir}", flush=True)
