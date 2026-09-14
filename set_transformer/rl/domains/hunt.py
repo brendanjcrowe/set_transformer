@@ -54,6 +54,7 @@ from __future__ import annotations
 import itertools
 import json
 import os
+from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -830,6 +831,91 @@ TASK_OBJECTIVE = Objective(
 )
 
 
+# -- task_nearest: Cluster-Hunt's campaign task objective (batch 10.10, 2026-09-14; plan 10.10) --------
+#
+# Predict the offset to the NEAREST LIVE cluster only: K = 1, the least-mass shape (2 numbers, squared
+# error, identify metric = nearest live centre). The label is computed here from the batch's `centers` /
+# `alive` (agent-relative, scaled), so no collector or file change; continuous except at a tie for
+# first place (broken by the lowest cluster index); decision-shaped (the greedy tour's next waypoint).
+# Cost, written down: the encoder is asked for one cluster at a time and may not carry the layout for
+# the later stops -- the comparison against reconstruction, which keeps the whole cloud, is the
+# experiment. `task` (the record's matched-slot loss) stays as the record-reproducing condition;
+# `task_sorted` (slots ordered by distance) was rejected: discontinuous at every rank tie.
+
+def nearest_live_offset(centers: torch.Tensor, alive: torch.Tensor):
+    """``(offset [B, 2], index [B], has_live [B])``: the closest live centre per row (ties -> the lowest
+    index), and which rows have a live cluster at all (the belief recorded after the last collection
+    has none; those rows are excluded from the loss and the metrics)."""
+    d = torch.linalg.norm(centers, dim=-1).masked_fill(alive < 0.5, float("inf"))
+    index = d.argmin(1)
+    has_live = alive.sum(1) > 0
+    offset = centers[torch.arange(len(centers), device=centers.device), index]
+    return offset, index, has_live
+
+
+def task_nearest_loss(y: torch.Tensor, batch: dict) -> torch.Tensor:
+    offset, _, live = nearest_live_offset(batch["centers"], batch["alive"])
+    if not bool(live.any()):
+        return (y * 0.0).sum()
+    return F.mse_loss(y[live], offset[live])
+
+
+@torch.no_grad()
+def task_nearest_metrics(y: torch.Tensor, batch: dict, scale: float) -> dict:
+    """The pick-a-target metrics against the nearest live centre, over the rows that have one."""
+    offset, index, live = nearest_live_offset(batch["centers"], batch["alive"])
+    y, offset, index = y[live], offset[live], index[live]
+    centers, alive = batch["centers"][live], batch["alive"][live]
+    if len(y) == 0:
+        return {"loc_mae": float("nan"), "identify_acc": float("nan"), "within_1.0": float("nan")}
+    err = scale * torch.linalg.norm(y - offset, dim=-1)
+    d = torch.linalg.norm(centers - y[:, None, :], dim=-1).masked_fill(alive < 0.5, float("inf"))
+    return {"loc_mae": float(err.mean()),
+            "identify_acc": float((d.argmin(1) == index).float().mean()),
+            "within_1.0": float((err < 1.0).float().mean())}
+
+
+def _task_nearest_resolve_arguments(parser, args, domain, encoder) -> None:
+    _task_resolve_arguments(parser, args, domain, encoder)
+
+
+def _task_nearest_prepare(parser, args, domain, encoder, device):
+    data = _task_prepare(parser, args, domain, encoder, device)
+    if resolve(args.variant).task != "collect_all":
+        parser.error(f"task_nearest is Cluster-Hunt's objective (collect_all variants); on {args.variant!r} the "
+                     "target is not the nearest cluster -- use --objective task")
+    return data
+
+
+def _task_nearest_run_name(args, now: datetime) -> str:
+    return f"{now.strftime('%Y%m%d_%H%M%S')}_task_nearest_{args.encoder}_seed{args.seed}"
+
+
+def _task_nearest_run(args, ctx: PretrainContext) -> PretrainResult:
+    return run_task_training(
+        args, ctx, data=ctx.data, obs_dim=2, out_dim=2,
+        loss_fn=task_nearest_loss,
+        metrics_fn=lambda y, batch: task_nearest_metrics(y, batch, ctx.data.particle_scale),
+        checkpoint_config={"objective": "task_nearest", "task": "nearest", "variant": args.variant,
+                           "pretraining": "set_transformer.rl.pretrain --domain hunt --objective task_nearest"},
+        label=f"{args.variant}/task_nearest/{ctx.encoder.name}")
+
+
+TASK_NEAREST_OBJECTIVE = Objective(
+    name="task_nearest",
+    description="encoder + 3-layer head -> the offset to the NEAREST LIVE cluster (2 numbers, MSE; the "
+                "greedy tour's next waypoint), computed from the file's centres / alive flags; Cluster-Hunt "
+                "only (the campaign's task condition there; `task` is the record's matched-slot loss)",
+    add_arguments=_task_add_arguments,
+    run=_task_nearest_run,
+    run_name=_task_nearest_run_name,
+    locate=_task_locate,
+    resolve_arguments=_task_nearest_resolve_arguments,
+    prepare=_task_nearest_prepare,
+    default_experiment_name=lambda encoder_name: f"{encoder_name}_task_nearest_pretrain",
+)
+
+
 # ---------------------------------------------------------------------------
 # Encoder defaults
 # ---------------------------------------------------------------------------
@@ -898,7 +984,8 @@ HUNT = Domain(
     # The record's supervised objective; `rl/pretrain.py --domain hunt` runs it when --objective
     # is omitted. The generic reconstruction (Chamfer + --ignore_weights = the record's control)
     # needs no declaration.
-    pretraining=Pretraining(objectives={"task": TASK_OBJECTIVE}, default_objective="task"),
+    pretraining=Pretraining(objectives={"task": TASK_OBJECTIVE, "task_nearest": TASK_NEAREST_OBJECTIVE},
+                            default_objective="task"),
     # Step 2: the record's behaviour policy, labels per snapshot, no rebalancing (batch 9.2).
     collection=HUNT_COLLECTION,
 )

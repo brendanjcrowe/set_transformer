@@ -72,7 +72,7 @@ def test_collection_record_and_defaults():
     a = collect.build_parser(HUNT).parse_args([])
     assert (a.seed, a.num_episodes, a.variant, a.pursuit_frac) == (7, 4000, "least_mass", 0.6)
     assert HUNT.pretraining.default_objective == "task"
-    assert sorted(pretrain.objectives_for(HUNT)) == ["reconstruction", "task"]
+    assert sorted(pretrain.objectives_for(HUNT)) == ["reconstruction", "task", "task_nearest"]   # 10.10
 
 
 def test_snapshot_extras_are_stacked_aligned_and_truncated():
