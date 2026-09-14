@@ -398,6 +398,32 @@ def _leaf_matches(name: str, seed: "int | None", run_tag: "str | None") -> bool:
     return True
 
 
+def run_folders(domain: str, variant: str, kind: str, encoder: str, *,
+                seed: "int | None" = None, run_tag: "str | None" = None,
+                objective: "str | None" = None,
+                root: "str | os.PathLike | None" = None) -> "list[Path]":
+    """The run folders of one cell, newest first, whatever their state (batch 10.1, 2026-09-14).
+
+    ``<root>/<domain>/<variant>/<kind>/<encoder>[/<objective>]/<timestamp>_seed<n>[_<run_tag>]/``
+    for ``kind`` ``"rl"`` (no objective) or ``"pretrain"`` (the objective names the folder), kept
+    when the leaf carries ``seed`` and ``run_tag`` by the rule :func:`find_rl_run` and
+    :func:`latest_pretrain_checkpoint` apply (``None`` = no constraint). Unlike those two this
+    does NOT read status files: it is what a driver uses to tell "still being written" from
+    "never started" (``run_config.json`` present, ``run_status.json`` absent, recent writes).
+    Read-only.
+    """
+    root = output_root() if root is None else Path(root)
+    folder = Path(root) / domain / variant / kind / encoder
+    if kind == "pretrain":
+        if objective is None:
+            raise ValueError("run_folders: kind='pretrain' needs the objective (it names the folder)")
+        folder = folder / objective
+    if not folder.is_dir():
+        return []
+    return [d for d in sorted((d for d in folder.iterdir() if d.is_dir()), key=lambda d: d.name, reverse=True)
+            if _leaf_matches(d.name, seed, run_tag)]
+
+
 def latest_pretrain_checkpoint(domain: str, variant: str, encoder: str, objective: "str | None" = None, *,
                                root: "str | os.PathLike | None" = None,
                                experiment_name: "str | None" = None,

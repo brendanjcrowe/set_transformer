@@ -330,6 +330,39 @@ def test_ant_tag_st_takes_geometry_off_a_checkpoint_and_refuses_disagreement(
                        "--num_inds", "32"])
 
 
+def test_failure_before_learn_leaves_a_failed_status_file(monkeypatch, tmp_path, checkpoints):
+    """Batch 10.1 (PITFALLS.md section 13 item 2). The exact failure of the 2026-09-13 smoke: a
+    checkpoint pretrained WITH the weight channel, a run asking for the ST without it. The
+    extractor refuses inside PPO construction, after run_config.json exists and before learn()
+    -- previously a folder with a config and no status, which the sweep driver's in-progress
+    check took for a live run. Now run_status.json says failed, 0 steps, and names the error."""
+    monkeypatch.setattr(run_records, "git_provenance", lambda: {})
+    monkeypatch.setattr(run_records, "tee_stdout_stderr", lambda path: None)
+    from set_transformer.rl.run_records import read_run_status
+    model_path = tmp_path / "models" / "st_agent.zip"
+    argv = ["--variant", "smart", "--total_timesteps", "128", "--n_envs", "1", "--ppo_n_steps", "64",
+            "--batch_size", "32", "--n_epochs", "1", "--num_particles", "16", "--device", "cpu",
+            "--eval_freq", "1000000000", "--n_eval_episodes", "1",
+            "--pretrained_path", checkpoints["ant_tag_st"], "--frozen", "--no_st_weight_channel",
+            "--output_root", str(tmp_path / "root"), "--log_dir", str(tmp_path / "logs") + "/",
+            "--model_save_path", str(model_path)]
+    with pytest.raises(RuntimeError, match="weighted_particles"):
+        train_mod.main(argv, domain="ant_tag", encoder="st")
+    status = read_run_status(str(model_path))
+    assert status is not None and status["status"] == "failed" and status["timesteps"] == 0
+    assert status["total_timesteps"] == 128 and "weighted_particles" in status["error"]
+    assert not model_path.exists()                       # no zip was saved: not a result of any kind
+    assert list((tmp_path / "root").glob("ant_tag/smart/rl/st/*/run_config.json"))
+    # a completed run is untouched by the guard: one status file, written by train() itself
+    ok_path = tmp_path / "ok" / "gaussian_agent.zip"
+    train_mod.main(["--variant", "oe10", "--total_timesteps", "64", "--n_envs", "1", "--ppo_n_steps", "32",
+                    "--batch_size", "16", "--n_epochs", "1", "--num_particles", "16", "--device", "cpu",
+                    "--eval_freq", "1000000000", "--n_eval_episodes", "1",
+                    "--output_root", str(tmp_path / "root"), "--log_dir", str(tmp_path / "logs2") + "/",
+                    "--model_save_path", str(ok_path)], domain="odd_even", encoder="gaussian")
+    assert read_run_status(str(ok_path))["status"] == "completed"
+
+
 # --------------------------------------------------------------------------
 # 4. The run directory: root-level layout and the legacy switch
 # --------------------------------------------------------------------------

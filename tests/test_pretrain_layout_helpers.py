@@ -204,3 +204,33 @@ def test_find_rl_run_returns_the_completed_cell_and_skips_failed_or_incomplete_o
     assert run_records.find_rl_run("odd_even", "oe50_short", "cgf", 0, "w1_cgf_K_fixed_e2e", root=root) == again
     # nothing was written or renamed under the root by the lookups
     assert sorted(p.name for p in (root / "odd_even" / "oe50_short" / "rl" / "cgf").iterdir())[0] == done.name
+
+
+def test_run_folders_lists_every_state_newest_first_by_the_leaf_rule(tmp_path):
+    """Batch 10.1: the public finder behind the driver's in-progress check. Unlike find_rl_run it
+    returns crashed, killed and incomplete folders too -- that is its point -- and it applies the
+    same seed / tag rule (a `_seed1` never matches `_seed10`)."""
+    root = tmp_path
+    tag = "w1_cgf_K_fixed_e2e"
+    assert run_records.run_folders("odd_even", "oe50_short", "rl", "cgf", seed=0, run_tag=tag, root=root) == []
+    done = _fake_rl_run(root, "cgf", f"20260913_100000_seed0_{tag}", status="completed")
+    _fake_rl_run(root, "cgf", "20260913_110000_seed0_w1_cgf_Kgrad_fixed_e2e", status="completed")   # other tag
+    _fake_rl_run(root, "cgf", f"20260913_120000_seed1_{tag}", status="completed")                    # other seed
+    _fake_rl_run(root, "cgf", f"20260913_125000_seed10_{tag}", status="completed")                   # seed10 != seed1
+    failed = _fake_rl_run(root, "cgf", f"20260913_130000_seed0_{tag}", status="failed")
+    killed = _fake_rl_run(root, "cgf", f"20260913_140000_seed0_{tag}", status=None)
+    found = run_records.run_folders("odd_even", "oe50_short", "rl", "cgf", seed=0, run_tag=tag, root=root)
+    assert found == [killed, failed, done]                                    # newest first, every state
+    assert len(run_records.run_folders("odd_even", "oe50_short", "rl", "cgf", seed=1, run_tag=tag, root=root)) == 1
+    assert len(run_records.run_folders("odd_even", "oe50_short", "rl", "cgf", seed=10, run_tag=tag, root=root)) == 1
+    assert len(run_records.run_folders("odd_even", "oe50_short", "rl", "cgf", seed=0, root=root)) == 4  # any tag
+    assert run_records.run_folders("odd_even", "oe50_short", "rl", "st", seed=0, run_tag=tag, root=root) == []
+    # the same rule as find_rl_run: the completed one it returns is in our list
+    assert run_records.find_rl_run("odd_even", "oe50_short", "cgf", 0, tag, root=root) in found
+    # pretraining folders live under the objective
+    pre = _touch(root / "odd_even" / "oe50_short" / "pretrain" / "cgf" / "belief_kl"
+                 / "20260913_000000_seed0_w1_cgf_K_fixed_belief_kl" / "run_config.json").parent
+    assert run_records.run_folders("odd_even", "oe50_short", "pretrain", "cgf", seed=0,
+                                   run_tag="w1_cgf_K_fixed_belief_kl", objective="belief_kl", root=root) == [pre]
+    with pytest.raises(ValueError, match="needs the objective"):
+        run_records.run_folders("odd_even", "oe50_short", "pretrain", "cgf", seed=0, root=root)

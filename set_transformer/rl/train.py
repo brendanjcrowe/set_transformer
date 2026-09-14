@@ -660,6 +660,31 @@ def main(argv: Sequence[str] | None = None, *, domain: Domain | str | None = Non
         print("--dry_run: run_config.json written; not training.")
         return None
 
+    # From here the run folder exists with its run_config.json. `train()` writes run_status.json
+    # only around `learn()`; an exception before that point (env construction, PPO / feature
+    # extractor construction, the pretrained-checkpoint reload and its geometry check) would
+    # leave a folder with a config and NO status -- which every reader that keys on "recent
+    # write, no status" (the sweep driver's in-progress check) takes for a live run
+    # (PITFALLS.md section 13 item 2; batch 10.1, 2026-09-14). Record the failure once, then
+    # re-raise. A failure inside `learn()` is already recorded by `train()`'s own finally:
+    # block, so the guard below keeps this from writing a second status over it.
+    try:
+        return _train_from_args(domain, args, encoder, start, net_arch, particle_filter_class,
+                                env_options, log_dir, model_save_path)
+    except BaseException as exc:      # noqa: B902 - recorded, then re-raised
+        status_path = os.path.join(os.path.dirname(model_save_path), run_records.RUN_STATUS_FILENAME)
+        if not os.path.exists(status_path):
+            os.makedirs(os.path.dirname(model_save_path), exist_ok=True)
+            run_records.write_run_status(model_save_path, completed=False, error=exc,
+                                         timesteps=0, total_timesteps=int(args.total_timesteps))
+            print(f"Run FAILED before training started ({type(exc).__name__}: {exc}); "
+                  f"recorded in {status_path}.")
+        raise
+
+
+def _train_from_args(domain, args, encoder, start, net_arch, particle_filter_class, env_options,
+                     log_dir, model_save_path):
+    """The `train(...)` call of `main`, moved out unchanged so the status guard above wraps it."""
     return train(
         domain, args.variant, encoder,
         features_extractor_kwargs=encoder.extractor_kwargs(args),
