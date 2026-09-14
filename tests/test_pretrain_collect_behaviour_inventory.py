@@ -505,7 +505,8 @@ def test_collect_help_and_list_variants(tmp):
 
 def test_collect_npz_contract(collect_smart):
     with np.load(collect_smart) as z:
-        assert set(z.files) == {"particles", "weights", "particle_scale", "metadata"}
+        # + the 10.9 labels (ant, target, step) on every Ant-Tag file
+        assert set(z.files) == {"particles", "weights", "particle_scale", "metadata", "ant", "target", "step"}
         particles, weights = z["particles"], z["weights"]
         assert particles.dtype == np.float32 and weights.dtype == np.float32
         assert particles.ndim == 3 and particles.shape[1:] == (100, 2)
@@ -513,9 +514,11 @@ def test_collect_npz_contract(collect_smart):
         assert np.allclose(weights.sum(1), 1.0, atol=1e-5)
         assert float(z["particle_scale"]) == SCALE
         meta = json.loads(str(z["metadata"]))
-    # 7.5 added command + threads (the run records' provenance) to the metadata.
+    # 7.5 added command + threads (the run records' provenance) to the metadata; 10.9 the label list,
+    # the variant's task heads and the env radii the labels are read against.
     assert set(meta) == {"variant", "env_id", "particle_filter_class", "num_particles", "dim_particles",
-                         "particle_scale", "args", "command", "threads", "git", "behaviour"}
+                         "particle_scale", "args", "command", "threads", "git", "behaviour",
+                         "label_arrays", "task_heads", "tag_radius", "visible_radius"}
     assert meta["variant"] == "smart" and meta["env_id"] == "pdomains-ant-tag-smart-v0"
     assert meta["particle_filter_class"] == "SmartAntTagParticleFilter"
     assert (meta["num_particles"], meta["dim_particles"], meta["particle_scale"]) == (100, 2, SCALE)

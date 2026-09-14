@@ -126,11 +126,15 @@ def test_ant_tag_collection_with_an_explicit_output_file(tmp_path, monkeypatch):
                            "--fully_observed_fraction", "0", "--no_rebalance", "--output_file", str(out)])
     assert result == out and out.exists()
     with np.load(out, allow_pickle=True) as z:
-        assert set(z.files) == {"particles", "weights", "particle_scale", "metadata"}
+        # 10.9: the three per-snapshot labels the task objective reads (the den family adds two)
+        assert set(z.files) == {"particles", "weights", "particle_scale", "metadata", "ant", "target", "step"}
         assert z["particles"].shape == (4, 20, 2) and float(z["particle_scale"]) == 4.5     # reset + 3 steps
+        assert z["target"].shape == (4, 2) and z["ant"].shape == (4, 2) and z["step"].tolist() == [0, 1, 2, 3]
         meta = json.loads(str(z["metadata"]))
     assert set(meta) == {"variant", "env_id", "particle_filter_class", "num_particles", "dim_particles",
-                         "particle_scale", "args", "command", "threads", "git", "behaviour"}
+                         "particle_scale", "args", "command", "threads", "git", "behaviour",
+                         "label_arrays", "task_heads", "tag_radius", "visible_radius"}
+    assert (meta["label_arrays"], meta["task_heads"], meta["tag_radius"]) == (["ant", "target", "step"], ["position"], 1.5)
     assert meta["particle_filter_class"] == "SmartAntTagParticleFilter" and meta["args"]["num_episodes"] == 1
 
 

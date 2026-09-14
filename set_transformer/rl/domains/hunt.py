@@ -54,16 +54,13 @@ from __future__ import annotations
 import itertools
 import json
 import os
-import time
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 
 import gymnasium as gym
 import numpy as np
 import pdomains  # noqa: F401 - registers the pdomains-* env ids
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize
@@ -80,6 +77,19 @@ from set_transformer.rl.domains.base import (
 )
 from set_transformer.rl.particle_filters.hunt import EnvEmittedBeliefFilter
 from set_transformer.rl.wrappers.particle_filter import PFDictWithWeightsObservationWrapper
+from set_transformer.rl.pretrain_objectives.task_head import (   # 10.9: the shared task-head loop
+    TaskData as _TaskData,
+    TaskEncoderWithHead,   # noqa: F401 - re-exported (tests, entry points)
+    add_task_arguments,
+    build_task_extractor,   # noqa: F401 - re-exported
+    check_variant_and_geometry,
+    extractor_geometry,   # noqa: F401 - re-exported
+    locate_from_dataset,
+    resolve_task_arguments,
+    run_task_training,
+    save_task_checkpoint as _save_task_checkpoint,
+    task_run_name,
+)
 
 #: ``pdomains.hunt.SCALE``: the arena half-width the envs divide by, and the ``arena_scale`` the
 #: shared extractors divide the (agent-relative, raw) particles by. Written here as a number so
@@ -705,63 +715,19 @@ def matched_slot_loss(off_pred, alive_logit, off_tgt, alive_tgt):
     return cost[torch.arange(B, device=cost.device), best].mean()
 
 
-class TaskData:
-    """The dataset on the device, split episode-disjoint: states arrive in rollout order and
-    neighbouring states within an episode are near duplicates, so a random split leaks and the
-    validation metric reads far higher than the encoder deserves (the record's rule: the last
-    ``val_frac`` of rows are validation)."""
+_COLLECT_HINT = "collect it with python -m set_transformer.rl.collect --domain hunt --variant <v>"
+
+
+class TaskData(_TaskData):
+    """The hunt dataset (``rl/pretrain_objectives/task_head.py::TaskData`` with hunt's arrays):
+    the agent position is the ``obs`` passthrough, the record's six label arrays are required."""
 
     LABELS = ("centers", "alive", "counts", "sigmas", "target", "target_index")
 
     def __init__(self, path: str, val_frac: float, device: torch.device):
-        with np.load(path, allow_pickle=True) as z:
-            missing = [k for k in ("particles", "weights", "agent", *self.LABELS) if k not in z.files]
-            if missing:
-                raise ValueError(f"{path} is not a hunt dataset: missing arrays {missing} "
-                                 "(collect it with python -m set_transformer.rl.collect --domain hunt)")
-            self.metadata = json.loads(str(z["metadata"])) if "metadata" in z.files else {}
-            # 10.8a: an imported / merged file marks every row's source (0 = scripted collection,
-            # r = the beliefs the round r-1 policy visited); the report then splits its metrics by it
-            optional = [k for k in ("source_round",) if k in z.files]
-            arrays = {k: np.asarray(z[k]) for k in ("particles", "weights", "agent", *self.LABELS, *optional)}
-        n = len(arrays["particles"])
-        n_val = int(val_frac * n)
-        if n_val < 1 or n - n_val < 1:
-            raise ValueError(f"{n} rows cannot be split with val_frac={val_frac}")
-        self.particle_scale = float(self.metadata.get("particle_scale", ARENA_SCALE))
-        self.n_train, self.n_val = n - n_val, n_val
-        self.device = device
-        self.train = {k: torch.as_tensor(v[:n - n_val]).to(device) for k, v in arrays.items()}
-        self.val = {k: torch.as_tensor(v[n - n_val:]).to(device) for k, v in arrays.items()}
-        self.num_particles = int(arrays["particles"].shape[1])
-        self.dim_particles = int(arrays["particles"].shape[2])
+        super().__init__(path, val_frac, device, labels=("agent", *self.LABELS), obs_key="agent",
+                         scale_default=ARENA_SCALE, collect_hint=_COLLECT_HINT, kind="hunt dataset")
 
-    @staticmethod
-    def obs(split: dict, index) -> dict:
-        """What the RL extractor is handed: the agent position, the RAW agent-relative cloud
-        (the extractor divides by arena_scale) and the (uniform) weights."""
-        return {"obs": split["agent"][index], "particles": split["particles"][index],
-                "weights": split["weights"][index]}
-
-
-class TaskEncoderWithHead(nn.Module):
-    """extractor -> belief features (the agent passthrough dropped) -> 3-layer head."""
-
-    def __init__(self, extractor: nn.Module, obs_dim: int, out_dim: int, hidden: int = 256):
-        super().__init__()
-        self.extractor = extractor
-        self.obs_dim = obs_dim
-        d = extractor.features_dim - obs_dim
-        self.head = nn.Sequential(
-            nn.Linear(d, hidden), nn.GELU(),
-            nn.Linear(hidden, hidden), nn.GELU(),
-            nn.Linear(hidden, out_dim))
-
-    def features(self, obs: dict) -> torch.Tensor:
-        return self.extractor(obs)[:, self.obs_dim:]
-
-    def forward(self, obs: dict) -> torch.Tensor:
-        return self.head(self.features(obs))
 
 
 def task_loss(y: torch.Tensor, batch: dict, task: str, n_clusters: int) -> torch.Tensor:
@@ -799,220 +765,54 @@ def task_metrics(y: torch.Tensor, batch: dict, task: str, n_clusters: int,
             "within_1.0": float((err < 1.0).float().mean())}
 
 
-def build_task_extractor(args, space: gym.spaces.Dict, scale: float):
-    """The encoder under pretraining, as the RL arm's own SB3 extractor class, built from the
-    flags THROUGH THE SHARED ENCODER TABLE (rl/encoders.py): the same construction
-    `rl/train.py --encoder <name>` performs."""
-    from set_transformer.rl import encoders as _encoders   # noqa: PLC0415 - see odd_even.build_extractor
-    encoder = _encoders.get(args.encoder)
-    kwargs = encoder.extractor_kwargs(args)
-    kwargs["arena_scale"] = float(scale)
-    kwargs[encoder.extractor_class.PRETRAINED_PATH_KWARG] = None
-    return encoder.extractor_class(space, **kwargs)
-
-
-def extractor_geometry(extractor) -> dict:
-    """The geometry record the extractor's loader checks (the extractor's own
-    `checkpoint_config`, batch 10.4)."""
-    return extractor.checkpoint_config()
+def _task_checkpoint_config(args, task: str) -> dict:
+    return {"objective": "task", "task": task, "variant": args.variant,
+            "pretraining": "set_transformer.rl.pretrain --domain hunt --objective task"}
 
 
 def save_task_checkpoint(model: TaskEncoderWithHead, path: Path, args, epoch: int, val: dict,
                          geometry: dict, task: str) -> None:
-    """The format each extractor's own loader reads, assembled by
-    :func:`~set_transformer.rl.pretrained_encoder.encoder_checkpoint` from the extractor's
-    `checkpoint_state()` / `checkpoint_config()` (batch 10.4; the if-chain on the encoder name --
-    ST under ``set_transformer.``, CGF whole, pooled under ``encoder.`` + ``weighted_particles`` --
-    moved into the extractors). ``geometry`` is kept in the signature; the extractor's is written."""
-    from set_transformer.rl.pretrained_encoder import encoder_checkpoint   # noqa: PLC0415 - cycle
-    extractor = model.extractor
-    torch.save(encoder_checkpoint(
-        extractor,
-        config={"objective": "task", "task": task, "variant": args.variant,
-                "arena_scale": float(extractor.arena_scale), "encoder": args.encoder,
-                "encoder_params": int(getattr(args, "encoder_params", 0)),
-                "pretraining": "set_transformer.rl.pretrain --domain hunt --objective task"},
-        head_state_dict={k: v.detach().cpu() for k, v in model.head.state_dict().items()},
-        epoch=epoch, val=val, args=vars(args)), path)
+    """Hunt's spelling of the shared writer (``geometry`` is kept in the signature; the
+    extractor's own record is what gets written)."""
+    _save_task_checkpoint(model, path, args, epoch, val, _task_checkpoint_config(args, task))
+
 
 
 def _task_add_arguments(parser, domain=None) -> None:
-    g = parser.add_argument_group("task objective: data")
-    g.add_argument("--data_path", type=str, default=None,
-                   help="The collected hunt dataset (.npz with the label arrays). Default: the "
-                        "variant's dataset under the output root.")
-    g.add_argument("--val_frac", type=float, default=0.1,
-                   help="Last fraction of rows (rollout order, so episode-disjoint) held out.")
-    t = parser.add_argument_group("task objective: training (the record's settings)")
-    t.add_argument("--num_epochs", type=int, default=120)
-    t.add_argument("--patience", type=int, default=15,
-                   help="Stop after this many epochs without a validation improvement.")
-    t.add_argument("--batch_size", type=int, default=256)
-    t.add_argument("--learning_rate", type=float, default=1e-3)
-    t.add_argument("--head_hidden", type=int, default=256)
+    add_task_arguments(parser, dataset_help="The collected hunt dataset (.npz with the label arrays).")
 
 
-def _task_locate(args) -> dict:
-    if not args.data_path:
-        return {"variant": None, "env_id": None}
-    from set_transformer.rl.pretrain_objectives.reconstruction import dataset_metadata  # noqa: PLC0415
-    meta = dataset_metadata(args.data_path)
-    return {"variant": meta.get("variant"), "env_id": meta.get("env_id")}
+_task_locate = locate_from_dataset
 
 
 def _task_resolve_arguments(parser, args, domain, encoder) -> None:
-    if not encoder.learned:
-        parser.error(f"the task objective needs a learned encoder ({' | '.join(TASK_ENCODERS)}); "
-                     f"{encoder.name!r} has no parameters to train")
-    if args.data_path is None:
-        if args.variant is None:
-            parser.error("--data_path or --variant is needed: the task objective reads the "
-                         "collected dataset")
-        from set_transformer.rl import run_records   # noqa: PLC0415
-        args.data_path = str(run_records.dataset_path(domain.name, args.variant, root=args.output_root))
-        print(f"--data_path not given; the variant's dataset under the root: {args.data_path}")
-    if not os.path.isfile(args.data_path):
-        parser.error(f"dataset {args.data_path} does not exist (collect it with "
-                     "python -m set_transformer.rl.collect --domain hunt --variant <v>)")
+    resolve_task_arguments(parser, args, domain, encoder, collect_hint=_COLLECT_HINT)
 
 
 def _task_prepare(parser, args, domain, encoder, device):
     data = TaskData(args.data_path, args.val_frac, torch.device(device))
-    recorded = data.metadata.get("variant")
-    if recorded is not None and args.variant is not None and recorded != args.variant:
-        parser.error(f"--variant {args.variant} but the dataset was collected on {recorded!r}")
-    if args.variant is None:
-        args.variant = recorded
-    args.num_particles = data.num_particles
-    args.dim_particles = data.dim_particles
-    args.arena_scale = data.particle_scale
+    check_variant_and_geometry(parser, args, data)
     return data
 
 
-def _task_run_name(args, now: datetime) -> str:
-    return f"{now.strftime('%Y%m%d_%H%M%S')}_task_{args.encoder}_seed{args.seed}"
+_task_run_name = task_run_name
 
 
 def _task_run(args, ctx: PretrainContext) -> PretrainResult:
-    """The training loop of src/hunt_tasks/pretrain/pretrain.py::main, moved: Adam, halve the
-    rate on a plateau, early stop, keep the best encoder WITH its matching head."""
-    args.encoder = ctx.encoder.name
-    data: TaskData = ctx.data
-    device = torch.device(ctx.device)
+    """Hunt's task objective on the shared loop (``rl/pretrain_objectives/task_head.py``, batch
+    10.9; the loop itself was here from 9.2 to 10.9): the matched-slot loss on Cluster-Hunt, the
+    offset MSE on the pick-a-target tasks, the record's metrics in arena units."""
     variant = resolve(args.variant)
     task = variant.task
     n_clusters = int(_env_config(args.variant).n_clusters)
-    run_dir = Path(ctx.run_dir)
-    checkpoint_dir = Path(ctx.checkpoint_dir) if ctx.checkpoint_dir else run_dir
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    (run_dir / "args.json").write_text(json.dumps(vars(args), indent=2, default=str))
-
-    space = gym.spaces.Dict({
-        "obs": gym.spaces.Box(-np.inf, np.inf, (2,), np.float32),
-        "particles": gym.spaces.Box(-np.inf, np.inf, (data.num_particles, data.dim_particles), np.float32),
-        "weights": gym.spaces.Box(0.0, 1.0, (data.num_particles,), np.float32),
-    })
-    extractor = build_task_extractor(args, space, data.particle_scale)
-    geometry = extractor_geometry(extractor)
     out_dim = n_clusters * 3 if task == "collect_all" else 2
-    model = TaskEncoderWithHead(extractor, obs_dim=2, out_dim=out_dim, hidden=args.head_hidden).to(device)
-    n_encoder = sum(p.numel() for p in extractor.encoder_parameters())
-    args.encoder_params = int(n_encoder)
-    print(f"[{args.variant}/task/{args.encoder}] train={data.n_train:,} val={data.n_val:,} "
-          f"encoder params={n_encoder:,} head out={out_dim} device={device}", flush=True)
+    return run_task_training(
+        args, ctx, data=ctx.data, obs_dim=2, out_dim=out_dim,
+        loss_fn=lambda y, batch: task_loss(y, batch, task, n_clusters),
+        metrics_fn=lambda y, batch: task_metrics(y, batch, task, n_clusters, ctx.data.particle_scale),
+        checkpoint_config=_task_checkpoint_config(args, task),
+        label=f"{args.variant}/task/{ctx.encoder.name}")
 
-    opt = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
-    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, factor=0.5, patience=5)
-
-    def val_loss():
-        model.eval()
-        tot, n = 0.0, 0
-        with torch.no_grad():
-            for i in range(0, data.n_val, 2048):
-                s = slice(i, min(i + 2048, data.n_val))
-                b = {k: v[s] for k, v in data.val.items()}
-                tot += float(task_loss(model(TaskData.obs(data.val, s)), b, task, n_clusters)) * (s.stop - s.start)
-                n += s.stop - s.start
-        return tot / max(n, 1)
-
-    best, best_epoch, best_state, best_head, bad, hist = float("inf"), None, None, None, 0, []
-    t0 = time.time()
-    for ep in range(args.num_epochs):
-        model.train()
-        perm = torch.randperm(data.n_train, device=device)
-        run = 0.0
-        for i in range(0, data.n_train, args.batch_size):
-            j = perm[i:i + args.batch_size]
-            b = {k: v[j] for k, v in data.train.items()}
-            loss = task_loss(model(TaskData.obs(data.train, j)), b, task, n_clusters)
-            opt.zero_grad(set_to_none=True)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            opt.step()
-            run += float(loss.detach()) * len(j)
-        v = val_loss()
-        sched.step(v)
-        hist.append({"epoch": ep, "train": run / data.n_train, "val": v})
-        if v < best - 1e-6:
-            best, best_epoch, bad = v, ep, 0
-            # Snapshot the HEAD as well as the encoder: the metrics below are computed with
-            # encoder + head, and a best-epoch encoder paired with a final-epoch head is a
-            # combination that never existed during training (the record's ST dim_hidden=512
-            # run reported a good best_val next to a near-chance identify_acc that way).
-            best_state = {k: t.detach().clone() for k, t in extractor.state_dict().items()}
-            best_head = {k: t.detach().clone() for k, t in model.head.state_dict().items()}
-        else:
-            bad += 1
-        if ep % 10 == 0 or bad >= args.patience or ep == args.num_epochs - 1:
-            print(f"  ep{ep:>3} train={run / data.n_train:.5f} val={v:.5f} best={best:.5f}", flush=True)
-        (run_dir / "history.json").write_text(json.dumps(hist, indent=1))
-        if bad >= args.patience:
-            break
-    save_task_checkpoint(model, checkpoint_dir / "checkpoint_last.pt", args, len(hist) - 1,
-                         {"loss": hist[-1]["val"]}, geometry, task)
-
-    extractor.load_state_dict(best_state)
-    model.head.load_state_dict(best_head)
-    model.eval()
-    chunks = []
-    with torch.no_grad():
-        for i in range(0, data.n_val, 4096):
-            s = slice(i, min(i + 4096, data.n_val))
-            b = {k: v[s] for k, v in data.val.items()}
-            chunks.append(task_metrics(model(TaskData.obs(data.val, s)), b, task, n_clusters,
-                                       data.particle_scale))
-    metrics = {k: float(np.mean([c[k] for c in chunks])) for k in chunks[0]}
-    # 10.8a: the same metrics per source of the validation rows (a DAgger file mixes the scripted
-    # collection with the states each round's policy visited; the record misread round 1 because
-    # its validation set changed composition between rounds)
-    by_source = {}
-    if "source_round" in data.val:
-        src = data.val["source_round"].cpu().numpy()
-        for r in np.unique(src):
-            rows = np.flatnonzero(src == r)
-            parts = []
-            with torch.no_grad():
-                for i in range(0, len(rows), 4096):
-                    idx = torch.as_tensor(rows[i:i + 4096], device=data.device)
-                    b = {k: v[idx] for k, v in data.val.items()}
-                    parts.append(task_metrics(model(TaskData.obs(data.val, idx)), b, task, n_clusters,
-                                              data.particle_scale))
-            by_source[str(int(r))] = {"rows": int(len(rows)),
-                                      **{k: float(np.mean([c[k] for c in parts])) for k in parts[0]}}
-        for r, m in by_source.items():
-            print(f"  val source {r}: rows={m['rows']}  " + "  ".join(f"{k}={v:.4f}" for k, v in m.items() if k != "rows"))
-    save_task_checkpoint(model, checkpoint_dir / "checkpoint_best.pt", args, best_epoch,
-                         {"loss": best, **metrics}, geometry, task)
-    (run_dir / "metrics.json").write_text(json.dumps(
-        dict(best_val=best, best_epoch=best_epoch, epochs=len(hist), minutes=(time.time() - t0) / 60,
-             val_metrics=metrics, val_metrics_by_source=by_source, history=hist), indent=2))
-    print(f"[{args.variant}/task/{args.encoder}] best_val={best:.5f} (epoch {best_epoch})  "
-          + "  ".join(f"{k}={v:.4f}" for k, v in metrics.items())
-          + f"  ({(time.time() - t0) / 60:.1f} min) -> {checkpoint_dir}", flush=True)
-    checkpoints = {"best": checkpoint_dir / "checkpoint_best.pt", "last": checkpoint_dir / "checkpoint_last.pt"}
-    return PretrainResult(run_dir=run_dir, rl_checkpoint=checkpoints["best"], checkpoints=checkpoints,
-                          summary={"best_val_loss": best, "best_epoch": best_epoch,
-                                   "epochs": len(hist), **metrics})
 
 
 TASK_OBJECTIVE = Objective(

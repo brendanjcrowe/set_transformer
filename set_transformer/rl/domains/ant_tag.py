@@ -63,6 +63,8 @@ from types import SimpleNamespace
 
 import gymnasium as gym
 import numpy as np
+import torch
+import torch.nn.functional as F
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize
@@ -77,7 +79,15 @@ from set_transformer.rl.curriculum import (
     parse_reward_schedule,
 )
 from set_transformer.rl.curriculum import parse_reward_schedule as _parse_reward_schedule
-from set_transformer.rl.domains.base import Collection, Domain, Evaluation
+from set_transformer.rl.domains.base import (
+    Collection,
+    Domain,
+    Evaluation,
+    Objective,
+    PretrainContext,
+    PretrainResult,
+    Pretraining,
+)
 from set_transformer.rl.particle_filters import ant_tag as _ant_tag_filters
 from set_transformer.rl.particle_filters.ant_tag import (
     AntTagParticleFilter,
@@ -87,6 +97,15 @@ from set_transformer.rl.particle_filters.ant_tag import (
     TwinDenAntTagParticleFilter,
 )
 from set_transformer.rl.particle_filters.base import BaseParticleFilter
+from set_transformer.rl.pretrain_objectives.task_head import (   # 10.9: the shared task-head loop
+    TaskData as _TaskData,
+    add_task_arguments,
+    check_variant_and_geometry,
+    locate_from_dataset,
+    resolve_task_arguments,
+    run_task_training,
+    task_run_name,
+)
 from set_transformer.rl.wrappers.particle_filter import PFDictWithWeightsObservationWrapper
 
 # ---------------------------------------------------------------------------
@@ -115,17 +134,26 @@ class Variant:
     #: configuration (domain_mds/smart_ant_tag.md). Set it only where a
     #: recipe has been established on that variant.
     default_reward_schedule: str | None = None
+    #: The heads of the ``task`` pretraining objective on this env (batch 10.9, 2026-09-14;
+    #: :data:`TASK_HEADS` lists them): ``position`` = the true target position in the scaled
+    #: frame (unimodal, fleeing target: the smart family); ``den_mass`` = the weighted particle
+    #: shares in the heavy den / light den / outside, soft cross-entropy against the row's OWN
+    #: cloud (the counterweighted-den family; ``den_occupied`` is stored for the report only).
+    #: Empty = the objective refuses the variant (``ghost`` / ``dens``: not designed yet).
+    task_heads: tuple[str, ...] = ()
 
 
 VARIANTS: dict[str, Variant] = {
     "base": Variant(
         env_id="pdomains-ant-tag-v0",
         particle_filter=AntTagParticleFilter,
+        task_heads=("position",),
         notes="Original dumb-target Ant-Tag. Unimodal belief.",
     ),
     "smart": Variant(
         env_id="pdomains-ant-tag-smart-v0",
         particle_filter=SmartAntTagParticleFilter,
+        task_heads=("position",),
         notes="Unimodal; the target flees harder as the ant closes.",
         # The schedules every July 2026 `smart` run recorded in its
         # run_config.json (the CGF 79% / Gaussian 65% comparison). Stated here
@@ -144,6 +172,7 @@ VARIANTS: dict[str, Variant] = {
     "smart_hard": Variant(
         env_id="pdomains-ant-tag-smart-hard-v0",
         particle_filter=SmartAntTagParticleFilter,
+        task_heads=("position",),
         notes=("SmartAntTag with the cdens_hard sensing/tagging geometry: "
                "tag_radius 0.6, visible_radius 1.0 (base env 1.5 / 3.0). "
                "Same 9x9 cage and 400-step cap as `smart`; unimodal belief."),
@@ -153,6 +182,7 @@ VARIANTS: dict[str, Variant] = {
     "smart_mid": Variant(
         env_id="pdomains-ant-tag-smart-mid-v0",
         particle_filter=SmartAntTagParticleFilter,
+        task_heads=("position",),
         notes=("SmartAntTag, tag_radius 1.0, visible_radius 2.0, target_step "
                "0.5. Geometry sweep around smart_hard (visible 2.0 covers ~16% "
                "of the 9x9 cage)."),
@@ -162,6 +192,7 @@ VARIANTS: dict[str, Variant] = {
     "smart_hard_slow": Variant(
         env_id="pdomains-ant-tag-smart-hard-slow-v0",
         particle_filter=SmartAntTagParticleFilter,
+        task_heads=("position",),
         notes=("smart_hard radii (tag 0.6, visible 1.0) with a slower target: "
                "target_step 0.3 instead of 0.5. The filter reads target_step "
                "off the env."),
@@ -171,6 +202,7 @@ VARIANTS: dict[str, Variant] = {
     "smart_mid_slow": Variant(
         env_id="pdomains-ant-tag-smart-mid-slow-v0",
         particle_filter=SmartAntTagParticleFilter,
+        task_heads=("position",),
         notes=("Both relaxations: tag 1.0, visible 2.0, target_step 0.3."),
         default_curriculum="0:100,0.2:100,0.5:2.0,1:2.0",
         default_evasion_curriculum="0:0,0.2:0,0.5:1,1:1",
@@ -178,6 +210,7 @@ VARIANTS: dict[str, Variant] = {
     "smart_mid_slow_v15": Variant(
         env_id="pdomains-ant-tag-smart-mid-slow-v15-v0",
         particle_filter=SmartAntTagParticleFilter,
+        task_heads=("position",),
         notes=("smart_mid_slow with visible_radius 1.5 instead of 2.0 (tag 1.0, "
                "target_step 0.3). Smaller flee zone AND smaller visible area."),
         # Reaches the real radius at 40%, not 50%: this is what all 57 ST runs
@@ -204,6 +237,7 @@ VARIANTS: dict[str, Variant] = {
     "cdens": Variant(
         env_id="pdomains-ant-tag-cdens-v0",
         particle_filter=CounterweightedDenAntTagParticleFilter,
+        task_heads=("den_mass",),
         notes=("Heavy-near / light-far dens; the pooled belief mean is pinned "
                "at 0 by construction, so the mirror bit lives only in the odd "
                "moments. Visibility radius 1.8."),
@@ -212,6 +246,7 @@ VARIANTS: dict[str, Variant] = {
     "cdens_hard": Variant(
         env_id="pdomains-ant-tag-cdens-hard-v0",
         particle_filter=CounterweightedDenAntTagParticleFilter,
+        task_heads=("den_mass",),
         notes=("Counterweighted dens with harder sensing/tagging geometry: "
                "tag_radius 0.6, visible_radius 1.0, spook_radius 1.4."),
         default_curriculum="0:100,0.2:100,0.5:1.0,1:1.0",
@@ -220,6 +255,7 @@ VARIANTS: dict[str, Variant] = {
     "cdens_terminal": Variant(
         env_id="pdomains-ant-tag-cdens-terminal-v0",
         particle_filter=CounterweightedDenAntTagParticleFilter,
+        task_heads=("den_mass",),
         notes=("Counterweighted dens where the two INACTIVE candidate "
                "positions are terminal hazards (-300), so probing the wrong "
                "arrangement ends the episode instead of wasting time."),
@@ -229,6 +265,7 @@ VARIANTS: dict[str, Variant] = {
     "cdens_nospook": Variant(
         env_id="pdomains-ant-tag-cdens-nospook-v0",
         particle_filter=CounterweightedDenAntTagParticleFilter,
+        task_heads=("den_mass",),
         notes="Counterweighted dens with the spook alarm disabled (ablation).",
     ),
 }
@@ -398,7 +435,8 @@ def print_variants() -> None:
         except Exception:  # noqa: BLE001 - listing must not fail on one bad entry
             cap = "?"
         print(f"{name:16s} {variant.env_id:38s} cap={cap:<5} "
-              f"{variant.particle_filter.__name__}")
+              f"{variant.particle_filter.__name__}"
+              + (f"  task_heads={'+'.join(variant.task_heads)}" if variant.task_heads else ""))
         if variant.notes:
             print(f"{'':16s}   {variant.notes}")
 
@@ -1227,7 +1265,7 @@ def _weighted_spread(particles: np.ndarray, weights: np.ndarray) -> np.ndarray:
     return np.sqrt(np.clip(var, 0.0, None)).mean(axis=1)
 
 
-def _rebalance_by_spread(
+def _rebalance_index_by_spread(
     particles: np.ndarray,
     weights: np.ndarray,
     collapsed_frac: float = 0.30,
@@ -1237,8 +1275,11 @@ def _rebalance_by_spread(
     diffuse_threshold: float = 4.0,
     seed: int = 42,
     upsample: bool = True,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Rebalance so intermediate-spread beliefs are well represented.
+) -> np.ndarray:
+    """The rows :func:`_rebalance_by_spread` keeps, in output order (its body, moved here in
+    batch 10.9 so the collector can apply the same selection to the per-row labels).
+
+    Rebalance so intermediate-spread beliefs are well represented.
 
     Downsamples over-represented buckets. With ``upsample=True`` (the
     historical behaviour) under-represented buckets are upsampled WITH
@@ -1301,7 +1342,26 @@ def _rebalance_by_spread(
         sampled.append(rng.choice(idx, size=n_target, replace=len(idx) < n_target))
     all_idx = np.concatenate(sampled)
     rng.shuffle(all_idx)
+    return all_idx
 
+
+def _rebalance_by_spread(
+    particles: np.ndarray,
+    weights: np.ndarray,
+    collapsed_frac: float = 0.30,
+    intermediate_frac: float = 0.40,
+    diffuse_frac: float = 0.30,
+    collapsed_threshold: float = 0.5,
+    diffuse_threshold: float = 4.0,
+    seed: int = 42,
+    upsample: bool = True,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Rebalance by belief spread (see :func:`_rebalance_index_by_spread`); the historical
+    two-array form the entry point and its tests read."""
+    all_idx = _rebalance_index_by_spread(
+        particles, weights, collapsed_frac=collapsed_frac, intermediate_frac=intermediate_frac,
+        diffuse_frac=diffuse_frac, collapsed_threshold=collapsed_threshold,
+        diffuse_threshold=diffuse_threshold, seed=seed, upsample=upsample)
     particles, weights = particles[all_idx], weights[all_idx]
     spreads_out = _weighted_spread(particles, weights)
     print(f"Post-rebalance: {len(particles)} samples — "
@@ -1386,7 +1446,25 @@ def _collect_resolve_arguments(parser, args, domain) -> dict:
             print(f"Auto-detected VecNormalize stats: {candidate}")
 
     print(f"Env: {resolved_env_id}, particle filter: {resolved_pf.__name__}")
-    return {"env_id": resolved_env_id, "particle_filter_class": resolved_pf}
+    return {"env_id": resolved_env_id, "particle_filter_class": resolved_pf,
+            "env_facts": _env_facts(resolved_env_id)}
+
+
+def _env_facts(env_id: str) -> dict:
+    """The env constants the labels of :func:`_collect_snapshot_extras` are read against, written
+    into the dataset's metadata (batch 10.9): the tag and visible radii, and on the
+    counterweighted-den envs the den radius (``cden_r``, one constant for both dens)."""
+    env = gym.make(env_id, rendering=False)
+    try:
+        u = env.unwrapped
+        facts = {"tag_radius": float(u.tag_radius), "visible_radius": float(u.visible_radius)}
+        if hasattr(u, "cden_r"):
+            facts["den_radius"] = float(u.cden_r)
+            # the four STATIC candidate centres, the env's (and the filter's) order [-h, +h, -f, +f]
+            facts["den_candidates"] = np.asarray(u.cden_candidates, dtype=float).round(6).tolist()
+        return facts
+    finally:
+        env.close()
 
 
 def _collect_prepare(args, options):
@@ -1459,6 +1537,37 @@ def _collect_begin_episode(args, options, state, env, episode):
     return {}, act
 
 
+#: The per-row label arrays every Ant-Tag dataset carries since batch 10.9 (RAW env units, like
+#: the particles): the ant position, the true target position, the step index.
+TASK_LABELS = ("ant", "target", "step")
+#: The two more the counterweighted-den envs carry: the heavy and light den centres of the row's
+#: episode (they flip sides at every reset; motion-model parameters the filter receives, not a
+#: privileged label) and the index, in the metadata's static ``den_candidates`` order
+#: ``[-h, +h, -f, +f]``, of the candidate disc that holds the target (REPORT ONLY).
+DEN_LABELS = ("den_positions", "den_occupied")
+
+
+def _collect_snapshot_extras(args, options, state, env, obs, step_index) -> dict:
+    """The labels of one snapshot, read off the env's hidden state as the belief is recorded."""
+    u = env.unwrapped
+    out = dict(ant=np.asarray(u.data.qpos[:2], np.float32),
+               target=np.asarray(u.get_target_pos(), np.float32),
+               step=np.int32(step_index))
+    if "den_radius" in options["env_facts"]:
+        out["den_positions"] = np.stack([u.cden_heavy_pos, u.cden_light_pos]).astype(np.float32)
+        occupied = u.cden_heavy_pos if u._occupied_is_heavy else u.cden_light_pos
+        candidates = np.asarray(options["env_facts"]["den_candidates"])
+        out["den_occupied"] = np.int64(np.argmin(np.linalg.norm(candidates - occupied, axis=1)))
+    return out
+
+
+def _collect_metadata_extras(args, options, particles, weights, steps) -> dict:
+    facts = options["env_facts"]
+    labels = TASK_LABELS + (DEN_LABELS if "den_radius" in facts else ())
+    heads = VARIANTS[args.variant].task_heads if args.variant in VARIANTS else ()
+    return dict(label_arrays=list(labels), task_heads=list(heads), **facts)
+
+
 def _collect_finish(args, options, state, n_snapshots) -> None:
     print(f"Trajectories — " + ", ".join(f"{k}: {v}" for k, v in state.counts.items()))
     print(f"Total snapshots (raw): {n_snapshots}")
@@ -1489,14 +1598,22 @@ def _collect_particle_scale(args, options) -> float:
 
 
 def _collect_rebalance(args, options, particles, weights, steps):
-    particles, weights = _rebalance_by_spread(
+    """The four-value form (batch 10.5 contract): the kept rows come back too, so the collector
+    applies the same selection to the per-row labels of :func:`_collect_snapshot_extras`."""
+    kept = _rebalance_index_by_spread(
         particles, weights,
         collapsed_threshold=args.collapsed_threshold,
         diffuse_threshold=args.diffuse_threshold,
         seed=args.seed,
         upsample=not args.rebalance_no_upsample,
     )
-    return particles, weights, None      # the step index is not kept on this domain
+    particles, weights = particles[kept], weights[kept]
+    spreads_out = _weighted_spread(particles, weights)
+    print(f"Post-rebalance: {len(particles)} samples — "
+          f"collapsed={int((spreads_out < args.collapsed_threshold).sum())}, "
+          f"intermediate={int(((spreads_out >= args.collapsed_threshold) & (spreads_out < args.diffuse_threshold)).sum())}, "
+          f"diffuse={int((spreads_out >= args.diffuse_threshold).sum())}")
+    return particles, weights, None, kept      # the step index is not kept on this domain
 
 
 ANT_TAG_COLLECTION = Collection(
@@ -1511,7 +1628,170 @@ ANT_TAG_COLLECTION = Collection(
     finish=_collect_finish,
     report=_collect_report,
     rebalance=_collect_rebalance,
+    snapshot_extras=_collect_snapshot_extras,
+    metadata_extras=_collect_metadata_extras,
     progress_desc="Collecting trajectories",
+)
+
+
+# ---------------------------------------------------------------------------
+# The ``task`` pretraining objective (batch 10.9, 2026-09-14; design in refactor_plans.md 10.9)
+# ---------------------------------------------------------------------------
+
+#: head name -> output size. ``position``: the true target position in the scaled frame
+#: (label / arena half-width, the frame the encoder sees), squared error; the report multiplies
+#: back to env units. ``den_mass``: logits over the FOUR static candidate discs ``[-h, +h, -f, +f]``
+#: plus outside (five-way; decision 10c-15, user 2026-09-14: the step-0 belief is the filter's
+#: four-candidate prior and a partition on the episode's two actual dens would file its phantom
+#: mass under "outside"), cross-entropy against the weighted particle shares of the row's own
+#: cloud (:func:`den_shares`); selection on the held-out loss, report = KL plus the argmax agreements.
+TASK_HEADS = {"position": 2, "den_mass": 5}
+_TASK_COLLECT_HINT = ("collect it with python -m set_transformer.rl.collect --domain ant_tag --variant <v>; "
+                      "the labels exist since 2026-09-14 (batch 10.9), the recorded files under "
+                      "experiments/ant_tag/data carry none")
+
+
+def den_shares(particles: np.ndarray, weights: np.ndarray, dens: np.ndarray, radius: float) -> np.ndarray:
+    """``[S, K + 1]`` weighted particle mass inside each of the K discs, then outside all of them,
+    per row. ``particles [S, N, 2]`` and ``dens [K, 2]`` (static, the four candidates) or
+    ``[S, K, 2]`` (per row) in the same (raw) frame; weights are normalised per row first. The
+    candidate discs never overlap (2.4 and 6.75 out on the diagonal, radius 0.4), so the shares sum
+    to one."""
+    w = np.clip(np.asarray(weights, np.float64), 0.0, None)
+    w = w / np.clip(w.sum(axis=1, keepdims=True), 1e-12, None)
+    dens = np.asarray(dens, np.float64)
+    if dens.ndim == 2:
+        dens = np.broadcast_to(dens[None], (len(w),) + dens.shape)
+    d = np.linalg.norm(np.asarray(particles, np.float64)[:, :, None, :]
+                       - dens[:, None, :, :], axis=-1)                                 # [S, N, K]
+    inside = (w[:, :, None] * (d <= float(radius))).sum(axis=1)                       # [S, K]
+    outside = np.clip(1.0 - inside.sum(axis=1, keepdims=True), 0.0, 1.0)
+    return np.concatenate([inside, outside], axis=1).astype(np.float32)
+
+
+class AntTagTaskData(_TaskData):
+    """The labelled Ant-Tag dataset: the ant position is the ``obs`` passthrough; the den
+    arrays are required when the variant's heads include ``den_mass``."""
+
+    def __init__(self, path: str, val_frac: float, device: torch.device, *, heads: tuple[str, ...]):
+        labels = TASK_LABELS + (DEN_LABELS if "den_mass" in heads else ())
+        super().__init__(path, val_frac, device, labels=labels, obs_key="ant", scale_default=float("nan"),
+                         collect_hint=_TASK_COLLECT_HINT, kind="labelled Ant-Tag dataset")
+
+
+def _head_slices(heads: tuple[str, ...]) -> list[tuple[str, slice]]:
+    out, offset = [], 0
+    for h in heads:
+        out.append((h, slice(offset, offset + TASK_HEADS[h])))
+        offset += TASK_HEADS[h]
+    return out
+
+
+def task_loss(y: torch.Tensor, batch: dict, heads: tuple[str, ...]) -> torch.Tensor:
+    total = y.new_zeros(())
+    for head, sl in _head_slices(heads):
+        if head == "position":
+            total = total + F.mse_loss(y[:, sl], batch["target_scaled"])
+        else:
+            total = total - (batch["den_shares"] * F.log_softmax(y[:, sl], dim=-1)).sum(-1).mean()
+    return total
+
+
+@torch.no_grad()
+def task_metrics(y: torch.Tensor, batch: dict, heads: tuple[str, ...], scale: float, tag_radius: float) -> dict:
+    """In env units: mean position error and the fraction of rows predicted within the tag
+    radius; for the den head the held-out KL(shares || predicted), the argmax agreement with the
+    shares (does the encoder read its own belief) and with the true candidate (does the belief
+    track the truth; the truth is never the "outside" class)."""
+    out = {}
+    for head, sl in _head_slices(heads):
+        z = y[:, sl]
+        if head == "position":
+            err = scale * torch.linalg.norm(z - batch["target_scaled"], dim=-1)
+            out["position_mae"] = float(err.mean())
+            out["within_tag_radius"] = float((err < tag_radius).float().mean())
+        else:
+            p = F.softmax(z, dim=-1)
+            q = batch["den_shares"]
+            kl = (q * (torch.log(q.clamp_min(1e-12)) - torch.log(p.clamp_min(1e-12)))).sum(-1)
+            out["den_kl"] = float(kl.mean())
+            out["den_acc_belief"] = float((p.argmax(-1) == q.argmax(-1)).float().mean())
+            out["den_acc_truth"] = float((p.argmax(-1) == batch["den_occupied"]).float().mean())
+    return out
+
+
+def _task_add_arguments(parser, domain=None) -> None:
+    add_task_arguments(parser, dataset_help="The labelled Ant-Tag dataset (.npz from the harness collector: "
+                                            "ant / target / step [/ den_positions / den_occupied] arrays).")
+
+
+def _task_resolve_arguments(parser, args, domain, encoder) -> None:
+    resolve_task_arguments(parser, args, domain, encoder, collect_hint=_TASK_COLLECT_HINT)
+
+
+def _task_prepare(parser, args, domain, encoder, device):
+    recorded = locate_from_dataset(args)["variant"]
+    if recorded is not None and args.variant is not None and recorded != args.variant:
+        parser.error(f"--variant {args.variant} but the dataset was collected on {recorded!r}")
+    variant_name = args.variant or recorded
+    if variant_name is None:
+        parser.error("the dataset records no variant; pass --variant")
+    heads = resolve(variant_name).task_heads
+    if not heads:
+        parser.error(f"variant {variant_name!r} declares no task heads (Variant.task_heads); the task "
+                     f"objective is defined for: " + ", ".join(n for n, v in VARIANTS.items() if v.task_heads))
+    try:
+        data = AntTagTaskData(args.data_path, args.val_frac, torch.device(device), heads=heads)
+    except ValueError as exc:            # missing label arrays, an unsplittable file: a command-line refusal
+        parser.error(str(exc))
+    if "particle_scale" not in data.metadata:
+        parser.error(f"{args.data_path} records no particle_scale in its metadata ({_TASK_COLLECT_HINT})")
+    check_variant_and_geometry(parser, args, data)
+    scale = data.particle_scale
+    facts = data.metadata
+    if "tag_radius" not in facts:
+        facts = {**facts, **_env_facts(resolve(args.variant).env_id)}
+    for split in (data.train, data.val):
+        split["target_scaled"] = split["target"] / scale
+        if "den_mass" in heads:
+            if "den_radius" not in facts or "den_candidates" not in facts:
+                parser.error(f"{args.data_path} records no den_radius / den_candidates, so the den shares "
+                             f"cannot be computed ({_TASK_COLLECT_HINT})")
+            shares = den_shares(split["particles"].cpu().numpy(), split["weights"].cpu().numpy(),
+                                np.asarray(facts["den_candidates"]), facts["den_radius"])
+            split["den_shares"] = torch.as_tensor(shares, device=data.device)
+    args.task_heads = list(heads)
+    args.tag_radius = float(facts["tag_radius"])
+    return data
+
+
+def _task_run(args, ctx: PretrainContext) -> PretrainResult:
+    heads = tuple(args.task_heads)
+    data = ctx.data
+    return run_task_training(
+        args, ctx, data=data, obs_dim=2, out_dim=sum(TASK_HEADS[h] for h in heads),
+        loss_fn=lambda y, batch: task_loss(y, batch, heads),
+        metrics_fn=lambda y, batch: task_metrics(y, batch, heads, data.particle_scale, args.tag_radius),
+        checkpoint_config={"objective": "task", "task": "+".join(heads), "task_heads": list(heads),
+                           "variant": args.variant,
+                           "pretraining": "set_transformer.rl.pretrain --domain ant_tag --objective task"},
+        label=f"{args.variant}/task/{ctx.encoder.name}")
+
+
+ANT_TAG_TASK_OBJECTIVE = Objective(
+    name="task",
+    description="encoder + 3-layer head -> the variant's task heads (Variant.task_heads): `position`, "
+                "the true target position in the scaled frame (MSE; the smart family), or `den_mass`, "
+                "the weighted particle shares in the four candidate dens [-h, +h, -f, +f] / outside (soft "
+                "cross-entropy; the counterweighted-den family). Reads the labelled dataset the harness "
+                "collector writes.",
+    add_arguments=_task_add_arguments,
+    run=_task_run,
+    run_name=task_run_name,
+    locate=locate_from_dataset,
+    resolve_arguments=_task_resolve_arguments,
+    prepare=_task_prepare,
+    default_experiment_name=lambda encoder_name: f"{encoder_name}_task_pretrain",
 )
 
 
@@ -1699,4 +1979,7 @@ ANT_TAG = Domain(
     # Step 2 of the pipeline: the pursuit / random trajectory mix with the locomotion policy,
     # rebalanced by weighted spread (batch 7.4).
     collection=ANT_TAG_COLLECTION,
+    # 10.9: the task objective next to the generic reconstruction, which stays the default (every
+    # recorded Ant-Tag pretraining command runs reconstruction without naming it).
+    pretraining=Pretraining(objectives={"task": ANT_TAG_TASK_OBJECTIVE}, default_objective=None),
 )

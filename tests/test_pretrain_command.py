@@ -61,9 +61,11 @@ def test_reconstruction_is_the_generic_default_and_every_domain_gets_it():
     assert pretrain_objectives.DEFAULT_OBJECTIVE == "reconstruction"
     for name in ("ant_tag", "odd_even"):
         assert "reconstruction" in pretrain.objectives_for(get_domain(name))
-    # Ant-Tag declares nothing of its own: the generic objectives only, reconstruction default.
+    # Ant-Tag declares its task objective (10.9) but names no default: reconstruction stays the
+    # default, so every recorded Ant-Tag pretraining command still runs it without naming it.
     ant_tag = get_domain("ant_tag")
-    assert ant_tag.pretraining == Pretraining()
+    assert set(ant_tag.pretraining.objectives) == {"task"} and ant_tag.pretraining.default_objective is None
+    assert set(pretrain.objectives_for(ant_tag)) == {"reconstruction", "task"}
     assert pretrain.default_objective_name(ant_tag) == "reconstruction"
 
 
