@@ -1521,6 +1521,66 @@ def collect_posterior_snapshots(variant: str, n_episodes: int, seed: int) -> dic
     }
 
 
+def load_posterior_snapshots(path, variant: str, val_frac: float) -> tuple[dict, dict]:
+    """The collected dataset (`python -m set_transformer.rl.collect --domain odd_even`, labelled
+    since batch 10.5) as the two dicts `collect_posterior_snapshots` returns, split by EPISODE.
+
+    On the exact-support filter the row's weights ARE the exact posterior over the states 1..n,
+    so the row is its own target; the file's `true_state`, `optimal_prediction` and `episode`
+    arrays are the labels. Two rules keep the rows equal to what the rolling path produces:
+    (1) the collector records the belief after the LAST step too (step index == cap), which no
+    policy ever acts on and the recorded runs never saw -- dropped here; (2) the collector's step
+    index counts from 0 at the reset, the rolling path from 1 -- shifted here. The validation
+    episodes are the LAST `val_frac` of the episodes (rounded up, at least one), disjoint from
+    training: neighbouring rows of one episode are near duplicates, so a random row split leaks.
+    """
+    resolved = variants.resolve(variant)
+    n = int(resolved.n_dist_size)
+    cap = variants.episode_cap(variant)
+    with np.load(path, allow_pickle=True) as z:
+        missing = [k for k in ("particles", "weights", "steps", "true_state", "optimal_prediction",
+                               "episode") if k not in z.files]
+        if missing:
+            raise ValueError(f"{path} is not a labelled Odd-Even dataset: missing arrays {missing} "
+                             "(collect it with python -m set_transformer.rl.collect --domain odd_even "
+                             "--variant <variant>; datasets written before 2026-09-14 carry no labels)")
+        meta = json.loads(str(z["metadata"])) if "metadata" in z.files else {}
+        particles = np.asarray(z["particles"], dtype=np.float32)
+        weights = np.asarray(z["weights"], dtype=np.float32)
+        steps = np.asarray(z["steps"]).astype(np.int64)
+        true_state = np.asarray(z["true_state"]).astype(np.int64)
+        mode = np.asarray(z["optimal_prediction"]).astype(np.int64)
+        episode = np.asarray(z["episode"]).astype(np.int64)
+    if meta.get("variant") not in (None, variant):
+        raise ValueError(f"{path} was collected on variant {meta.get('variant')!r}, this run is "
+                         f"{variant!r}")
+    if particles.shape[1:] != (n, 1):
+        raise ValueError(f"{path} holds {particles.shape[1:]} particles per row; the exact-posterior "
+                         f"objectives need one particle per state, ({n}, 1) on {variant}")
+    states = np.arange(1, n + 1, dtype=np.float32)
+    if not np.array_equal(particles[:, :, 0], np.broadcast_to(states, particles[:, :, 0].shape)):
+        raise ValueError(f"{path} does not hold the exact-support filter (particles must be the "
+                         f"states 1..{n} in order; collect with the variant's default filter)")
+    keep = steps < cap                       # rule (1)
+    if not keep.any():
+        raise ValueError(f"{path} has no belief a policy acts on (every step index >= cap {cap})")
+    weights, steps = weights[keep], steps[keep] + 1          # rule (2)
+    true_state, mode, episode = true_state[keep], mode[keep], episode[keep]
+    episodes = np.unique(episode)
+    if len(episodes) < 2:
+        raise ValueError(f"{path} holds {len(episodes)} episode(s); an episode-disjoint split needs 2+")
+    n_val = max(1, int(math.ceil(val_frac * len(episodes))))
+    if n_val >= len(episodes):
+        raise ValueError(f"val_frac={val_frac} leaves no training episode of {len(episodes)}")
+    val_episodes = set(episodes[len(episodes) - n_val:].tolist())
+    is_val = np.array([e in val_episodes for e in episode.tolist()])
+
+    def part(mask):
+        return {"weights": weights[mask], "true_state": true_state[mask], "mode": mode[mask],
+                "step": steps[mask], "group": episode[mask], "n": n, "cap": cap}
+    return part(~is_val), part(is_val)
+
+
 class BeliefBatches:
     """Tensors on the device; particles are the centred states, shared."""
 
@@ -1671,6 +1731,17 @@ def _belief_add_arguments(parser: argparse.ArgumentParser, domain=None) -> None:
     """The objective's flags, spelled as the package command spells them (decision 2 of plan
     section 7: --num_epochs / --learning_rate; the entry point maps --epochs / --lr)."""
     g = parser.add_argument_group("exact-posterior objective: data")
+    g.add_argument("--data_path", type=str, default=None,
+                   help="A labelled collected dataset (python -m set_transformer.rl.collect --domain "
+                        "odd_even; batch 10.5). Default: the variant's dataset under the run root "
+                        "when it exists, else the episodes are rolled here (--n_train_episodes).")
+    g.add_argument("--data_source", choices=("auto", "dataset", "rolled"), default="auto",
+                   help="auto (default): --data_path, else the variant's dataset under the root if "
+                        "it exists, else rolled. dataset: the file is required. rolled: always roll "
+                        "(the recorded runs' path).")
+    g.add_argument("--val_frac", type=float, default=0.1,
+                   help="Dataset path only: the LAST val_frac of the episodes are validation "
+                        "(the recorded runs rolled 400 of 4,400).")
     g.add_argument("--n_train_episodes", type=int, default=4000)
     g.add_argument("--n_val_episodes", type=int, default=400)
     g.add_argument("--data_seed", type=int, default=100000,
@@ -1705,6 +1776,43 @@ def _belief_resolve_arguments(parser, args, domain, encoder) -> None:
                      "<registry key> (--list_variants shows them)")
     if args.init_from and encoder.name != "st":
         raise SystemExit("--init_from is implemented for --encoder st only")
+    # 10.5 (decision 6): where the beliefs come from, decided once, printed, recorded.
+    if args.data_source == "rolled":
+        if args.data_path:
+            parser.error("--data_source rolled and --data_path contradict each other")
+        args.data_path = None
+    else:
+        if args.data_path is None:
+            from set_transformer.rl import run_records
+            candidate = run_records.dataset_path(domain.name, args.variant,
+                                                 root=getattr(args, "output_root", None))
+            if candidate.exists():
+                args.data_path = str(candidate)
+            elif args.data_source == "dataset":
+                parser.error(f"--data_source dataset: no collected dataset at {candidate} "
+                             f"(python -m set_transformer.rl.collect --domain {domain.name} "
+                             f"--variant {args.variant}) and no --data_path")
+        elif not os.path.isfile(args.data_path):
+            parser.error(f"dataset {args.data_path} does not exist")
+        if not (0.0 < args.val_frac < 1.0):
+            parser.error("--val_frac must be in (0, 1)")
+    args.data_source = "dataset" if args.data_path else "rolled"
+    print(f"Beliefs: {args.data_source}" + (f" ({args.data_path}; validation = the last "
+                                            f"{args.val_frac:g} of the episodes)" if args.data_path
+                                            else f" (rolled: {args.n_train_episodes} + "
+                                                 f"{args.n_val_episodes} episodes, data_seed "
+                                                 f"{args.data_seed})"))
+
+
+def _belief_locate(args) -> dict:
+    """Where a given dataset says it belongs (10.5): the collector records `variant` and `env_id`;
+    without --data_path there is nothing to read (the objective rolls the env)."""
+    path = getattr(args, "data_path", None)
+    if not path or not os.path.isfile(path):
+        return {}
+    with np.load(path, allow_pickle=True) as z:
+        meta = json.loads(str(z["metadata"])) if "metadata" in z.files else {}
+    return {"variant": meta.get("variant"), "env_id": meta.get("env_id")}
 
 
 def _belief_prepare(parser, args, domain, encoder, device):
@@ -1753,11 +1861,19 @@ def _belief_run(args, ctx: PretrainContext, target: str) -> PretrainResult:
 
     # ---- data ----------------------------------------------------------------
     t0 = time.time()
-    train = collect_posterior_snapshots(args.variant, args.n_train_episodes, args.data_seed)
-    val = collect_posterior_snapshots(args.variant, args.n_val_episodes, args.data_seed + 10_000_000)
-    print(f"collected {len(train['weights'])} train rows / {len(val['weights'])} val rows "
-          f"in {time.time() - t0:.0f}s; train distinct s*: "
-          f"{len(set(train['true_state'].tolist()))}")
+    if getattr(args, "data_path", None):
+        # 10.5 (decision 6): the collected, labelled dataset; episode-disjoint split.
+        train, val = load_posterior_snapshots(args.data_path, args.variant, args.val_frac)
+        print(f"loaded {len(train['weights'])} train rows ({len(np.unique(train['group']))} episodes) / "
+              f"{len(val['weights'])} val rows ({len(np.unique(val['group']))} episodes) from "
+              f"{args.data_path} in {time.time() - t0:.0f}s; train distinct s*: "
+              f"{len(set(train['true_state'].tolist()))}")
+    else:
+        train = collect_posterior_snapshots(args.variant, args.n_train_episodes, args.data_seed)
+        val = collect_posterior_snapshots(args.variant, args.n_val_episodes, args.data_seed + 10_000_000)
+        print(f"collected {len(train['weights'])} train rows / {len(val['weights'])} val rows "
+              f"in {time.time() - t0:.0f}s; train distinct s*: "
+              f"{len(set(train['true_state'].tolist()))}")
     train_b = BeliefBatches(train, centre, device)
     val_b = BeliefBatches(val, centre, device)
 
@@ -1929,6 +2045,7 @@ def _exact_posterior_objective(target: str, description: str) -> Objective:
         add_arguments=_belief_add_arguments,
         run=lambda args, ctx: _belief_run(args, ctx, target),
         run_name=lambda args, now: _belief_run_name(args, now, target),
+        locate=_belief_locate,
         resolve_arguments=_belief_resolve_arguments,
         prepare=_belief_prepare,
         report=_belief_report,
@@ -2003,7 +2120,31 @@ def _rebalance(
     late_frac: float = 0.25,
     seed: int = 42,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Rebalance the snapshot mix across the belief's own sharpening axis.
+    """Rebalance the snapshot mix across the belief's own sharpening axis (see
+    `_rebalance_index`, which holds the body since batch 10.5 and returns the kept rows)."""
+    idx = _rebalance_index(weights, steps, by=by, early_step=early_step, collapse_step=collapse_step,
+                           diffuse_ess=diffuse_ess, collapsed_ess=collapsed_ess, early_frac=early_frac,
+                           mid_frac=mid_frac, late_frac=late_frac, seed=seed)
+    return particles[idx], weights[idx], steps[idx]
+
+
+def _rebalance_index(
+    weights: np.ndarray,
+    steps: np.ndarray,
+    by: str = "step",
+    early_step: int = EARLY_STEP,
+    collapse_step: int = COLLAPSE_STEP,
+    diffuse_ess: float = 5.0,
+    collapsed_ess: float = 1.5,
+    early_frac: float = 0.40,
+    mid_frac: float = 0.35,
+    late_frac: float = 0.25,
+    seed: int = 42,
+) -> np.ndarray:
+    """The rows `_rebalance` keeps, in output order (batch 10.5, 2026-09-14: returned as an index so
+    the collector can apply the same selection to the per-snapshot labels).
+
+    Rebalance the snapshot mix across the belief's own sharpening axis.
 
     Three buckets, downsampled (never upsampled -- no row appears twice) to
     the target fractions. `by="step"` splits on the step index, which is the axis the
@@ -2034,7 +2175,7 @@ def _rebalance(
     else:
         raise ValueError(f"Unknown --rebalance_by: {by!r}; use step or ess")
 
-    n_total = len(particles)
+    n_total = len(weights)
     buckets = [(labels[0], early, early_frac),
                (labels[1], mid, mid_frac),
                (labels[2], late, late_frac)]
@@ -2071,7 +2212,7 @@ def _rebalance(
     if len(all_idx) < n_total:
         print(f"  Rebalance keeps {len(all_idx)} of {n_total} snapshots "
               "(downsampled to the target fractions without duplication)")
-    return particles[all_idx], weights[all_idx], steps[all_idx]
+    return all_idx
 
 
 def _report_distribution(particles, weights, steps, collapse_step) -> None:
@@ -2143,6 +2284,11 @@ def _collect_resolve_arguments(parser, args, domain) -> dict:
     return {"env_id": resolved.env_id, "particle_filter_class": particle_filter_class}
 
 
+def _collect_prepare(args, options) -> dict:
+    """The per-run state: the episode being rolled (for the `episode` label; batch 10.5)."""
+    return {"episode": None}
+
+
 def _collect_make_env(args, options, state):
     return make_odd_even_belief_env(
         num_particles=args.num_particles,
@@ -2160,7 +2306,20 @@ def _collect_begin_episode(args, options, state, env, episode):
     # uniformly: the action is a prediction and does not move the state or the
     # observation stream, so the belief distribution collected under random
     # actions is the same one any policy would induce.
+    state["episode"] = int(episode)
     return {"seed": args.seed + episode}, (lambda obs: env.action_space.sample())
+
+
+def _collect_snapshot_extras(args, options, state, env, obs, step_index) -> dict:
+    """Per-snapshot LABELS read off the live env (batch 10.5, decision 6): the hidden state, the
+    posterior's argmax and the episode index -- what `collect_rollouts` reads off `info` -- so the
+    exact-posterior objectives can train on this file (on the exact-support filter the row's
+    weights ARE the posterior). `optimal_prediction` comes from the env's float64 posterior, not
+    from the float32 weights in the row, so a tie broken differently by the cast cannot mislabel it."""
+    base = env.unwrapped
+    return {"true_state": np.int64(base.true_state),
+            "optimal_prediction": np.int64(base.get_optimal_prediction()),
+            "episode": np.int64(state["episode"])}
 
 
 def _collect_report(args, options, particles, weights, steps, stage) -> None:
@@ -2177,9 +2336,11 @@ def _collect_report(args, options, particles, weights, steps, stage) -> None:
 
 
 def _collect_rebalance(args, options, particles, weights, steps):
+    """Returns the kept rows AND their index (a 4-tuple), so the collector applies the same
+    selection to the per-snapshot labels (batch 10.5)."""
     print("\nRebalancing...")
-    return _rebalance(
-        particles, weights, steps,
+    idx = _rebalance_index(
+        weights, steps,
         by=args.rebalance_by,
         early_step=args.early_step,
         collapse_step=args.collapse_step,
@@ -2190,6 +2351,7 @@ def _collect_rebalance(args, options, particles, weights, steps):
         late_frac=args.late_frac,
         seed=args.seed,
     )
+    return particles[idx], weights[idx], steps[idx], idx
 
 
 def _collect_metadata_extras(args, options, particles, weights, steps) -> dict:
@@ -2263,8 +2425,10 @@ ODD_EVEN_COLLECTION = Collection(
     resolve_arguments=_collect_resolve_arguments,
     particle_scale=lambda args, options: variants.state_scale(args.variant),
     particle_centre=lambda args, options: variants.state_centre(args.variant),
+    prepare=_collect_prepare,
     make_env=_collect_make_env,
     begin_episode=_collect_begin_episode,
+    snapshot_extras=_collect_snapshot_extras,
     report=_collect_report,
     rebalance=_collect_rebalance,
     metadata_extras=_collect_metadata_extras,

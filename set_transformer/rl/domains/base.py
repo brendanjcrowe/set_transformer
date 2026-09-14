@@ -214,7 +214,9 @@ class Collection:
     report: Callable = lambda args, options, particles, weights, steps, stage: None
     #: ``rebalance(args, options, particles, weights, steps) -> (particles, weights, steps)``;
     #: ``steps`` may come back None when the problem does not keep the index. Skipped under
-    #: ``--no_rebalance``.
+    #: ``--no_rebalance``. A hook may return a 4th element, the index of the kept rows in output
+    #: order (Odd-Even, batch 10.5); the collector then applies the same selection to the
+    #: :attr:`snapshot_extras` labels, which otherwise may not be combined with rebalancing.
     rebalance: Callable = lambda args, options, particles, weights, steps: (particles, weights, steps)
     #: ``metadata_extras(args, options, particles, weights, steps) -> dict``: facts added to the
     #: metadata JSON next to the shared ones (Odd-Even: n_dist_size, episode_cap, the centre,

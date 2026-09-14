@@ -237,7 +237,7 @@ def test_exact_posterior_refusals(tmp_path, capsys):
     assert "rolls the env itself: pass --variant" in capsys.readouterr().err
     with pytest.raises(SystemExit):
         pretrain.main(["--domain", "odd_even", "--encoder", "st", "--dry_run"])
-    assert "objective 'belief_kl' has no inputs to read one from" in capsys.readouterr().err
+    assert "no dataset was given to read one from" in capsys.readouterr().err     # 10.5: it takes --data_path
     with pytest.raises(SystemExit) as exc:
         pretrain.main(["--encoder", "cgf", "--match_params", "2000", "--init_from", "nowhere.pt", *base])
     assert "--init_from is implemented for --encoder st only" in str(exc.value)
@@ -297,20 +297,21 @@ def test_variant_flag_must_belong_to_the_domain(dataset, tmp_path, capsys):
 
 
 def test_a_flag_of_another_objective_is_refused_with_the_default_named(dataset, tmp_path, capsys):
-    """--data_path without --objective on odd_even: the domain's default (belief_kl) applies, and
-    the error says so instead of a bare 'unrecognized arguments'."""
+    """A reconstruction flag (--sinkhorn_blur) without --objective on odd_even: the domain's default
+    (belief_kl) applies, and the error says so instead of a bare 'unrecognized arguments'. (Until 10.5
+    the test used --data_path, which the exact-posterior objectives now take.)"""
     with pytest.raises(SystemExit) as exc:
-        pretrain.main(["--domain", "odd_even", "--encoder", "st", "--data_path", str(dataset),
-                       "--base_dir", str(tmp_path), "--dry_run"])
+        pretrain.main(["--domain", "odd_even", "--encoder", "st", "--variant", "oe50_short",
+                       "--sinkhorn_blur", "0.02", "--base_dir", str(tmp_path), "--dry_run"])
     err = capsys.readouterr().err
-    assert exc.value.code == 2 and "unrecognized arguments: --data_path" in err
+    assert exc.value.code == 2 and "unrecognized arguments: --sinkhorn_blur" in err
     assert "odd_even's default 'belief_kl' applies; --list_objectives shows the others" in err
     # With the objective named, the same typo is a plain unrecognized-argument error.
     with pytest.raises(SystemExit):
         pretrain.main(["--domain", "odd_even", "--encoder", "st", "--objective", "belief_kl", "--variant",
-                       "oe50_short", "--data_path", str(dataset), "--base_dir", str(tmp_path), "--dry_run"])
+                       "oe50_short", "--sinkhorn_blur", "0.02", "--base_dir", str(tmp_path), "--dry_run"])
     err = capsys.readouterr().err
-    assert "unrecognized arguments: --data_path" in err and "default" not in err
+    assert "unrecognized arguments: --sinkhorn_blur" in err and "default" not in err
 
 
 # ---------------------------------------------------------------------------

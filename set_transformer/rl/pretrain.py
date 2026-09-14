@@ -325,7 +325,8 @@ def main(argv: Sequence[str] | None = None, *, domain: Domain | str | None = Non
     if not args.base_dir and not args.variant:
         # 7.3: an objective without inputs (the exact posterior rolls the env) has nothing
         # to read a variant from; say so instead of blaming a dataset it does not take.
-        what = ("the dataset records no variant" if hasattr(args, "data_path")
+        what = ("the dataset records no variant" if getattr(args, "data_path", None)
+                else "no dataset was given to read one from" if hasattr(args, "data_path")
                 else f"objective {objective_record.name!r} has no inputs to read one from")
         parser.error(f"--base_dir not given and {what}: pass "
                      "--variant <registry key> (and --domain) or --base_dir <folder>")

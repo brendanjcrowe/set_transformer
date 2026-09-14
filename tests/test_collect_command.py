@@ -97,7 +97,9 @@ def test_odd_even_collection_lands_under_the_root_with_its_contract(tmp_path, mo
     assert out == root / "odd_even" / "oe50_short" / "data" / "oe50_short_pf_dataset_t.npz" and out.exists()
     assert not (tmp_path / "elsewhere" / "data").exists() and not (tmp_path / "elsewhere" / "runs").exists()
     with np.load(out, allow_pickle=True) as z:
-        assert set(z.files) == {"particles", "weights", "particle_scale", "particle_centre", "steps", "metadata"}
+        # 10.5: the three per-snapshot labels the exact-posterior objectives read
+        assert set(z.files) == {"particles", "weights", "particle_scale", "particle_centre", "steps", "metadata",
+                                "true_state", "optimal_prediction", "episode"}
         assert z["particles"].dtype == np.float32 and z["particles"].shape[1:] == (50, 1)
         assert z["weights"].shape == z["particles"].shape[:2] and z["steps"].dtype == np.int32
         assert float(z["particle_scale"]) == 24.5 and float(z["particle_centre"]) == 25.5

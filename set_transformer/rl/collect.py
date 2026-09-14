@@ -302,13 +302,21 @@ def main(argv: Sequence[str] | None = None, *, domain: Domain | str | None = Non
                                                extras_out=snapshot_extras)
     collection.report(args, options, particles, weights, steps, "raw")
     if not args.no_rebalance:
-        if snapshot_extras and collection.rebalance is not _DEFAULT_REBALANCE:
-            # Rebalancing permutes / duplicates / drops rows; the per-snapshot labels would no
-            # longer line up with the particles. No domain declares both today.
-            parser.error(f"domain {domain.name!r} records per-snapshot labels "
-                         f"({sorted(snapshot_extras)}) and also rebalances; the two cannot be "
-                         "combined. Pass --no_rebalance.")
-        particles, weights, steps = collection.rebalance(args, options, particles, weights, steps)
+        rebalanced = collection.rebalance(args, options, particles, weights, steps)
+        if len(rebalanced) == 4:
+            # 10.5: the hook also returned the kept rows' index, so the per-snapshot labels follow
+            # the same selection and stay aligned with the particles (Odd-Even).
+            particles, weights, steps, kept = rebalanced
+            for key in list(snapshot_extras):
+                snapshot_extras[key] = snapshot_extras[key][np.asarray(kept)]
+        else:
+            if snapshot_extras and collection.rebalance is not _DEFAULT_REBALANCE:
+                # Rebalancing permutes / duplicates / drops rows; the per-snapshot labels would no
+                # longer line up with the particles. A hook that returns its index (above) may.
+                parser.error(f"domain {domain.name!r} records per-snapshot labels "
+                             f"({sorted(snapshot_extras)}) and also rebalances without returning "
+                             "the kept rows; the two cannot be combined. Pass --no_rebalance.")
+            particles, weights, steps = rebalanced
     collection.report(args, options, particles, weights, steps, "final")
 
     metadata = build_metadata(domain, args, options, particles, weights, steps,
