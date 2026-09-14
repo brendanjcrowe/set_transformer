@@ -27,6 +27,8 @@ from __future__ import annotations
 
 from stable_baselines3.common.callbacks import BaseCallback
 
+from set_transformer.rl.pretrained_encoder import policy_extractors
+
 
 class _ScaledLRParamGroup(dict):
     """An optimizer param group whose ``lr`` is always ``lr_scale`` x the value written.
@@ -90,9 +92,15 @@ def scale_encoder_learning_rate(model, scale: float) -> None:
     # The shared encoder interface (change 2, 2026-09-12): every learned extractor says
     # which of its parameters are the encoder. Before this the function reached for
     # `.encoder.parameters()`, which the CGF extractor does not have (it IS the encoder),
-    # so a CGF finetune at a scaled rate could not be run.
-    encoder_params = list(policy.features_extractor.encoder_parameters())
-    encoder_ids = {id(p) for p in encoder_params}
+    # so a CGF finetune at a scaled rate could not be run. Every extractor the policy holds
+    # goes into the scaled group (batch 9.1: with --separate_extractors the value network's
+    # own encoder would otherwise finetune at the full head rate).
+    encoder_params, encoder_ids = [], set()
+    for extractor in policy_extractors(model):
+        for param in extractor.encoder_parameters():
+            if id(param) not in encoder_ids:
+                encoder_params.append(param)
+                encoder_ids.add(id(param))
     other_params = [p for p in policy.parameters() if id(p) not in encoder_ids]
     base_lr = model.lr_schedule(1.0)
     encoder_group = _ScaledLRParamGroup(params=encoder_params, lr_scale=scale)
@@ -125,13 +133,9 @@ class UnfreezeEncoderCallback(BaseCallback):
         self.done = False
 
     def _encoders(self):
-        found = [self.model.policy.features_extractor]
-        for attr in ("actor", "critic", "critic_target"):
-            module = getattr(self.model.policy, attr, None)
-            other = getattr(module, "features_extractor", None)
-            if other is not None and other is not found[0]:
-                found.append(other)
-        return found
+        # The one enumeration of a policy's extractors (rl/pretrained_encoder.py), so a
+        # separate value-network extractor is released together with the actor's (batch 9.1).
+        return policy_extractors(self.model)
 
     def _on_step(self) -> bool:
         if not self.done and self.num_timesteps >= self.unfreeze_at:

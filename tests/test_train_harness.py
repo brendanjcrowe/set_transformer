@@ -53,6 +53,7 @@ from set_transformer.rl import run_records  # noqa: E402
 from set_transformer.rl import train as train_mod  # noqa: E402
 from set_transformer.rl.curriculum import Schedule  # noqa: E402
 from set_transformer.rl.domains import ant_tag as ant_tag_domain  # noqa: E402
+from set_transformer.rl.domains import hunt as hunt_domain  # noqa: E402
 from set_transformer.rl.domains import odd_even as odd_even_domain  # noqa: E402
 from set_transformer.rl.domains.base import Domain  # noqa: E402
 from set_transformer.rl.feature_extractors.cgf import WeightedCGFFeaturesExtractor  # noqa: E402
@@ -156,11 +157,14 @@ def _drive_shared(monkeypatch, tmp_path, domain, encoder, argv, *, legacy_layout
 @pytest.mark.parametrize("name,record,module", [
     ("ant_tag", ant_tag_domain.ANT_TAG, ant_tag_domain),
     ("odd_even", odd_even_domain.ODD_EVEN, odd_even_domain),
+    ("hunt", hunt_domain.HUNT, hunt_domain),
 ])
 def test_domain_record_is_complete_and_names_the_module_objects(name, record, module):
     assert isinstance(record, Domain) and record.name == name
     assert domains.get(name) is record and domains.get(record) is record
     for field in dataclasses.fields(Domain):
+        if field.name == "collection" and name == "hunt":
+            continue        # the hunt collector arrives with batch 9.2
         assert getattr(record, field.name) is not None, field.name
     assert record.variants is module.VARIANTS
     assert record.resolve is module.resolve and record.episode_cap is module.episode_cap

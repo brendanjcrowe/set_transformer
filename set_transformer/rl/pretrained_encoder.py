@@ -68,14 +68,22 @@ def _cgf_reference_state(path: str) -> dict:
 
 
 def policy_extractors(model) -> list:
-    """Every features extractor on the policy: the shared one first, then any an actor /
-    critic / critic_target holds of its own (SAC-style policies build those; PPO has one)."""
+    """Every features extractor on the policy, each once: the shared one first, then the
+    policy's own ``pi_features_extractor`` / ``vf_features_extractor`` when they are distinct
+    objects (PPO with ``share_features_extractor=False``, the trainer's ``--separate_extractors``;
+    batch 9.1, 2026-09-13), then any an actor / critic / critic_target holds of its own
+    (SAC-style policies build those)."""
     extractors = [model.policy.features_extractor]
+    seen = {id(extractors[0])}
+    candidates = [getattr(model.policy, attr, None)
+                  for attr in ("pi_features_extractor", "vf_features_extractor")]
     for attr in ("actor", "critic", "critic_target"):
         module = getattr(model.policy, attr, None)
-        other = getattr(module, "features_extractor", None)
-        if other is not None and other is not extractors[0]:
+        candidates.append(getattr(module, "features_extractor", None))
+    for other in candidates:
+        if other is not None and id(other) not in seen:
             extractors.append(other)
+            seen.add(id(other))
     return extractors
 
 
@@ -85,9 +93,11 @@ def reload_pretrained(model, path: str, frozen: bool, verify: bool = True) -> No
     Four steps, all required (PITFALLS.md sections 1 and 7): reload every extractor on the
     policy from ``path``; re-freeze if ``frozen``; ASSERT the live encoder equals the
     checkpoint (max|delta| == 0 -- the only positive evidence in the logs that the reload
-    landed); blank the checkpoint path in ``policy_kwargs`` so no absolute path is baked into
-    the saved zip. Uses only the shared encoder interface, so the ST, CGF and pooled
-    extractors go through exactly the same code.
+    landed) -- for EVERY extractor the policy holds, so a separate value-network extractor
+    (``--separate_extractors``) is verified too, not only the shared / actor one; blank the
+    checkpoint path in ``policy_kwargs`` so no absolute path is baked into the saved zip. Uses
+    only the shared encoder interface, so the ST, CGF and pooled extractors go through exactly
+    the same code.
     """
     extractors = policy_extractors(model)
     for extractor in extractors:
@@ -97,11 +107,16 @@ def reload_pretrained(model, path: str, frozen: bool, verify: bool = True) -> No
     name = type(extractors[0]).__name__
     print(f"{name}: encoder RE-loaded after PPO construction "
           "(SB3 init_weights would otherwise overwrite it)"
-          + (" and re-frozen" if frozen else ""))
+          + (" and re-frozen" if frozen else "")
+          + (f" -- {len(extractors)} extractors (separate actor / critic)"
+             if len(extractors) > 1 else ""))
     if verify:
-        verify_matches_checkpoint(extractors[0].reference_state(path),
-                                  extractors[0].encoder_state_dict(), path,
-                                  label=f"{name} encoder")
+        reference = extractors[0].reference_state(path)
+        for index, extractor in enumerate(extractors):
+            label = (f"{name} encoder" if len(extractors) == 1
+                     else f"{name} encoder [{index + 1}/{len(extractors)}]")
+            verify_matches_checkpoint(reference, extractor.encoder_state_dict(), path,
+                                      label=label)
     kwargs = model.policy_kwargs.get("features_extractor_kwargs", {})
     key = getattr(extractors[0], "PRETRAINED_PATH_KWARG", None)
     if key is not None and key in kwargs:

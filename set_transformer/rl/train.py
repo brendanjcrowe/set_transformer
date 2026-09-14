@@ -58,7 +58,7 @@ from set_transformer.rl.encoder_finetune import (
     scale_encoder_learning_rate,
 )
 from set_transformer.rl.encoders import Encoder
-from set_transformer.rl.pretrained_encoder import reload_pretrained
+from set_transformer.rl.pretrained_encoder import policy_extractors, reload_pretrained
 
 ALGORITHMS = {"PPO": PPO, "SAC": SAC}
 
@@ -100,6 +100,8 @@ def train(
     ppo_n_steps: int = 2048,
     n_epochs: int = 10,
     target_kl: float | None = None,
+    ent_coef: float = 0.0,
+    separate_extractors: bool = False,
     lr_anneal: bool = False,
     device: str = "cpu",
     # the run
@@ -124,8 +126,11 @@ def train(
     builds them with ``Encoder.extractor_kwargs``); ``env_options`` is what the domain's
     ``resolve_arguments`` returned; ``schedules`` are ``Schedule`` records with this run's
     waypoints (``Domain.schedules(args)``); ``encoder_options`` steer the encoder's callbacks
-    (CGF: ``running_norm_update``). ``post_construct(model)`` runs after every built-in
-    post-construction step.
+    (CGF: ``running_norm_update``). ``ent_coef`` is PPO's entropy bonus (0.0 = SB3's default);
+    ``separate_extractors`` gives the value network its own features extractor
+    (``share_features_extractor=False``, the recorded hunt configuration) instead of sharing
+    the actor's; both PPO only (batch 9.1, 2026-09-13). ``post_construct(model)`` runs after
+    every built-in post-construction step.
     """
     domain = _domains.get(domain)
     enc = _encoders.get(encoder)
@@ -146,6 +151,9 @@ def train(
     if frozen and not pretrained_path:
         raise ValueError("frozen=True without a pretrained checkpoint would freeze a RANDOM "
                          "encoder")
+    if algorithm != "PPO" and (ent_coef != 0.0 or separate_extractors):
+        raise ValueError("--ent_coef and --separate_extractors are PPO options (SAC tunes its "
+                         "entropy coefficient itself and never shares the extractor)")
     if init_policy and (pretrained_path or resume_from):
         raise ValueError("--init_policy warm-starts the WHOLE policy from a saved agent; it "
                          "cannot be combined with a pretrained encoder or --resume_from")
@@ -225,6 +233,11 @@ def train(
     }
     if net_arch is not None:
         policy_kwargs["net_arch"] = list(net_arch)
+    if separate_extractors:
+        # One extractor for the actor, another for the value network: SB3 builds the second
+        # with the same class and kwargs; the pretrained reload / freeze / lr-scale steps below
+        # enumerate both (rl/pretrained_encoder.policy_extractors).
+        policy_kwargs["share_features_extractor"] = False
     lr_arg = ((lambda progress_remaining: learning_rate * progress_remaining) if lr_anneal
               else learning_rate)
     if resume_from:
@@ -237,7 +250,7 @@ def train(
         mismatched = {
             k: (getattr(model, k), v)
             for k, v in dict(n_steps=ppo_n_steps, batch_size=batch_size, n_epochs=n_epochs,
-                             target_kl=target_kl, seed=seed).items()
+                             target_kl=target_kl, ent_coef=ent_coef, seed=seed).items()
             if getattr(model, k) != v
         }
         if mismatched:
@@ -265,6 +278,7 @@ def train(
             batch_size=batch_size,
             n_epochs=n_epochs,
             target_kl=target_kl,
+            ent_coef=ent_coef,
             verbose=1,
             tensorboard_log=log_dir,
             seed=seed,
@@ -306,7 +320,10 @@ def train(
         finetune_callbacks.append(UnfreezeEncoderCallback(unfreeze_at))
     if enc.learned:
         n_encoder = sum(p.numel() for p in model.policy.features_extractor.encoder_parameters())
-        print(f"{enc.extractor_class.__name__}: {n_encoder:,} encoder parameters")
+        n_extractors = len(policy_extractors(model))
+        print(f"{enc.extractor_class.__name__}: {n_encoder:,} encoder parameters"
+              + (f" (x{n_extractors}: separate actor / critic extractors)"
+                 if n_extractors > 1 else ""))
     if init_policy:
         # Warm-start the whole policy (extractor + MLP + heads) from a compatible saved agent
         # (Brendan's benchmark option). Strict load: a silent shape mismatch here would look
@@ -449,6 +466,14 @@ def _add_common_arguments(parser: argparse.ArgumentParser, domain: Domain, encod
                         help="Linearly anneal learning_rate to 0 over training.")
     parser.add_argument("--target_kl", type=float, default=None,
                         help="PPO target_kl early-stop threshold per rollout (None = disabled).")
+    parser.add_argument("--ent_coef", type=float, default=0.0,
+                        help="PPO entropy bonus coefficient (default 0.0 = SB3's default). The "
+                             "recorded hunt runs used 0.005. PPO only.")
+    parser.add_argument("--separate_extractors", action="store_true",
+                        help="Give the value network its own features extractor instead of "
+                             "sharing the actor's (SB3 share_features_extractor=False; what "
+                             "every recorded hunt PPO run did). A pretrained encoder is loaded, "
+                             "verified, frozen or lr-scaled in BOTH. Default: shared. PPO only.")
     parser.add_argument("--progress_bar", action="store_true",
                         help="Enable SB3 progress bar. Requires stable-baselines3[extra].")
     parser.add_argument(
@@ -570,6 +595,9 @@ def main(argv: Sequence[str] | None = None, *, domain: Domain | str | None = Non
             args.resume_vecnormalize = run_records.resume_vecnormalize_path(args.resume_from)
         if args.resume_vecnormalize and not os.path.isfile(args.resume_vecnormalize):
             parser.error(f"VecNormalize snapshot {args.resume_vecnormalize} does not exist")
+    if args.algorithm.upper() != "PPO" and (args.ent_coef != 0.0 or args.separate_extractors):
+        parser.error("--ent_coef and --separate_extractors are PPO options (SAC tunes its "
+                     "entropy coefficient itself and never shares the extractor)")
     if args.init_policy:
         if start.pretrained_path or args.resume_from:
             parser.error("--init_policy warm-starts the WHOLE policy; not with --pretrained_path "
@@ -656,6 +684,8 @@ def main(argv: Sequence[str] | None = None, *, domain: Domain | str | None = Non
         ppo_n_steps=args.ppo_n_steps,
         n_epochs=args.n_epochs,
         target_kl=args.target_kl,
+        ent_coef=args.ent_coef,
+        separate_extractors=args.separate_extractors,
         lr_anneal=args.lr_anneal,
         device=args.device,
         log_dir=log_dir,
