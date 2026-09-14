@@ -24,7 +24,10 @@ weights and trains unweighted either way.
 ``--encoder cgf`` pretrains the CGF arm's block (``WeightedCGFFeaturesExtractor`` through a
 ``PFDecoder``, same loss / alignment / frame) and exports ``checkpoints/checkpoint_best_cgf_arm.pt``
 for ``rl/train.py --encoder cgf --pretrained_path``; the ST checkpoint is ``checkpoint_best.pt``
-itself.
+itself. ``--encoder deepset|pointnet`` (batch 10.11, 2026-09-14) pretrains the pooled arm's own
+extractor the same way (``models/pooled_arm_ae.py``: weight channel, weighted / masked pool) and
+exports ``checkpoints/checkpoint_best_<encoder>_arm.pt``; alignment (``--align_lambda``) runs on
+every one of the four, the Trainer reading ``encode()`` off each arm autoencoder.
 """
 
 from __future__ import annotations
@@ -41,17 +44,19 @@ import torch.multiprocessing as mp
 
 from set_transformer.data.dataset import get_data_loader
 from set_transformer.emd_matrix import dataset_sha256, read_sidecar
-from set_transformer.models.cgf_arm_ae import (
-    CGFArmAutoencoder,
-    export_arm_checkpoint,
-    make_arm_extractor,
-)
+from set_transformer.models.arm_export import export_arm_checkpoint
+from set_transformer.models.cgf_arm_ae import CGFArmAutoencoder, make_arm_extractor
+from set_transformer.models.pooled_arm_ae import PooledArmAutoencoder, make_pooled_arm_extractor
 from set_transformer.rl.domains.base import Objective, PretrainContext, PretrainResult
 from set_transformer.training.config import ExperimentConfig, TrainingConfig
 from set_transformer.training.trainer import Trainer
 
-#: Encoders this objective can pretrain by reconstruction.
-ENCODERS = ("st", "cgf")
+#: Encoders this objective can pretrain by reconstruction: every learned encoder of the table
+#: (``rl/encoders.py``; pinned equal by a test). The ST trains as the Trainer's own ``pf_st``
+#: autoencoder; the other three train as ARM autoencoders around their RL extractor.
+ENCODERS = ("st", "cgf", "deepset", "pointnet")
+#: The pooled arms (``models/pooled_arm_ae.py``).
+POOLED_ENCODERS = ("deepset", "pointnet")
 
 
 def dataset_metadata(data_path: str) -> dict:
@@ -210,7 +215,9 @@ def resolve_arguments(parser: argparse.ArgumentParser, args: argparse.Namespace,
         print(f"Dataset: {candidate} (the variant's collected dataset under the run root)")
     if encoder.name not in ENCODERS:
         parser.error(f"--objective reconstruction pretrains {ENCODERS}; "
-                     f"encoder {encoder.name!r} has no reconstruction path.")
+                     f"encoder {encoder.name!r} has no reconstruction path"
+                     + ("" if encoder.learned else " (an analytic encoder has no parameters to pretrain)")
+                     + ".")
     if args.emd_matrix_path is None and args.align_lambda > 0:
         parser.error("--align_lambda > 0 needs --emd_matrix_path "
                      "(run 2b_precompute_emd.py on this dataset first)")
@@ -261,6 +268,7 @@ def prepare(parser: argparse.ArgumentParser, args: argparse.Namespace, domain, e
         with np.load(args.data_path) as archive:
             dataset_has_weights = "weights" in archive.files
     # 7.2: the ST arm's --no_st_weight_channel means the same as --ignore_weights (no mass
+    # channel on the encoder input); 10.11: so does the pooled arms' --no_weight_channel (same dest).
     # channel on the encoder input); either spelling turns the weights off.
     ignore_weights = bool(args.ignore_weights) or not getattr(args, "weight_channel", True)
     weighted = dataset_has_weights and not ignore_weights
@@ -382,6 +390,50 @@ def prepare(parser: argparse.ArgumentParser, args: argparse.Namespace, domain, e
         particle_centre=particle_centre)
 
 
+def _pooled_kwargs(encoder, args: argparse.Namespace, *, arena_scale: float, weighted: bool,
+                   pretrained_path: str | None = None) -> dict:
+    """The pooled extractor's constructor kwargs from the resolved flags, through the table
+    (``Encoder.extractor_kwargs``), with the dataset's frame and weightedness put in (10.11)."""
+    kwargs = encoder.extractor_kwargs(args)
+    kwargs["arena_scale"] = float(arena_scale)
+    kwargs["weight_channel"] = bool(weighted)
+    kwargs[encoder.extractor_class.PRETRAINED_PATH_KWARG] = pretrained_path
+    kwargs["frozen"] = False
+    return kwargs
+
+
+def _export_arm(args: argparse.Namespace, experiment_config: ExperimentConfig, extractor, *,
+                encoder_name: str, suffix: str, aligning: bool, weighted: bool,
+                particle_centre: float, build_fresh) -> tuple[dict, str]:
+    """Export ``checkpoint_{best,latest}.pt`` of an ARM autoencoder as
+    ``checkpoint_<tag>_<suffix>.pt`` (the RL-loadable files) and prove the primary one
+    round-trips: ``build_fresh(path)`` builds the RL extractor with the export as its pretrained
+    path, and every tensor must equal the file's. The body is the CGF export loop of the
+    2026-09-11 script, shared with the pooled arms since 10.11. Returns ``(exported, primary)``."""
+    objective = f"reconstruction_{args.loss_type}" + ("_aligned" if aligning else "")
+    exported = {}
+    for tag in ("best", "latest"):
+        src = experiment_config.checkpoint_dir / f"checkpoint_{tag}.pt"
+        if not src.exists():
+            continue
+        dst = experiment_config.checkpoint_dir / f"checkpoint_{tag}_{suffix}.pt"
+        export_arm_checkpoint(
+            src, dst, extractor, encoder_name=encoder_name, particle_centre=particle_centre,
+            objective=objective, data_path=args.data_path,
+            extra_config={"weighted_pretraining": bool(weighted),
+                          "sinkhorn_blur": args.sinkhorn_blur,
+                          "sinkhorn_scaling": args.sinkhorn_scaling})
+        exported[tag] = dst
+    primary = "best" if "best" in exported else "latest"     # 7.5: see rl_checkpoint in run()
+    check = build_fresh(str(exported[primary]))
+    ref = torch.load(exported[primary], map_location="cpu", weights_only=False)["model_state_dict"]
+    live = check.checkpoint_state()
+    worst = max(float((ref[k].float() - live[k].float()).abs().max()) for k in ref)
+    if worst > 0.0:
+        raise RuntimeError(f"exported checkpoint does not round-trip (max |delta| {worst})")
+    return exported, primary
+
+
 def run_name(args: argparse.Namespace, now: datetime) -> str:
     """``<loss>_<YYYY-MM-DD_HH-MM-SS>``, the Trainer run folder the script always used."""
     return f"{args.loss_type}_{now.strftime('%Y-%m-%d_%H-%M-%S')}"
@@ -466,6 +518,7 @@ def run(args: argparse.Namespace, ctx: PretrainContext) -> PretrainResult:
     model = None
     cgf_extractor = None
     cgf_kwargs = None
+    pooled_extractor = None
     if encoder_name == "cgf":
         # The block divides by arena_scale; the loader already divided by the
         # dataset's particle_scale. They are the same number here (checked in
@@ -492,6 +545,22 @@ def run(args: argparse.Namespace, ctx: PretrainContext) -> PretrainResult:
               f"{model.num_encodings} x {model.dim_encoder}; "
               f"{cgf_extractor.encoder_parameter_count()} encoder params, "
               f"{sum(p.numel() for p in model.decoder.parameters())} decoder params")
+    elif encoder_name in POOLED_ENCODERS:
+        # 10.11: the pooled arm's own RL extractor, built THROUGH THE ENCODER TABLE from the
+        # resolved flags (the construction rl/train.py performs), with the dataset's frame and
+        # weightedness: weight_channel follows `weighted` (--no_weight_channel == --ignore_weights).
+        pooled_extractor = make_pooled_arm_extractor(
+            ctx.encoder.extractor_class, args.num_particles, args.dim_particles,
+            **_pooled_kwargs(ctx.encoder, args, arena_scale=applied_scale, weighted=weighted))
+        model = PooledArmAutoencoder(
+            pooled_extractor, num_particles=args.num_particles,
+            dim_particles=args.dim_particles, particle_scale=applied_scale,
+            dim_hidden=args.dim_hidden, weighted=weighted)
+        training_config.model_type = "pooled_arm_ae"
+        print(f"{encoder_name} arm encoder: {pooled_extractor.checkpoint_config()}")
+        print(f"  code {model.num_encodings} x {model.dim_encoder}; "
+              f"{pooled_extractor.encoder_parameter_count()} encoder params, "
+              f"{sum(p.numel() for p in model.decoder.parameters())} decoder params")
 
     trainer = Trainer(
         training_config=training_config,
@@ -516,29 +585,12 @@ def run(args: argparse.Namespace, ctx: PretrainContext) -> PretrainResult:
         # whole autoencoder. Export best and latest, then prove the export loads
         # into a fresh extractor with the CLI's geometry (strict keys + the
         # loader's field-by-field geometry check).
-        objective = f"reconstruction_{args.loss_type}" + ("_aligned" if aligning else "")
-        exported = {}
-        for tag in ("best", "latest"):
-            src = experiment_config.checkpoint_dir / f"checkpoint_{tag}.pt"
-            if not src.exists():
-                continue
-            dst = experiment_config.checkpoint_dir / f"checkpoint_{tag}_cgf_arm.pt"
-            export_arm_checkpoint(
-                src, dst, cgf_extractor, particle_centre=applied_centre,
-                objective=objective, data_path=args.data_path,
-                extra_config={"weighted_pretraining": bool(weighted),
-                              "sinkhorn_blur": args.sinkhorn_blur,
-                              "sinkhorn_scaling": args.sinkhorn_scaling})
-            exported[tag] = dst
-        primary = "best" if "best" in exported else "latest"     # 7.5: see rl_checkpoint above
-        check = make_arm_extractor(args.num_particles, args.dim_particles,
-                                   arena_scale=applied_scale, **cgf_kwargs,
-                                   pretrained_cgf_model_path=str(exported[primary]))
-        ref = torch.load(exported[primary], map_location="cpu", weights_only=False)["model_state_dict"]
-        live = check.state_dict()
-        worst = max(float((ref[k].float() - live[k].float()).abs().max()) for k in ref)
-        if worst > 0.0:
-            raise RuntimeError(f"exported checkpoint does not round-trip (max |delta| {worst})")
+        exported, primary = _export_arm(
+            args, experiment_config, cgf_extractor, encoder_name="cgf", suffix="cgf_arm",
+            aligning=aligning, weighted=weighted, particle_centre=applied_centre,
+            build_fresh=lambda path: make_arm_extractor(
+                args.num_particles, args.dim_particles, arena_scale=applied_scale,
+                **cgf_kwargs, pretrained_cgf_model_path=path))
         print(f"Exported CGF arm encoder: {exported[primary]}"
               + (f" (and {exported['latest']})" if primary == "best" and "latest" in exported else ""))
         print("  loads strict into WeightedCGFFeaturesExtractor with this geometry. Use:\n"
@@ -547,6 +599,27 @@ def run(args: argparse.Namespace, ctx: PretrainContext) -> PretrainResult:
               "--st_encoder_lr_scale 0.1]\n"
               "  (flags left at default take the checkpoint's geometry; arena_scale must "
               f"equal {applied_scale}).")
+        checkpoints.update({f"{tag}_export": path for tag, path in exported.items()})
+        rl_checkpoint = exported[primary]
+    elif encoder_name in POOLED_ENCODERS:
+        # 10.11: the same export and round trip for the pooled arm, the fresh extractor built
+        # through the table with the export as its pretrained path (what rl/train.py does).
+        exported, primary = _export_arm(
+            args, experiment_config, pooled_extractor, encoder_name=encoder_name,
+            suffix=f"{encoder_name}_arm", aligning=aligning, weighted=weighted,
+            particle_centre=applied_centre,
+            build_fresh=lambda path: make_pooled_arm_extractor(
+                ctx.encoder.extractor_class, args.num_particles, args.dim_particles,
+                **_pooled_kwargs(ctx.encoder, args, arena_scale=applied_scale, weighted=weighted,
+                                 pretrained_path=path)))
+        print(f"Exported {encoder_name} arm encoder: {exported[primary]}"
+              + (f" (and {exported['latest']})" if primary == "best" and "latest" in exported else ""))
+        print(f"  loads strict into {ctx.encoder.extractor_class.__name__} with this geometry. Use:\n"
+              f"    python3 -m set_transformer.rl.train --domain <domain> --encoder {encoder_name} "
+              f"--variant <variant> --pretrained_path {exported[primary]} [--frozen | "
+              "--encoder_lr_scale 0.1]\n"
+              f"  (pass the same --num_encodings / --dim_encoder / --dim_hidden / --pooling"
+              f"{'' if weighted else ' and --no_weight_channel'}; arena_scale must equal {applied_scale}).")
         checkpoints.update({f"{tag}_export": path for tag, path in exported.items()})
         rl_checkpoint = exported[primary]
 

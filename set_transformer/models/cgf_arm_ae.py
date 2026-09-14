@@ -31,7 +31,6 @@ provenance -- the same shape ``experiments/odd_even/3_pretrain_st_belief.py`` wr
 
 from __future__ import annotations
 
-import dataclasses
 from pathlib import Path
 
 import gymnasium as gym
@@ -39,6 +38,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from set_transformer.models.arm_export import plain as _plain  # noqa: F401 - historical name
 from set_transformer.modules import PFDecoder
 from set_transformer.rl.feature_extractors.cgf import WeightedCGFFeaturesExtractor
 
@@ -141,15 +141,6 @@ class CGFArmAutoencoder(nn.Module):
         return {k: v.detach().cpu() for k, v in self.extractor.state_dict().items()}
 
 
-def _plain(obj):
-    """Dataclass / namespace -> dict so the export payload is pure Python + tensors."""
-    if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
-        return dataclasses.asdict(obj)
-    if hasattr(obj, "__dict__") and not isinstance(obj, (dict, list, tuple, str, int, float)):
-        return dict(vars(obj))
-    return obj
-
-
 def export_arm_checkpoint(trainer_checkpoint: Path, out_path: Path,
                           extractor: WeightedCGFFeaturesExtractor,
                           particle_centre: float, objective: str,
@@ -163,42 +154,15 @@ def export_arm_checkpoint(trainer_checkpoint: Path, out_path: Path,
     ``WeightedCGFFeaturesExtractor._check_checkpoint_geometry`` compares, ``arena_scale``
     included -- plus provenance. ``particle_scale`` / ``particle_centre`` are also
     written top-level, as ``Trainer`` checkpoints carry them for the ST arm.
+
+    Since batch 10.11 (2026-09-14) the body is the generic
+    :func:`set_transformer.models.arm_export.export_arm_checkpoint`, which does the same steps
+    through the extractor's ``checkpoint_state()`` / ``checkpoint_config()`` (for the CGF arm:
+    the whole extractor ``state_dict`` and ``_cgf_geometry``, as before) and serves the pooled
+    arms too. The file's content is unchanged.
     """
-    loaded = torch.load(trainer_checkpoint, map_location="cpu", weights_only=False)
-    full = loaded["model_state_dict"]
-    prefix = "extractor."
-    encoder_state = {k[len(prefix):]: v.detach().cpu() for k, v in full.items()
-                     if k.startswith(prefix)}
-    expected = set(extractor.state_dict().keys())
-    if set(encoder_state) != expected:
-        raise RuntimeError(
-            "checkpoint's extractor keys do not match the extractor built from the "
-            f"CLI: missing {sorted(expected - set(encoder_state))}, unexpected "
-            f"{sorted(set(encoder_state) - expected)}")
-    config = {
-        **extractor._cgf_geometry,
-        "encoder": "cgf",
-        "objective": objective,
-        "pretraining": "3_train_st.py",
-        "dataset": str(data_path),
-        "particle_centre": float(particle_centre),
-        "encoder_params": int(extractor.encoder_parameter_count()),
-        **(extra_config or {}),
-    }
-    payload = {
-        "model_state_dict": encoder_state,
-        "config": config,
-        "epoch": loaded.get("epoch"),
-        "global_step": loaded.get("global_step"),
-        "best_val_loss": loaded.get("best_val_loss"),
-        "particle_scale": float(extractor.arena_scale),
-        "particle_centre": float(particle_centre),
-        "alignment": loaded.get("alignment"),
-        # plain dict, not the TrainingConfig dataclass: the export must unpickle
-        # without the set_transformer package importable (driver snippets, other envs)
-        "trainer_config": _plain(loaded.get("config")),
-        "source_checkpoint": str(trainer_checkpoint),
-    }
-    out_path = Path(out_path)
-    torch.save(payload, out_path)
-    return out_path
+    from set_transformer.models.arm_export import export_arm_checkpoint as _export
+
+    return _export(trainer_checkpoint, out_path, extractor, encoder_name="cgf",
+                   particle_centre=particle_centre, objective=objective, data_path=data_path,
+                   extra_config=extra_config)

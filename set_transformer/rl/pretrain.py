@@ -219,7 +219,10 @@ def _round_trip(encoder: _encoders.Encoder, args, result: PretrainResult, weight
     extractor = encoder.extractor_class(space, **kwargs)
     verify_matches_checkpoint(extractor.reference_state(str(path)), extractor.encoder_state_dict(),
                               str(path), label=f"{encoder.extractor_class.__name__} encoder")
-    geometry = getattr(extractor, "_st_geometry", None) or getattr(extractor, "_cgf_geometry", None) or {}
+    # 10.11: every learned extractor's own geometry record (ST / CGF: the same dicts as before;
+    # pooled: `_geometry` + `weighted_particles`).
+    geometry = extractor.checkpoint_config() if hasattr(extractor, "checkpoint_config") else (
+        getattr(extractor, "_st_geometry", None) or getattr(extractor, "_cgf_geometry", None) or {})
     return {k: (v if isinstance(v, (int, float, str, bool, type(None))) else str(v))
             for k, v in dict(geometry).items()}
 

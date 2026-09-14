@@ -438,7 +438,8 @@ class Trainer:
 
         Without alignment this is plain ``model(x)`` (latent None). With it,
         the autoencoders decode an explicit ``encode()`` -- identical to
-        ``forward`` for PFSetTransformer / DeepSetAE -- and the VAEs expose
+        ``forward`` for PFSetTransformer / DeepSetAE and for the arm autoencoders
+        (``cgf_arm_ae`` / ``pooled_arm_ae``) -- and the VAEs expose
         their posterior mean while the decoder still sees the sample. The
         VQ-VAEs quantize the code, so aligning their pre-quantization latent
         would optimize something the decoder never sees; refused.
@@ -446,7 +447,9 @@ class Trainer:
         if not need_latent:
             recon, aux = self._split_output(self.model(model_input))
             return recon, aux, None
-        if self.config.model_type in ("pf_st", "ds_ae"):
+        if self.config.model_type in ("pf_st", "ds_ae", "cgf_arm_ae", "pooled_arm_ae"):
+            # 10.11 (2026-09-14): the two ARM autoencoders (models/cgf_arm_ae.py,
+            # models/pooled_arm_ae.py) expose the same encode() -> decoder split.
             latent = self.model.encode(model_input)
             return self.model.decoder(latent), {}, latent
         if self.config.model_type in ("set_vae", "ds_vae"):
