@@ -1255,25 +1255,87 @@ def _goal_action(base_obs: np.ndarray, goal_xy, locomotion_policy: "PPO", vecnor
     return action
 
 
+def segment_clear(a, b, hazards, radius: float) -> bool:
+    """True when the straight segment a -> b stays more than ``radius`` from every hazard point (the
+    cdens_terminal phantom zones end the episode at -300; a waypoint behind one is a death sentence for
+    a locomotion policy that walks straight)."""
+    if hazards is None or len(hazards) == 0:
+        return True
+    a = np.asarray(a, dtype=np.float64); b = np.asarray(b, dtype=np.float64)
+    ab = b - a
+    denom = float(ab @ ab)
+    for h in np.asarray(hazards, dtype=np.float64):
+        t = 0.0 if denom < 1e-12 else float(np.clip(((h - a) @ ab) / denom, 0.0, 1.0))
+        if np.linalg.norm(a + t * ab - h) <= radius:
+            return False
+    return True
+
+
 def sample_waypoint(rng: np.random.Generator, ant_xy, target_xy, *, half_width: float, min_dist: float,
-                    target_clearance: float, tries: int = 50) -> np.ndarray:
+                    target_clearance: float, tries: int = 50, candidates=None, candidate_prob: float = 0.0,
+                    candidate_offset: float = 0.8, hazards=None, hazard_radius: float = 0.0) -> np.ndarray:
     """A point of the cage ``[-half_width, half_width]^2`` at least ``min_dist`` from the ant and at least
     ``target_clearance`` from the TRUE target (so the walk stays blind and sweeps). Up to ``tries`` uniform
     draws; if none satisfies both, the draw farthest from the ant among those clear of the target, else
-    the farthest from the ant. The target is a collection-time heuristic, never a label or an input."""
+    the farthest from the ant. The target is a collection-time heuristic, never a label or an input.
+
+    Den-biased draws (2026-09-14, the cdens measurement: uniform points on a 14 x 14 cage passed a den in
+    2-7 % of episodes): with probability ``candidate_prob`` the point is ``candidate_offset`` from one of the
+    ``candidates`` (the episode's two ACTIVE den centres, which the filter knows; see :func:`_active_dens`)
+    in a random direction, so the ant walks up to a den and checks it. No ``min_dist`` (the heavy den is
+    2.4 from the spawn) and no target clearance on these draws: checking the occupied den (and seeing the
+    target) is the point.
+
+    ``hazards`` / ``hazard_radius`` (cdens_terminal's phantom zones): every draw, den-biased or uniform, must
+    have a straight path from the ant that clears them (:func:`segment_clear`); the active light den sits
+    behind the phantom heavy den on the same diagonal, so half the den-biased walks of the first measurement
+    ended the episode at -300. A den none of whose approaches is clear is skipped; a uniform draw with an
+    unsafe path is rejected like one that is too close."""
     ant = np.asarray(ant_xy, dtype=np.float64)
     target = np.asarray(target_xy, dtype=np.float64)
+    if candidates is not None and len(candidates) and rng.random() < candidate_prob:
+        cands = list(np.asarray(candidates, dtype=np.float64))
+        rng.shuffle(cands)
+        for centre in cands:
+            for _ in range(8):
+                theta = rng.uniform(0.0, 2.0 * np.pi)
+                point = np.clip(centre + candidate_offset * np.array([np.cos(theta), np.sin(theta)]), -half_width, half_width)
+                if segment_clear(ant, point, hazards, hazard_radius):
+                    return point
+        # no den reachable on a straight safe path: fall through to a uniform draw
     best, best_d = None, -1.0
     for _ in range(int(tries)):
         cand = rng.uniform(-half_width, half_width, size=2)
         d_ant = float(np.linalg.norm(cand - ant))
         clear = float(np.linalg.norm(cand - target)) >= target_clearance
-        if d_ant >= min_dist and clear:
+        safe = segment_clear(ant, cand, hazards, hazard_radius)
+        if d_ant >= min_dist and clear and safe:
             return cand
-        score = d_ant + (half_width * 10.0 if clear else 0.0)
+        score = d_ant + (half_width * 10.0 if clear else 0.0) + (half_width * 100.0 if safe else 0.0)
         if score > best_d:
             best, best_d = cand, score
     return best
+
+
+def _active_dens(unwrapped):
+    """The den centres a den-biased waypoint may aim at: the episode's two ACTIVE dens (heavy, light), which
+    the filter is told at every step -- not the two phantom candidates, whose 1.4 zone ends a cdens_terminal
+    episode at -300 (the first den-biased measurement sent half the draws there and cut the episodes short).
+    Which of the two holds the target stays unknown. None where the env has no dens."""
+    heavy, light = getattr(unwrapped, "cden_heavy_pos", None), getattr(unwrapped, "cden_light_pos", None)
+    if heavy is None or light is None:
+        return None
+    return np.stack([np.asarray(heavy, dtype=np.float64), np.asarray(light, dtype=np.float64)])
+
+
+def _phantom_hazards(unwrapped, margin: float = 0.5):
+    """``(positions, radius)`` of the terminal phantom zones a cdens_terminal env exposes
+    (``cden_phantom_positions``, ``phantom_terminal_radius``), the radius widened by ``margin`` for the
+    locomotion policy's wobble; ``(None, 0.0)`` on envs without them."""
+    pos = getattr(unwrapped, "cden_phantom_positions", None)
+    if pos is None:
+        return None, 0.0
+    return np.asarray(pos, dtype=np.float64), float(getattr(unwrapped, "phantom_terminal_radius", 1.4)) + margin
 
 
 class _WaypointWalk:
@@ -1289,8 +1351,13 @@ class _WaypointWalk:
 
     def _resample(self, ant_xy):
         u = self.env.unwrapped
+        hazards, hazard_radius = _phantom_hazards(u)
         self.goal = sample_waypoint(self.state.rng, ant_xy, u.get_target_pos(), half_width=self.half_width,
-                                    min_dist=self.args.waypoint_min_dist, target_clearance=self.args.waypoint_target_clearance)
+                                    min_dist=self.args.waypoint_min_dist, target_clearance=self.args.waypoint_target_clearance,
+                                    candidates=_active_dens(u),
+                                    candidate_prob=self.args.waypoint_candidate_prob,
+                                    candidate_offset=self.args.waypoint_candidate_offset,
+                                    hazards=hazards, hazard_radius=hazard_radius)
         self.steps_on_goal = 0
         self.n_sampled += 1
         self.state.waypoints_sampled += 1
@@ -1479,6 +1546,13 @@ def _collect_add_arguments(parser) -> None:
                    help="The ant has arrived when within this distance; the next waypoint is drawn. ENV UNITS.")
     w.add_argument("--waypoint_patience", type=int, default=80,
                    help="Steps without arriving before the next waypoint is drawn anyway (a wall).")
+    w.add_argument("--waypoint_candidate_prob", type=float, default=0.0,
+                   help="Share of waypoints drawn next to one of the episode's two ACTIVE dens (counterweighted-den "
+                        "envs; the filter knows them; ignored where the env has none), so the ant walks up to a den "
+                        "and checks it. 0 = uniform points only.")
+    w.add_argument("--waypoint_candidate_offset", type=float, default=0.8,
+                   help="Distance of a den-biased waypoint from the den centre (ENV UNITS; inside the spook radius 1.4 "
+                        "and the visible radius 1.0 of cdens_terminal).")
     w.add_argument("--waypoint_radius", choices=("real", "range"), default="real",
                    help="Visibility radius of a waypoint episode: the env's real one (default) or drawn from "
                         "the --visibility_radius_min/max range like the other types.")
@@ -1524,6 +1598,11 @@ def _collect_resolve_arguments(parser, args, domain) -> dict:
     facts = _env_facts(resolved_env_id)
     if not 0.0 <= args.waypoint_fraction <= 1.0:
         parser.error(f"--waypoint_fraction {args.waypoint_fraction} is not in [0, 1]")
+    if not 0.0 <= args.waypoint_candidate_prob <= 1.0:
+        parser.error(f"--waypoint_candidate_prob {args.waypoint_candidate_prob} is not in [0, 1]")
+    if args.waypoint_candidate_prob > 0 and "den_candidates" not in facts:
+        print(f"WARNING: --waypoint_candidate_prob {args.waypoint_candidate_prob} but {resolved_env_id} has no den "
+              "candidates; every waypoint is a uniform point.")
     if args.fully_observed_fraction + args.pursuit_fraction + args.waypoint_fraction > 1.0 + 1e-9:
         parser.error("--fully_observed_fraction + --pursuit_fraction + --waypoint_fraction exceeds 1")
     if args.waypoint_min_dist is None:
@@ -1749,6 +1828,11 @@ ANT_TAG_COLLECTION = Collection(
 #: mass under "outside"), cross-entropy against the weighted particle shares of the row's own
 #: cloud (:func:`den_shares`); selection on the held-out loss, report = KL plus the argmax agreements.
 TASK_HEADS = {"position": 2, "den_mass": 5}
+#: The den head's disc radius (env units), 2026-09-14: the filter's partial resampling puts ~10 % of the mass just
+#: outside the env's 0.4 disc (donor copies + N(0, 0.25) noise, seen by the policy before the next predict's leash
+#: snaps them back); counting by the nearest candidate within 1.0 folds those strays back into their den. The
+#: candidates are >= 4.35 apart, so 1.0 cannot mix them. The env's own radius stays in the metadata (`den_radius`).
+DEN_SHARE_RADIUS = 1.0
 _TASK_COLLECT_HINT = ("collect it with python -m set_transformer.rl.collect --domain ant_tag --variant <v>; "
                       "the labels exist since 2026-09-14 (batch 10.9), the recorded files under "
                       "experiments/ant_tag/data carry none")
@@ -1829,6 +1913,10 @@ def task_metrics(y: torch.Tensor, batch: dict, heads: tuple[str, ...], scale: fl
 def _task_add_arguments(parser, domain=None) -> None:
     add_task_arguments(parser, dataset_help="The labelled Ant-Tag dataset (.npz from the harness collector: "
                                             "ant / target / step [/ den_positions / den_occupied] arrays).")
+    parser.add_argument("--den_share_radius", type=float, default=DEN_SHARE_RADIUS,
+                        help="den_mass head: a particle within this distance of a candidate den centre counts as "
+                             f"that den's mass (ENV UNITS; default {DEN_SHARE_RADIUS}, the env's disc is 0.4 -- "
+                             "the filter's resampling strays sit just outside it).")
 
 
 def _task_resolve_arguments(parser, args, domain, encoder) -> None:
@@ -1864,7 +1952,7 @@ def _task_prepare(parser, args, domain, encoder, device):
                 parser.error(f"{args.data_path} records no den_radius / den_candidates, so the den shares "
                              f"cannot be computed ({_TASK_COLLECT_HINT})")
             shares = den_shares(split["particles"].cpu().numpy(), split["weights"].cpu().numpy(),
-                                np.asarray(facts["den_candidates"]), facts["den_radius"])
+                                np.asarray(facts["den_candidates"]), args.den_share_radius)
             split["den_shares"] = torch.as_tensor(shares, device=data.device)
     args.task_heads = list(heads)
     args.tag_radius = float(facts["tag_radius"])
@@ -1880,6 +1968,7 @@ def _task_run(args, ctx: PretrainContext) -> PretrainResult:
         metrics_fn=lambda y, batch: task_metrics(y, batch, heads, data.particle_scale, args.tag_radius),
         checkpoint_config={"objective": "task", "task": "+".join(heads), "task_heads": list(heads),
                            "variant": args.variant,
+                           **({"den_share_radius": float(args.den_share_radius)} if "den_mass" in heads else {}),
                            "pretraining": "set_transformer.rl.pretrain --domain ant_tag --objective task"},
         label=f"{args.variant}/task/{ctx.encoder.name}")
 

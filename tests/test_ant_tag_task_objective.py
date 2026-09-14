@@ -164,6 +164,9 @@ def test_den_family_stores_the_episode_dens_and_the_truth(datasets):
     assert meta["task_heads"] == ["den_mass"] and meta["tag_radius"] == 0.6
     shares = ant_tag.den_shares(P, W, cand, meta["den_radius"])
     assert shares.shape == (len(P), 5) and np.allclose(shares.sum(1), 1.0, atol=1e-5) and shares.min() >= 0.0
+    # the head's radius (1.0) folds the resampling strays back: no less den mass than the env's 0.4 disc
+    wide = ant_tag.den_shares(P, W, cand, ant_tag.DEN_SHARE_RADIUS)
+    assert np.all(wide[:, :4].sum(1) >= shares[:, :4].sum(1) - 1e-6) and wide[:, 4].mean() <= shares[:, 4].mean()
     # the step-0 rows hold the filter's four-candidate prior: mass on all four discs, little outside
     with np.load(datasets["cdens_terminal"], allow_pickle=True) as z:
         step0 = z["step"] == 0
@@ -227,6 +230,7 @@ def test_den_mass_head_on_cdens_terminal(datasets, tmp_path, monkeypatch, capsys
     ck = torch.load(result.rl_checkpoint, map_location="cpu", weights_only=False)
     assert (ck["config"]["task"], ck["config"]["variant"], ck["config"]["arena_scale"]) == ("den_mass", "cdens_terminal", 7.0)
     assert ck["head_state_dict"]["4.weight"].shape[0] == 5           # four candidates + outside
+    assert ck["config"]["den_share_radius"] == 1.0                   # the head counts strays back into their den
     assert list(root.glob("ant_tag/cdens_terminal/pretrain/deepset/task/*_seed0/checkpoints/checkpoint_best.pt"))
 
 
