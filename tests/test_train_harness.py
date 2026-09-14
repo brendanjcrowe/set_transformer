@@ -163,8 +163,6 @@ def test_domain_record_is_complete_and_names_the_module_objects(name, record, mo
     assert isinstance(record, Domain) and record.name == name
     assert domains.get(name) is record and domains.get(record) is record
     for field in dataclasses.fields(Domain):
-        if field.name == "collection" and name == "hunt":
-            continue        # the hunt collector arrives with batch 9.2
         assert getattr(record, field.name) is not None, field.name
     assert record.variants is module.VARIANTS
     assert record.resolve is module.resolve and record.episode_cap is module.episode_cap

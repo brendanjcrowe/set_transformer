@@ -86,10 +86,7 @@ def test_arena_scale_is_the_env_module_constant():
 def test_domain_record_is_complete():
     import dataclasses
     for field in dataclasses.fields(Domain):
-        if field.name == "collection":
-            continue        # the collector arrives with batch 9.2
         assert getattr(HUNT, field.name) is not None, field.name
-    assert HUNT.collection is None
     assert HUNT.variants is hunt.VARIANTS and HUNT.resolve is hunt.resolve
     assert HUNT.default_variant in HUNT.variants and HUNT.particle_dim == 2
     assert HUNT.encoder_callbacks("st") == []

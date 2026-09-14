@@ -38,6 +38,11 @@ reads the env's own verdict -- ``info["solved"]`` with the correct / wrong / tim
 pick-a-target tasks, the number of clusters collected on Cluster-Hunt -- over 300 episodes
 (the record's fixed set), re-seeded per episode because the configuration is drawn at reset.
 
+**Collection and pretraining** (batch 9.2): the recorded behaviour policy collects labelled
+snapshots through the shared collector (``Collection.snapshot_extras``), and the ``task``
+objective trains encoder + head on those labels (bodies moved from
+``src/hunt_tasks/pretrain/{collect,heads,pretrain}.py``); see the two sections below.
+
 The numbers this module produces are a NEW table under the record's protocol, not a
 reproduction of ``domain_mds/{cluster_hunt,least_mass}.md``: the extractors are the harness
 ones, the ST reads a (constant) weight channel, and the trainer is the shared PPO loop.
@@ -46,17 +51,33 @@ ones, the ST reads a (constant) weight channel, and the trainer is the shared PP
 
 from __future__ import annotations
 
+import itertools
+import json
 import os
+import time
 from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
 
 import gymnasium as gym
 import numpy as np
 import pdomains  # noqa: F401 - registers the pdomains-* env ids
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize
 
 from set_transformer.rl.curriculum import Schedule, ScheduleRouter, parse_curriculum
-from set_transformer.rl.domains.base import Domain, Evaluation
+from set_transformer.rl.domains.base import (
+    Collection,
+    Domain,
+    Evaluation,
+    Objective,
+    PretrainContext,
+    PretrainResult,
+    Pretraining,
+)
 from set_transformer.rl.particle_filters.hunt import EnvEmittedBeliefFilter
 from set_transformer.rl.wrappers.particle_filter import PFDictWithWeightsObservationWrapper
 
@@ -456,6 +477,547 @@ def _eval_report(episodes, references, args, variant, cap) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Dataset collection (batch 9.2, 2026-09-13). The shared loop is rl/collect.py; what is here is
+# what only the hunt tasks know, moved from src/hunt_tasks/pretrain/collect.py of the parent repo:
+# the behaviour policy (an OU random walk or noisy pursuit of a random cluster), the per-episode
+# draw of the task size, and the LABELS each snapshot carries (cluster centres, alive flags,
+# counts, widths, the target) through the Collection.snapshot_extras hook. Particles are stored as
+# the pass-through filter emits them -- agent-relative, raw arena units, particle_scale 10, no
+# centre -- so the generic reconstruction objective reads the file unchanged and the `task`
+# objective below reads the labels. No rebalancing (the record had none).
+#
+# One difference from the record: the shared loop also records the state AFTER the terminal step,
+# so a harness dataset has one more row per episode than pretrain/collect.py produced (which
+# stopped before it); on Cluster-Hunt that last row has no live cluster, so its target is zero
+# and target_index -1. tests/test_hunt_pretrain.py drops those rows before comparing.
+# ---------------------------------------------------------------------------
+
+#: The record's per-episode draw of how many clusters spawn: the RL curriculum covers 1 -> 5
+#: (Cluster-Hunt) / 2 -> 5, so the data covers all of it, weighted toward the full task.
+N_ACTIVE_CHOICES = {"collect_all": (1, 2, 3, 4, 5, 5, 5), "pick_target": (2, 3, 4, 5, 5, 5)}
+
+
+def _behaviour(kind, rng, pos, goal, prev):
+    """Return an action in [-1,1]^2.
+
+    'walk'    : an OU random walk. Independent uniform actions would average out
+                and leave the agent near where it started, so the walk is
+                correlated in time and actually travels.
+    'pursuit' : unit step toward `goal` plus noise.
+    """
+    if kind == "walk":
+        a = 0.8 * prev + 0.6 * rng.standard_normal(2)
+    else:
+        d = goal - pos
+        n = np.linalg.norm(d)
+        a = (d / n if n > 1e-6 else rng.standard_normal(2)) + 0.35 * rng.standard_normal(2)
+    return np.clip(a, -1.0, 1.0)
+
+
+def _collect_add_arguments(parser) -> None:
+    parser.add_argument("--pursuit_frac", type=float, default=0.6,
+                        help="Fraction of episodes driven by noisy pursuit of a random cluster; "
+                             "the rest are OU random walks (the record's 0.6).")
+    parser.add_argument("--n_active_choices", type=str, default=None,
+                        help="Comma list the number of live clusters is drawn from per episode. "
+                             "Default: the record's (cluster_hunt 1,2,3,4,5,5,5; least_mass / "
+                             "most_var 2,3,4,5,5,5).")
+
+
+def _collect_resolve_arguments(parser, args, domain) -> dict:
+    variant = resolve(args.variant)
+    if args.timesteps is None:
+        args.timesteps = episode_cap(args.variant)
+    if args.num_particles is None:
+        args.num_particles = int(_env_config(args.variant).n_particles)
+    if args.n_active_choices:
+        choices = tuple(int(x) for x in args.n_active_choices.split(","))
+    else:
+        choices = N_ACTIVE_CHOICES[variant.task]
+    print(f"Variant: {args.variant} | env: {variant.env_id} | task: {variant.task} | "
+          f"cap={args.timesteps} | n_active per episode from {choices}")
+    return {"env_id": variant.env_id, "particle_filter_class": variant.particle_filter,
+            "n_active_choices": choices, "task": variant.task}
+
+
+def _collect_prepare(args, options):
+    from types import SimpleNamespace   # noqa: PLC0415
+    return SimpleNamespace(rng=np.random.default_rng(args.seed), kinds={"walk": 0, "pursuit": 0})
+
+
+def _collect_make_env(args, options, state):
+    return make_hunt_belief_env(num_particles=args.num_particles, rank=0, seed=args.seed,
+                                variant=args.variant,
+                                particle_filter_class=options["particle_filter_class"])()
+
+
+def _collect_begin_episode(args, options, state, env, episode):
+    """The record's draw order: task size, reset seed, behaviour kind; the goal is drawn on the
+    first action (it needs the centres the reset produces); Cluster-Hunt re-draws the goal at
+    5 % per step or when its cluster is gone."""
+    rng = state.rng
+    unwrapped = env.unwrapped
+    env.set_n_active(int(rng.choice(options["n_active_choices"])))
+    reset_seed = int(rng.integers(1 << 30))
+    kind = "pursuit" if rng.random() < args.pursuit_frac else "walk"
+    state.kinds[kind] += 1
+    memo = {"prev": np.zeros(2), "goal": None}
+    collect_all = options["task"] == "collect_all"
+
+    def act(obs):
+        if memo["goal"] is None:
+            # Drawn on the first action: it needs the centres the reset produced. The record
+            # drew it right after reset and then entered the loop, whose goal-switch check
+            # below ran on the first state as well.
+            n_live = int(unwrapped.n_active) if collect_all else int(unwrapped.k)
+            memo["goal"] = unwrapped.centers[rng.integers(n_live)]
+        if collect_all:
+            live = np.flatnonzero(unwrapped.alive)
+            if rng.random() < 0.05 or not unwrapped.alive[np.argmin(
+                    np.linalg.norm(unwrapped.centers - memo["goal"], axis=-1))]:
+                memo["goal"] = unwrapped.centers[rng.choice(live)]
+        memo["prev"] = _behaviour(kind, rng, unwrapped.pos, memo["goal"], memo["prev"])
+        return memo["prev"]
+
+    return {"seed": reset_seed}, act
+
+
+def _collect_snapshot_extras(args, options, state, env, obs, step_index) -> dict:
+    """The labels of one snapshot, in the record's layout: K = n_clusters slots."""
+    u = env.unwrapped
+    K = int(u.cfg.n_clusters)
+    centers = np.zeros((K, 2), np.float32)
+    alive = np.zeros(K, np.float32)
+    counts = np.zeros(K, np.float32)
+    sigmas = np.zeros(K, np.float32)
+    if options["task"] == "collect_all":
+        # Every centre (the record labelled all five, dead ones included) with its alive flag.
+        centers[:] = ((u.centers - u.pos) / ARENA_SCALE).astype(np.float32)
+        alive[:] = u.alive.astype(np.float32)
+        sigmas[:] = u.sigmas
+        counts[:] = u._particle_counts()
+        live = np.flatnonzero(u.alive)
+        if len(live):
+            d = np.linalg.norm(u.centers[live] - u.pos, axis=-1)
+            j = int(live[np.argmin(d)])
+            target = ((u.centers[j] - u.pos) / ARENA_SCALE).astype(np.float32)
+        else:
+            j, target = -1, np.zeros(2, np.float32)
+    else:
+        k = int(u.k)
+        centers[:k] = (u.centers - u.pos) / ARENA_SCALE
+        alive[:k] = 1.0
+        counts[:k] = u.counts
+        sigmas[:k] = u.sigmas
+        j = int(u.target)
+        target = ((u.centers[j] - u.pos) / ARENA_SCALE).astype(np.float32)
+    return dict(agent=np.asarray(obs["obs"], np.float32), centers=centers, alive=alive,
+                counts=counts, sigmas=sigmas, target=target,
+                target_index=np.int64(j), step=np.int32(step_index))
+
+
+def _collect_finish(args, options, state, n_snapshots) -> None:
+    print(f"Episodes -- " + ", ".join(f"{k}: {v}" for k, v in state.kinds.items())
+          + f"; snapshots (raw): {n_snapshots}")
+
+
+def _collect_report(args, options, particles, weights, steps, stage) -> None:
+    if stage != "final":
+        return
+    print(f"Dataset: particles {particles.shape} (agent-relative, raw units), weights "
+          f"{weights.shape} (uniform)")
+    for dim in range(particles.shape[-1]):
+        column = particles[:, :, dim]
+        print(f"  dim {dim}: [{column.min():.2f}, {column.max():.2f}]")
+    print(f"  particle_scale (recorded for pretraining): {ARENA_SCALE}")
+
+
+def _collect_metadata_extras(args, options, particles, weights, steps) -> dict:
+    return dict(task=options["task"], episode_cap=episode_cap(args.variant),
+                n_clusters=int(_env_config(args.variant).n_clusters),
+                pursuit_frac=args.pursuit_frac, n_active_choices=list(options["n_active_choices"]),
+                env_kwargs=dict(gym.spec(resolve(args.variant).env_id).kwargs),
+                label_arrays=["agent", "centers", "alive", "counts", "sigmas", "target",
+                              "target_index", "step"])
+
+
+HUNT_COLLECTION = Collection(
+    add_arguments=_collect_add_arguments,
+    defaults={"seed": 7, "num_episodes": 4000},
+    resolve_arguments=_collect_resolve_arguments,
+    particle_scale=lambda args, options: ARENA_SCALE,
+    prepare=_collect_prepare,
+    make_env=_collect_make_env,
+    begin_episode=_collect_begin_episode,
+    finish=_collect_finish,
+    report=_collect_report,
+    metadata_extras=_collect_metadata_extras,
+    snapshot_extras=_collect_snapshot_extras,
+    progress_desc="Collecting hunt episodes",
+)
+
+
+# ---------------------------------------------------------------------------
+# The `task` pretraining objective (batch 9.2): the encoder + a 3-layer head trained on the
+# dataset's labels, as src/hunt_tasks/pretrain/{heads,pretrain}.py did (bodies moved). The
+# encoder is the harness extractor built through the shared encoder table, so the checkpoint
+# loads in rl/train.py without translation; the head reads the belief features only.
+#   pick_target (least_mass, most_var): MSE from the head to the agent-relative offset of the
+#                                       target cluster (the stage-1 probe objective).
+#   collect_all (cluster_hunt):         permutation-matched slot loss over K (dx, dy, alive).
+# The record's control, Chamfer reconstruction, is the generic objective with
+# `--loss_type chamfer --ignore_weights` (decision 9c-7).
+# ---------------------------------------------------------------------------
+
+TASK_ENCODERS = ("st", "cgf", "deepset", "pointnet")
+
+_PERM_CACHE: dict = {}
+
+
+def perms(k: int, device) -> torch.Tensor:
+    """All permutations of ``range(k)`` as a [k!, k] index tensor, cached per device
+    (moved from src/mode_recovery_probe/probe2d/metrics2d.py)."""
+    key = (k, str(device))
+    if key not in _PERM_CACHE:
+        _PERM_CACHE[key] = torch.tensor(list(itertools.permutations(range(k))),
+                                        device=device, dtype=torch.long)
+    return _PERM_CACHE[key]
+
+
+def matched_slot_loss(off_pred, alive_logit, off_tgt, alive_tgt):
+    """Permutation-invariant loss over K unordered cluster slots.
+
+    Position error counts only for clusters that are actually there; the alive
+    flag is scored for every slot. K = 5 gives 120 permutations, which is one
+    vectorized reduction, so no assignment solver is needed.
+    """
+    B, K, _ = off_pred.shape
+    P = perms(K, off_pred.device)                                  # [Pn, K]
+    op = off_pred[:, P, :]                                         # [B, Pn, K, 2]
+    ap = alive_logit[:, P]                                         # [B, Pn, K]
+    pos = ((op - off_tgt[:, None]) ** 2).sum(-1) * alive_tgt[:, None]
+    bce = F.binary_cross_entropy_with_logits(
+        ap, alive_tgt[:, None].expand_as(ap), reduction="none")
+    cost = (pos + 0.1 * bce).mean(-1)                              # [B, Pn]
+    best = cost.argmin(1)
+    return cost[torch.arange(B, device=cost.device), best].mean()
+
+
+class TaskData:
+    """The dataset on the device, split episode-disjoint: states arrive in rollout order and
+    neighbouring states within an episode are near duplicates, so a random split leaks and the
+    validation metric reads far higher than the encoder deserves (the record's rule: the last
+    ``val_frac`` of rows are validation)."""
+
+    LABELS = ("centers", "alive", "counts", "sigmas", "target", "target_index")
+
+    def __init__(self, path: str, val_frac: float, device: torch.device):
+        with np.load(path, allow_pickle=True) as z:
+            missing = [k for k in ("particles", "weights", "agent", *self.LABELS) if k not in z.files]
+            if missing:
+                raise ValueError(f"{path} is not a hunt dataset: missing arrays {missing} "
+                                 "(collect it with python -m set_transformer.rl.collect --domain hunt)")
+            self.metadata = json.loads(str(z["metadata"])) if "metadata" in z.files else {}
+            arrays = {k: np.asarray(z[k]) for k in ("particles", "weights", "agent", *self.LABELS)}
+        n = len(arrays["particles"])
+        n_val = int(val_frac * n)
+        if n_val < 1 or n - n_val < 1:
+            raise ValueError(f"{n} rows cannot be split with val_frac={val_frac}")
+        self.particle_scale = float(self.metadata.get("particle_scale", ARENA_SCALE))
+        self.n_train, self.n_val = n - n_val, n_val
+        self.device = device
+        self.train = {k: torch.as_tensor(v[:n - n_val]).to(device) for k, v in arrays.items()}
+        self.val = {k: torch.as_tensor(v[n - n_val:]).to(device) for k, v in arrays.items()}
+        self.num_particles = int(arrays["particles"].shape[1])
+        self.dim_particles = int(arrays["particles"].shape[2])
+
+    @staticmethod
+    def obs(split: dict, index) -> dict:
+        """What the RL extractor is handed: the agent position, the RAW agent-relative cloud
+        (the extractor divides by arena_scale) and the (uniform) weights."""
+        return {"obs": split["agent"][index], "particles": split["particles"][index],
+                "weights": split["weights"][index]}
+
+
+class TaskEncoderWithHead(nn.Module):
+    """extractor -> belief features (the agent passthrough dropped) -> 3-layer head."""
+
+    def __init__(self, extractor: nn.Module, obs_dim: int, out_dim: int, hidden: int = 256):
+        super().__init__()
+        self.extractor = extractor
+        self.obs_dim = obs_dim
+        d = extractor.features_dim - obs_dim
+        self.head = nn.Sequential(
+            nn.Linear(d, hidden), nn.GELU(),
+            nn.Linear(hidden, hidden), nn.GELU(),
+            nn.Linear(hidden, out_dim))
+
+    def features(self, obs: dict) -> torch.Tensor:
+        return self.extractor(obs)[:, self.obs_dim:]
+
+    def forward(self, obs: dict) -> torch.Tensor:
+        return self.head(self.features(obs))
+
+
+def task_loss(y: torch.Tensor, batch: dict, task: str, n_clusters: int) -> torch.Tensor:
+    if task == "collect_all":
+        y = y.view(-1, n_clusters, 3)
+        return matched_slot_loss(y[..., :2], y[..., 2], batch["centers"], batch["alive"])
+    return F.mse_loss(y, batch["target"])
+
+
+@torch.no_grad()
+def task_metrics(y: torch.Tensor, batch: dict, task: str, n_clusters: int,
+                 scale: float) -> dict:
+    """The numbers that decide whether pretraining worked, in arena units (the record's
+    `PretrainModel.evaluate`, moved): identification rate and location error on the pick-a-target
+    tasks; centre error and alive accuracy on Cluster-Hunt."""
+    if task == "collect_all":
+        y = y.view(-1, n_clusters, 3)
+        P = perms(n_clusters, y.device)
+        op = y[:, P, :2]
+        al = y[:, P, 2]
+        pos = ((op - batch["centers"][:, None]) ** 2).sum(-1) * batch["alive"][:, None]
+        bce = F.binary_cross_entropy_with_logits(
+            al, batch["alive"][:, None].expand_as(al), reduction="none")
+        best = (pos + 0.1 * bce).mean(-1).argmin(1)
+        idx = torch.arange(len(y), device=y.device)
+        e = scale * torch.linalg.norm(op[idx, best] - batch["centers"], dim=-1)
+        m = batch["alive"] > 0
+        return {"centre_mae": float(e[m].mean()),
+                "alive_acc": float(((al[idx, best] > 0).float() == batch["alive"]).float().mean())}
+    err = scale * torch.linalg.norm(y - batch["target"], dim=-1)
+    d = torch.linalg.norm(batch["centers"] - y[:, None, :], dim=-1)
+    d = d.masked_fill(batch["alive"] < 0.5, float("inf"))
+    return {"loc_mae": float(err.mean()),
+            "identify_acc": float((d.argmin(1) == batch["target_index"]).float().mean()),
+            "within_1.0": float((err < 1.0).float().mean())}
+
+
+def build_task_extractor(args, space: gym.spaces.Dict, scale: float):
+    """The encoder under pretraining, as the RL arm's own SB3 extractor class, built from the
+    flags THROUGH THE SHARED ENCODER TABLE (rl/encoders.py): the same construction
+    `rl/train.py --encoder <name>` performs."""
+    from set_transformer.rl import encoders as _encoders   # noqa: PLC0415 - see odd_even.build_extractor
+    encoder = _encoders.get(args.encoder)
+    kwargs = encoder.extractor_kwargs(args)
+    kwargs["arena_scale"] = float(scale)
+    kwargs[encoder.extractor_class.PRETRAINED_PATH_KWARG] = None
+    return encoder.extractor_class(space, **kwargs)
+
+
+def extractor_geometry(extractor) -> dict:
+    for attr in ("_st_geometry", "_cgf_geometry", "_geometry"):
+        if hasattr(extractor, attr):
+            return dict(getattr(extractor, attr))
+    return {}
+
+
+def save_task_checkpoint(model: TaskEncoderWithHead, path: Path, args, epoch: int, val: dict,
+                         geometry: dict, task: str) -> None:
+    """The format each extractor's own loader reads. ST: encoder keys under `set_transformer.`;
+    CGF: the extractor's whole state_dict (t, norm statistics and readout ARE the encoder);
+    deepset / pointnet: the encoder under `encoder.` with `particle_scale` top-level."""
+    extractor = model.extractor
+    if args.encoder == "st":
+        state = {f"set_transformer.{k}": v.detach().cpu() for k, v in extractor.encoder.state_dict().items()}
+    elif args.encoder == "cgf":
+        state = {k: v.detach().cpu() for k, v in extractor.state_dict().items()}
+    else:
+        state = {f"encoder.{k}": v.detach().cpu() for k, v in extractor.encoder.state_dict().items()}
+    config = {**geometry, "objective": "task", "task": task, "variant": args.variant,
+              "arena_scale": float(extractor.arena_scale), "encoder": args.encoder,
+              "encoder_params": int(getattr(args, "encoder_params", 0)),
+              "pretraining": "set_transformer.rl.pretrain --domain hunt --objective task"}
+    if args.encoder in ("deepset", "pointnet"):
+        config["weighted_particles"] = bool(extractor.weight_channel)
+    torch.save({
+        "model_state_dict": state,
+        "head_state_dict": {k: v.detach().cpu() for k, v in model.head.state_dict().items()},
+        "config": config,
+        "particle_scale": float(extractor.arena_scale),
+        "epoch": epoch,
+        "val": val,
+        "args": vars(args),
+    }, path)
+
+
+def _task_add_arguments(parser, domain=None) -> None:
+    g = parser.add_argument_group("task objective: data")
+    g.add_argument("--data_path", type=str, default=None,
+                   help="The collected hunt dataset (.npz with the label arrays). Default: the "
+                        "variant's dataset under the output root.")
+    g.add_argument("--val_frac", type=float, default=0.1,
+                   help="Last fraction of rows (rollout order, so episode-disjoint) held out.")
+    t = parser.add_argument_group("task objective: training (the record's settings)")
+    t.add_argument("--num_epochs", type=int, default=120)
+    t.add_argument("--patience", type=int, default=15,
+                   help="Stop after this many epochs without a validation improvement.")
+    t.add_argument("--batch_size", type=int, default=256)
+    t.add_argument("--learning_rate", type=float, default=1e-3)
+    t.add_argument("--head_hidden", type=int, default=256)
+
+
+def _task_locate(args) -> dict:
+    if not args.data_path:
+        return {"variant": None, "env_id": None}
+    from set_transformer.rl.pretrain_objectives.reconstruction import dataset_metadata  # noqa: PLC0415
+    meta = dataset_metadata(args.data_path)
+    return {"variant": meta.get("variant"), "env_id": meta.get("env_id")}
+
+
+def _task_resolve_arguments(parser, args, domain, encoder) -> None:
+    if encoder.name not in TASK_ENCODERS:
+        parser.error(f"the task objective is implemented for --encoder "
+                     f"{' | '.join(TASK_ENCODERS)}, not {encoder.name!r}")
+    if args.data_path is None:
+        if args.variant is None:
+            parser.error("--data_path or --variant is needed: the task objective reads the "
+                         "collected dataset")
+        from set_transformer.rl import run_records   # noqa: PLC0415
+        args.data_path = str(run_records.dataset_path(domain.name, args.variant, root=args.output_root))
+        print(f"--data_path not given; the variant's dataset under the root: {args.data_path}")
+    if not os.path.isfile(args.data_path):
+        parser.error(f"dataset {args.data_path} does not exist (collect it with "
+                     "python -m set_transformer.rl.collect --domain hunt --variant <v>)")
+
+
+def _task_prepare(parser, args, domain, encoder, device):
+    data = TaskData(args.data_path, args.val_frac, torch.device(device))
+    recorded = data.metadata.get("variant")
+    if recorded is not None and args.variant is not None and recorded != args.variant:
+        parser.error(f"--variant {args.variant} but the dataset was collected on {recorded!r}")
+    if args.variant is None:
+        args.variant = recorded
+    args.num_particles = data.num_particles
+    args.dim_particles = data.dim_particles
+    args.arena_scale = data.particle_scale
+    return data
+
+
+def _task_run_name(args, now: datetime) -> str:
+    return f"{now.strftime('%Y%m%d_%H%M%S')}_task_{args.encoder}_seed{args.seed}"
+
+
+def _task_run(args, ctx: PretrainContext) -> PretrainResult:
+    """The training loop of src/hunt_tasks/pretrain/pretrain.py::main, moved: Adam, halve the
+    rate on a plateau, early stop, keep the best encoder WITH its matching head."""
+    args.encoder = ctx.encoder.name
+    data: TaskData = ctx.data
+    device = torch.device(ctx.device)
+    variant = resolve(args.variant)
+    task = variant.task
+    n_clusters = int(_env_config(args.variant).n_clusters)
+    run_dir = Path(ctx.run_dir)
+    checkpoint_dir = Path(ctx.checkpoint_dir) if ctx.checkpoint_dir else run_dir
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "args.json").write_text(json.dumps(vars(args), indent=2, default=str))
+
+    space = gym.spaces.Dict({
+        "obs": gym.spaces.Box(-np.inf, np.inf, (2,), np.float32),
+        "particles": gym.spaces.Box(-np.inf, np.inf, (data.num_particles, data.dim_particles), np.float32),
+        "weights": gym.spaces.Box(0.0, 1.0, (data.num_particles,), np.float32),
+    })
+    extractor = build_task_extractor(args, space, data.particle_scale)
+    geometry = extractor_geometry(extractor)
+    out_dim = n_clusters * 3 if task == "collect_all" else 2
+    model = TaskEncoderWithHead(extractor, obs_dim=2, out_dim=out_dim, hidden=args.head_hidden).to(device)
+    n_encoder = sum(p.numel() for p in extractor.encoder_parameters())
+    args.encoder_params = int(n_encoder)
+    print(f"[{args.variant}/task/{args.encoder}] train={data.n_train:,} val={data.n_val:,} "
+          f"encoder params={n_encoder:,} head out={out_dim} device={device}", flush=True)
+
+    opt = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
+    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, factor=0.5, patience=5)
+
+    def val_loss():
+        model.eval()
+        tot, n = 0.0, 0
+        with torch.no_grad():
+            for i in range(0, data.n_val, 2048):
+                s = slice(i, min(i + 2048, data.n_val))
+                b = {k: v[s] for k, v in data.val.items()}
+                tot += float(task_loss(model(TaskData.obs(data.val, s)), b, task, n_clusters)) * (s.stop - s.start)
+                n += s.stop - s.start
+        return tot / max(n, 1)
+
+    best, best_epoch, best_state, best_head, bad, hist = float("inf"), None, None, None, 0, []
+    t0 = time.time()
+    for ep in range(args.num_epochs):
+        model.train()
+        perm = torch.randperm(data.n_train, device=device)
+        run = 0.0
+        for i in range(0, data.n_train, args.batch_size):
+            j = perm[i:i + args.batch_size]
+            b = {k: v[j] for k, v in data.train.items()}
+            loss = task_loss(model(TaskData.obs(data.train, j)), b, task, n_clusters)
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+            run += float(loss.detach()) * len(j)
+        v = val_loss()
+        sched.step(v)
+        hist.append({"epoch": ep, "train": run / data.n_train, "val": v})
+        if v < best - 1e-6:
+            best, best_epoch, bad = v, ep, 0
+            # Snapshot the HEAD as well as the encoder: the metrics below are computed with
+            # encoder + head, and a best-epoch encoder paired with a final-epoch head is a
+            # combination that never existed during training (the record's ST dim_hidden=512
+            # run reported a good best_val next to a near-chance identify_acc that way).
+            best_state = {k: t.detach().clone() for k, t in extractor.state_dict().items()}
+            best_head = {k: t.detach().clone() for k, t in model.head.state_dict().items()}
+        else:
+            bad += 1
+        if ep % 10 == 0 or bad >= args.patience or ep == args.num_epochs - 1:
+            print(f"  ep{ep:>3} train={run / data.n_train:.5f} val={v:.5f} best={best:.5f}", flush=True)
+        (run_dir / "history.json").write_text(json.dumps(hist, indent=1))
+        if bad >= args.patience:
+            break
+    save_task_checkpoint(model, checkpoint_dir / "checkpoint_last.pt", args, len(hist) - 1,
+                         {"loss": hist[-1]["val"]}, geometry, task)
+
+    extractor.load_state_dict(best_state)
+    model.head.load_state_dict(best_head)
+    model.eval()
+    chunks = []
+    with torch.no_grad():
+        for i in range(0, data.n_val, 4096):
+            s = slice(i, min(i + 4096, data.n_val))
+            b = {k: v[s] for k, v in data.val.items()}
+            chunks.append(task_metrics(model(TaskData.obs(data.val, s)), b, task, n_clusters,
+                                       data.particle_scale))
+    metrics = {k: float(np.mean([c[k] for c in chunks])) for k in chunks[0]}
+    save_task_checkpoint(model, checkpoint_dir / "checkpoint_best.pt", args, best_epoch,
+                         {"loss": best, **metrics}, geometry, task)
+    (run_dir / "metrics.json").write_text(json.dumps(
+        dict(best_val=best, best_epoch=best_epoch, epochs=len(hist), minutes=(time.time() - t0) / 60,
+             val_metrics=metrics, history=hist), indent=2))
+    print(f"[{args.variant}/task/{args.encoder}] best_val={best:.5f} (epoch {best_epoch})  "
+          + "  ".join(f"{k}={v:.4f}" for k, v in metrics.items())
+          + f"  ({(time.time() - t0) / 60:.1f} min) -> {checkpoint_dir}", flush=True)
+    checkpoints = {"best": checkpoint_dir / "checkpoint_best.pt", "last": checkpoint_dir / "checkpoint_last.pt"}
+    return PretrainResult(run_dir=run_dir, rl_checkpoint=checkpoints["best"], checkpoints=checkpoints,
+                          summary={"best_val_loss": best, "best_epoch": best_epoch,
+                                   "epochs": len(hist), **metrics})
+
+
+TASK_OBJECTIVE = Objective(
+    name="task",
+    description="encoder + 3-layer head -> the dataset's labels: the offset to the target "
+                "cluster (least_mass / most_var, MSE) or every centre + alive flag "
+                "(cluster_hunt, permutation-matched); the record's pretraining objective",
+    add_arguments=_task_add_arguments,
+    run=_task_run,
+    run_name=_task_run_name,
+    locate=_task_locate,
+    resolve_arguments=_task_resolve_arguments,
+    prepare=_task_prepare,
+    default_experiment_name=lambda encoder_name: f"{encoder_name}_task_pretrain",
+)
+
+
+# ---------------------------------------------------------------------------
 # Encoder defaults
 # ---------------------------------------------------------------------------
 
@@ -520,4 +1082,10 @@ HUNT = Domain(
         "st": dict(num_inds=16, dim_hidden=64, num_post_sab=2),
     },
     evaluation=Evaluation(default_n_episodes=300, reseed_per_episode=True, report=_eval_report),
+    # The record's supervised objective; `rl/pretrain.py --domain hunt` runs it when --objective
+    # is omitted. The generic reconstruction (Chamfer + --ignore_weights = the record's control)
+    # needs no declaration.
+    pretraining=Pretraining(objectives={"task": TASK_OBJECTIVE}, default_objective="task"),
+    # Step 2: the record's behaviour policy, labels per snapshot, no rebalancing (batch 9.2).
+    collection=HUNT_COLLECTION,
 )

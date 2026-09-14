@@ -60,6 +60,10 @@ NPY_REFUSAL = ("Output must be .npz -- a .npy cannot hold the weights alongside 
 # Command line
 # ---------------------------------------------------------------------------
 
+#: The identity ``rebalance`` every Collection has unless it declares its own.
+_DEFAULT_REBALANCE = Collection.__dataclass_fields__["rebalance"].default
+
+
 def collection_of(domain: Domain, parser_for_errors=None) -> Collection:
     if domain.collection is None:
         message = f"domain {domain.name!r} declares no dataset collector (Domain.collection is None)"
@@ -123,7 +127,8 @@ def build_parser(domain: Domain, *, prog: str | None = None,
 # The loop
 # ---------------------------------------------------------------------------
 
-def collect_arrays(domain: Domain, args, options: dict, *, progress: bool = True):
+def collect_arrays(domain: Domain, args, options: dict, *, progress: bool = True,
+                   extras_out: dict | None = None):
     """Roll out the RL-time belief env and record every belief it produces.
 
     The loop the two collectors shared, written once: the problem prepares (policy, RNG),
@@ -131,7 +136,10 @@ def collect_arrays(domain: Domain, args, options: dict, *, progress: bool = True
     every step the particle cloud and its weights are stored, with the problem's centre added
     back so the file holds RAW coordinates.
 
-    Returns ``(particles [S, N, D] float32, weights [S, N] float32, steps [S] int64)``.
+    Returns ``(particles [S, N, D] float32, weights [S, N] float32, steps [S] int64)``. A domain
+    whose ``Collection.snapshot_extras`` returns per-snapshot labels gets them stacked (one array
+    per key, first axis S, truncated like the particles) into ``extras_out`` when the caller
+    passes a dict (batch 9.2).
     """
     collection = collection_of(domain)
     state = collection.prepare(args, options)
@@ -141,6 +149,7 @@ def collect_arrays(domain: Domain, args, options: dict, *, progress: bool = True
     all_particles: list[np.ndarray] = []
     all_weights: list[np.ndarray] = []
     all_steps: list[int] = []
+    all_extras: dict[str, list] = {}
 
     def _record(obs_dict, step_index):
         particles = np.asarray(obs_dict["particles"], dtype=np.float32)
@@ -153,6 +162,13 @@ def collect_arrays(domain: Domain, args, options: dict, *, progress: bool = True
         all_particles.append(particles)
         all_weights.append(np.asarray(obs_dict["weights"], dtype=np.float32))
         all_steps.append(int(step_index))
+        extras = collection.snapshot_extras(args, options, state, env, obs_dict, step_index)
+        if extras:
+            if all_extras and set(extras) != set(all_extras):
+                raise RuntimeError(f"snapshot_extras changed its keys: {sorted(all_extras)} then "
+                                   f"{sorted(extras)}")
+            for key, value in extras.items():
+                all_extras.setdefault(key, []).append(np.asarray(value))
 
     episodes = range(args.num_episodes)
     bar = tqdm(episodes, desc=collection.progress_desc) if progress else episodes
@@ -183,6 +199,10 @@ def collect_arrays(domain: Domain, args, options: dict, *, progress: bool = True
         particles = particles[:args.max_snapshots]
         weights = weights[:args.max_snapshots]
         steps = steps[:args.max_snapshots]
+    if extras_out is not None:
+        for key, values in all_extras.items():
+            stacked = np.asarray(values)
+            extras_out[key] = stacked[:args.max_snapshots] if args.max_snapshots is not None else stacked
     return particles, weights, steps
 
 
@@ -277,15 +297,24 @@ def main(argv: Sequence[str] | None = None, *, domain: Domain | str | None = Non
 
     print(f"Collecting {args.num_episodes} episodes x up to {args.timesteps} steps, "
           f"{args.num_particles} particles, seed {args.seed}")
-    particles, weights, steps = collect_arrays(domain, args, options, progress=True)
+    snapshot_extras: dict = {}
+    particles, weights, steps = collect_arrays(domain, args, options, progress=True,
+                                               extras_out=snapshot_extras)
     collection.report(args, options, particles, weights, steps, "raw")
     if not args.no_rebalance:
+        if snapshot_extras and collection.rebalance is not _DEFAULT_REBALANCE:
+            # Rebalancing permutes / duplicates / drops rows; the per-snapshot labels would no
+            # longer line up with the particles. No domain declares both today.
+            parser.error(f"domain {domain.name!r} records per-snapshot labels "
+                         f"({sorted(snapshot_extras)}) and also rebalances; the two cannot be "
+                         "combined. Pass --no_rebalance.")
         particles, weights, steps = collection.rebalance(args, options, particles, weights, steps)
     collection.report(args, options, particles, weights, steps, "final")
 
     metadata = build_metadata(domain, args, options, particles, weights, steps,
                               command=" ".join([prog or "set_transformer.rl.collect", *argv]))
-    extra = collection.extra_arrays(args, options, particles, weights, steps)
+    extra = dict(snapshot_extras)
+    extra.update(collection.extra_arrays(args, options, particles, weights, steps))
     save_dataset(output, particles, weights, metadata, extra)
     print(f"Saved to {output}")
     return output

@@ -223,6 +223,13 @@ class Collection:
     #: ``extra_arrays(args, options, particles, weights, steps) -> dict``: further members of the
     #: ``.npz`` (Odd-Even: ``particle_centre``, ``steps``).
     extra_arrays: Callable = lambda args, options, particles, weights, steps: {}
+    #: ``snapshot_extras(args, options, state, env, obs, step_index) -> dict | None``: per-snapshot
+    #: LABELS read off the live env at the moment a belief is recorded (hunt: the cluster centres,
+    #: alive flags, counts, widths and the target; batch 9.2, 2026-09-13). The collector stacks
+    #: them into one array per key, truncates them with ``--max_snapshots`` and writes them next to
+    #: :attr:`extra_arrays`. None (the default) records nothing. A domain that returns extras may
+    #: not also rebalance (the rows would no longer line up) unless ``--no_rebalance`` is given.
+    snapshot_extras: Callable = lambda args, options, state, env, obs, step_index: None
     #: The progress bar's label.
     progress_desc: str = "Collecting episodes"
 
