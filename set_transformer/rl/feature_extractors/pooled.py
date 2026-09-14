@@ -100,8 +100,16 @@ class _PooledFeaturesExtractor(BaseFeaturesExtractor):
             raise ValueError(f"{type(self).__name__}: pooling must be one of "
                              f"{self.POOLINGS}, got {pooling!r}")
         if frozen and not pretrained_model_path:
-            raise ValueError(f"{type(self).__name__}: frozen=True without a pretrained "
-                             "checkpoint would freeze a random encoder")
+            # Not an error (batch 10.4, 2026-09-14). SB3 pickles the extractor's kwargs into the
+            # saved policy zip, and the post-construction reload blanks the checkpoint PATH there
+            # (no absolute path in the zip) while `frozen` stays True; PPO.load then rebuilds the
+            # extractor with exactly this pair of arguments before it restores the trained tensors.
+            # Refusing it made every frozen pooled agent unloadable at evaluation (found by the w1p
+            # smoke). Freezing a random encoder in a FRESH run is still refused, by the trainer's
+            # start-mode resolution (`--frozen without --pretrained_path`, rl/encoders.py), as the
+            # ST arm does it.
+            print(f"{type(self).__name__}: frozen=True without a checkpoint path -- a reload of a "
+                  "saved policy (its trained tensors follow); the encoder is frozen as it stands.")
         obs_dim = observation_space["obs"].shape[0]
         particle_dim = observation_space["particles"].shape[1]
         self.num_particles = observation_space["particles"].shape[0]
@@ -246,6 +254,16 @@ class _PooledFeaturesExtractor(BaseFeaturesExtractor):
 
     def encoder_state_dict(self) -> dict:
         return self.encoder.state_dict()
+
+    def checkpoint_state(self) -> dict:
+        """The inverse of `load_pretrained` (batch 10.4): the encoder tensors under the
+        ``encoder.`` prefix `_extract_encoder_state` strips, detached, on the CPU."""
+        return {f"encoder.{k}": v.detach().cpu() for k, v in self.encoder.state_dict().items()}
+
+    def checkpoint_config(self) -> dict:
+        """The geometry record `_check_checkpoint_geometry` reads: the constructor's record plus
+        ``weighted_particles`` under the name the loader (and the ST's record) uses."""
+        return {**self._geometry, "weighted_particles": bool(self.weight_channel)}
 
     def reference_state(self, path: str) -> dict:
         return self.pretrained_reference_state(path)

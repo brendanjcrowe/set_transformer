@@ -1483,8 +1483,11 @@ def _split_accuracy(preds, labels, steps):
 # ---------------------------------------------------------------------------
 
 
-#: Encoders the exact-posterior objectives can pretrain.
-EXACT_POSTERIOR_ENCODERS = ("st", "cgf")
+# Encoders the exact-posterior objectives can pretrain: EVERY learned encoder of the shared table
+# (st, cgf, deepset, pointnet; batch 10.4, 2026-09-14 -- before it a hand-kept tuple ("st", "cgf")).
+# The check is `encoder.learned` in `_belief_resolve_arguments`; the pooled arms read the exact
+# posterior through their weight channel (weights x N as an input column) and their weighted /
+# masked pooling, and their checkpoint is written by the extractor's own `checkpoint_state()`.
 
 
 # -- data ----------------------------------------------------------------------------------
@@ -1571,8 +1574,9 @@ def build_extractor(args, space, scale: float, pretrained_path: str | None = Non
 
 
 def extractor_geometry(extractor) -> dict:
-    return dict(extractor._st_geometry if hasattr(extractor, "_st_geometry")
-                else extractor._cgf_geometry)
+    """The geometry record the extractor's loader checks; since batch 10.4 the extractor says it
+    itself (`checkpoint_config`), for every learned encoder."""
+    return extractor.checkpoint_config()
 
 
 class BeliefEncoderWithHead(nn.Module):
@@ -1640,32 +1644,25 @@ def evaluate_belief_head(model, batches: BeliefBatches, objective: str, batch_si
 
 def save_belief_checkpoint(model: BeliefEncoderWithHead, path: Path, args, epoch: int,
                            val: dict, geometry: dict) -> None:
-    """The format the RL arm's extractor loads: a dict with `model_state_dict`
-    and a `config` carrying the geometry fields the loader checks.
-
-    ST: encoder keys under `set_transformer.` (what SetTransformerFeaturesExtractor
-    strips). CGF: the extractor's whole state_dict, unprefixed -- t, the norm
-    statistics and the readout ARE the encoder."""
-    if args.encoder == "st":
-        encoder_state = {f"set_transformer.{k}": v.detach().cpu()
-                         for k, v in model.extractor.encoder.state_dict().items()}
-    else:
-        encoder_state = {k: v.detach().cpu()
-                         for k, v in model.extractor.state_dict().items()}
-    torch.save({
-        "model_state_dict": encoder_state,
-        "head_state_dict": {k: v.detach().cpu() for k, v in model.head.state_dict().items()},
-        "config": {**geometry, "objective": args.objective, "variant": args.variant,
-                   "arena_scale": float(model.extractor.arena_scale),
-                   "encoder": args.encoder,
-                   "encoder_params": int(getattr(args, "encoder_params", 0)),
-                   # The producer's historical name, kept so checkpoints stay byte-identical
-                   # with the recorded ones; the unified config block is batch 7.5's.
-                   "pretraining": "3_pretrain_st_belief.py"},
-        "epoch": epoch,
-        "val": val,
-        "args": vars(args),
-    }, path)
+    """The format the RL arm's extractor loads, assembled by
+    :func:`~set_transformer.rl.pretrained_encoder.encoder_checkpoint` from the extractor's own
+    `checkpoint_state()` / `checkpoint_config()` (batch 10.4; before it an if-chain on the encoder
+    name lived here: ST keys under ``set_transformer.``, CGF the whole state). ``geometry`` is the
+    same record the extractor reports and is kept in the signature for the entry point; the
+    extractor's is written. Top-level ``particle_scale`` (the Trainer's convention) is new since
+    10.4; the loaders compare it with their ``arena_scale``."""
+    from set_transformer.rl.pretrained_encoder import encoder_checkpoint   # noqa: PLC0415 - cycle
+    torch.save(encoder_checkpoint(
+        model.extractor,
+        config={"objective": args.objective, "variant": args.variant,
+                "arena_scale": float(model.extractor.arena_scale),
+                "encoder": args.encoder,
+                "encoder_params": int(getattr(args, "encoder_params", 0)),
+                # The producer's historical name, kept so the recorded checkpoints' readers
+                # keep working; the unified record block is batch 7.5's.
+                "pretraining": "3_pretrain_st_belief.py"},
+        head_state_dict={k: v.detach().cpu() for k, v in model.head.state_dict().items()},
+        epoch=epoch, val=val, args=vars(args)), path)
 
 
 # -- the Objective hooks (rl/domains/base.py::Objective) -------------------------------------
@@ -1700,9 +1697,9 @@ def _belief_add_arguments(parser: argparse.ArgumentParser, domain=None) -> None:
 
 
 def _belief_resolve_arguments(parser, args, domain, encoder) -> None:
-    if encoder.name not in EXACT_POSTERIOR_ENCODERS:
-        parser.error(f"exact-posterior pretraining is implemented for --encoder "
-                     f"{' | '.join(EXACT_POSTERIOR_ENCODERS)}, not {encoder.name!r}")
+    if not encoder.learned:
+        parser.error(f"exact-posterior pretraining needs a learned encoder (st, cgf, deepset, "
+                     f"pointnet); {encoder.name!r} has no parameters to train")
     if args.variant is None:
         parser.error("exact-posterior pretraining rolls the env itself: pass --variant "
                      "<registry key> (--list_variants shows them)")
@@ -1792,7 +1789,7 @@ def _belief_run(args, ctx: PretrainContext, target: str) -> PretrainResult:
     n_encoder_buffers = sum(b.numel() for b in extractor.buffers())
     print(f"encoder+head parameters: {n_params:,}  (head {n_head:,}; encoder "
           f"{n_params - n_head:,} trainable + {n_encoder_buffers:,} buffer values)")
-    if args.encoder == "st":
+    if args.encoder != "cgf":                  # the CGF's count comes from its readout sizing
         args.encoder_params = int(n_params - n_head)
 
     trainable = [p for p in model.parameters() if p.requires_grad]

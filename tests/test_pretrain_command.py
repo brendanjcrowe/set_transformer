@@ -227,9 +227,11 @@ def test_exact_posterior_dry_run_writes_the_record_under_the_root(tmp_path, monk
 
 def test_exact_posterior_refusals(tmp_path, capsys):
     base = ["--domain", "odd_even", "--variant", "oe50_short", "--dry_run", "--base_dir", str(tmp_path)]
+    # 10.4: the pooled arms are accepted (every learned encoder is); an analytic one is refused by
+    # the door before the objective sees it
     with pytest.raises(SystemExit):
-        pretrain.main(["--encoder", "deepset", *base])
-    assert "implemented for --encoder st | cgf, not 'deepset'" in capsys.readouterr().err
+        pretrain.main(["--encoder", "gaussian", *base])
+    assert "has no parameters to pretrain" in capsys.readouterr().err
     with pytest.raises(SystemExit):
         pretrain.main(["--domain", "odd_even", "--encoder", "st", "--dry_run", "--base_dir", str(tmp_path)])
     assert "rolls the env itself: pass --variant" in capsys.readouterr().err
@@ -258,7 +260,10 @@ def test_exact_posterior_package_route_trains_and_round_trips(tmp_path, monkeypa
     assert not (run_dir / "probe_results.json").exists()
     assert result.rl_checkpoint == run_dir / "checkpoint_best.pt" and result.summary["best_epoch"] == 1
     ck = torch.load(result.rl_checkpoint, map_location="cpu", weights_only=False)
-    assert set(ck) == {"model_state_dict", "head_state_dict", "config", "epoch", "val", "args", pretrain.CHECKPOINT_RECORD_KEY}
+    # 10.4: top-level particle_scale (the Trainer's convention) is written by encoder_checkpoint for every encoder
+    assert set(ck) == {"model_state_dict", "head_state_dict", "config", "epoch", "val", "args", "particle_scale",
+                       pretrain.CHECKPOINT_RECORD_KEY}
+    assert ck["particle_scale"] == 24.5
     assert (ck["config"]["objective"], ck["config"]["encoder"], ck["config"]["arena_scale"]) == ("belief_kl", "st", 24.5)
     args = json.loads((run_dir / "args.json").read_text())
     assert (args["num_epochs"], args["objective"], args["encoder"], args["variant"]) == (1, "belief_kl", "st", "oe50_short")

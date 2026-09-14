@@ -62,6 +62,30 @@ def verify_matches_checkpoint(reference: dict, live: dict, path: str,
           f"({n_shared} tensors, max|delta| = 0.0)")
 
 
+def encoder_checkpoint(extractor, *, config: dict | None = None, **top_level) -> dict:
+    """The dict an RL-loadable pretraining checkpoint is built from -- the INVERSE of
+    :func:`reload_pretrained`, written once (batch 10.4, 2026-09-14).
+
+    Every learned extractor says how its own loader wants the file: ``checkpoint_state()`` gives
+    the encoder tensors under the prefix ``load_pretrained`` strips (ST ``set_transformer.``, CGF
+    the whole extractor unprefixed, DeepSet / PointNet ``encoder.``), ``checkpoint_config()`` the
+    geometry record the loader checks (``weighted_particles`` and ``arena_scale`` included). The
+    dataset frame goes top-level as ``particle_scale``, the Trainer's convention, which every
+    loader compares with its ``arena_scale``. ``config`` adds the objective's own fields (objective,
+    variant, encoder, encoder_params, ...); ``top_level`` adds the rest (``head_state_dict``,
+    ``epoch``, ``val``, ``args``). Before this function each objective kept its own if-chain on the
+    encoder name (Odd-Even's exact-posterior objectives, hunt's task objective); they now call it,
+    and the Ant-Tag task objective (plan 10.9) will.
+    """
+    payload = {
+        "model_state_dict": extractor.checkpoint_state(),
+        "config": {**extractor.checkpoint_config(), **(config or {})},
+        "particle_scale": float(extractor.arena_scale),
+    }
+    payload.update(top_level)
+    return payload
+
+
 def _cgf_reference_state(path: str) -> dict:
     loaded = torch.load(path, map_location="cpu", weights_only=False)
     return loaded["model_state_dict"] if "model_state_dict" in loaded else loaded

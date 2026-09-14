@@ -137,8 +137,11 @@ def test_pretrained_ae_checkpoint_loads_freezes_and_mismatches_are_refused(tmp_p
     with pytest.raises(RuntimeError):
         _quiet(lambda: cls(_space(), arena_scale=SCALE, weight_channel=False, dim_encoder=2,
                            pretrained_model_path=str(ckpt)))
-    with pytest.raises(ValueError, match="frozen"):
-        _quiet(lambda: cls(_space(), arena_scale=SCALE, frozen=True))
+    # frozen=True with no checkpoint path is ACCEPTED since 2026-09-14 (batch 10.4; PITFALLS 13.11): it
+    # is the pair SB3 rebuilds the extractor with at PPO.load after the reload blanked the path in the
+    # pickled kwargs. The fresh-run guard is the trainer's start-mode resolution.
+    bare = _quiet(lambda: cls(_space(), arena_scale=SCALE, frozen=True))
+    assert not any(p.requires_grad for p in bare.encoder_parameters())
 
 
 def test_trainer_checkpoint_frame_check(tmp_path):

@@ -865,6 +865,15 @@ class WeightedCGFFeaturesExtractor(BaseFeaturesExtractor):
     def encoder_state_dict(self) -> dict:
         return self.state_dict()
 
+    def checkpoint_state(self) -> dict:
+        """The inverse of `load_pretrained` (batch 10.4): the whole extractor's state, unprefixed,
+        detached, on the CPU -- t, the norm statistics and the readout ARE the encoder."""
+        return {k: v.detach().cpu() for k, v in self.state_dict().items()}
+
+    def checkpoint_config(self) -> dict:
+        """The geometry record `_check_checkpoint_geometry` compares against."""
+        return dict(self._cgf_geometry)
+
     def reference_state(self, path: str) -> dict:
         """The checkpoint's whole ``model_state_dict`` (or the bare dict), keyed like
         ``self.state_dict()``."""

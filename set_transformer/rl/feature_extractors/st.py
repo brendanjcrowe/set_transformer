@@ -348,6 +348,20 @@ class SetTransformerFeaturesExtractor(BaseFeaturesExtractor):
         """The live encoder tensors, keyed like `reference_state()`."""
         return self.encoder.state_dict()
 
+    # -- The inverse of load_pretrained (batch 10.4, 2026-09-14): what a pretraining objective
+    # -- writes so that THIS class's loader reads it back. rl/pretrained_encoder.encoder_checkpoint
+    # -- assembles the file from these two.
+
+    def checkpoint_state(self) -> dict:
+        """The encoder tensors under the ``set_transformer.`` prefix `_load_pretrained_encoder`
+        strips, detached, on the CPU."""
+        return {f"set_transformer.{k}": v.detach().cpu() for k, v in self.encoder.state_dict().items()}
+
+    def checkpoint_config(self) -> dict:
+        """The geometry record `_check_checkpoint_geometry` compares against (``weighted_particles``
+        and ``arena_scale`` included)."""
+        return dict(self._st_geometry)
+
     def reference_state(self, path: str) -> dict:
         """The encoder tensors a checkpoint holds, keyed like `encoder_state_dict()`.
 

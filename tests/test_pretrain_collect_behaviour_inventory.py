@@ -407,7 +407,10 @@ def test_belief_run_folder_name_and_files(belief_st_run):
 def test_belief_st_checkpoint_is_in_the_rl_loaders_format(belief_st_run):
     ck = torch.load(belief_st_run / "checkpoint_best.pt", map_location="cpu", weights_only=False)
     # 7.5 added the top-level `pretraining_run` record (additive; the loaders' keys are unchanged).
-    assert set(ck) == {"model_state_dict", "head_state_dict", "config", "epoch", "val", "args", "pretraining_run"}
+    # 7.5 added `pretraining_run`; 10.4 added top-level `particle_scale` (additive; the loaders' keys are unchanged).
+    assert set(ck) == {"model_state_dict", "head_state_dict", "config", "epoch", "val", "args", "pretraining_run",
+                       "particle_scale"}
+    assert ck["particle_scale"] == 24.5
     assert ck["model_state_dict"] and all(k.startswith("set_transformer.") for k in ck["model_state_dict"])
     assert set(ck["head_state_dict"]) == {"weight", "bias"} and ck["head_state_dict"]["weight"].shape == (50, 64)
     c = ck["config"]

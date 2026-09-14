@@ -669,6 +669,8 @@ HUNT_COLLECTION = Collection(
 # `--loss_type chamfer --ignore_weights` (decision 9c-7).
 # ---------------------------------------------------------------------------
 
+# Every learned encoder of the shared table (checked as `encoder.learned`; batch 10.4 replaced a
+# hand-kept tuple). Kept as a name for the messages.
 TASK_ENCODERS = ("st", "cgf", "deepset", "pointnet")
 
 _PERM_CACHE: dict = {}
@@ -807,39 +809,28 @@ def build_task_extractor(args, space: gym.spaces.Dict, scale: float):
 
 
 def extractor_geometry(extractor) -> dict:
-    for attr in ("_st_geometry", "_cgf_geometry", "_geometry"):
-        if hasattr(extractor, attr):
-            return dict(getattr(extractor, attr))
-    return {}
+    """The geometry record the extractor's loader checks (the extractor's own
+    `checkpoint_config`, batch 10.4)."""
+    return extractor.checkpoint_config()
 
 
 def save_task_checkpoint(model: TaskEncoderWithHead, path: Path, args, epoch: int, val: dict,
                          geometry: dict, task: str) -> None:
-    """The format each extractor's own loader reads. ST: encoder keys under `set_transformer.`;
-    CGF: the extractor's whole state_dict (t, norm statistics and readout ARE the encoder);
-    deepset / pointnet: the encoder under `encoder.` with `particle_scale` top-level."""
+    """The format each extractor's own loader reads, assembled by
+    :func:`~set_transformer.rl.pretrained_encoder.encoder_checkpoint` from the extractor's
+    `checkpoint_state()` / `checkpoint_config()` (batch 10.4; the if-chain on the encoder name --
+    ST under ``set_transformer.``, CGF whole, pooled under ``encoder.`` + ``weighted_particles`` --
+    moved into the extractors). ``geometry`` is kept in the signature; the extractor's is written."""
+    from set_transformer.rl.pretrained_encoder import encoder_checkpoint   # noqa: PLC0415 - cycle
     extractor = model.extractor
-    if args.encoder == "st":
-        state = {f"set_transformer.{k}": v.detach().cpu() for k, v in extractor.encoder.state_dict().items()}
-    elif args.encoder == "cgf":
-        state = {k: v.detach().cpu() for k, v in extractor.state_dict().items()}
-    else:
-        state = {f"encoder.{k}": v.detach().cpu() for k, v in extractor.encoder.state_dict().items()}
-    config = {**geometry, "objective": "task", "task": task, "variant": args.variant,
-              "arena_scale": float(extractor.arena_scale), "encoder": args.encoder,
-              "encoder_params": int(getattr(args, "encoder_params", 0)),
-              "pretraining": "set_transformer.rl.pretrain --domain hunt --objective task"}
-    if args.encoder in ("deepset", "pointnet"):
-        config["weighted_particles"] = bool(extractor.weight_channel)
-    torch.save({
-        "model_state_dict": state,
-        "head_state_dict": {k: v.detach().cpu() for k, v in model.head.state_dict().items()},
-        "config": config,
-        "particle_scale": float(extractor.arena_scale),
-        "epoch": epoch,
-        "val": val,
-        "args": vars(args),
-    }, path)
+    torch.save(encoder_checkpoint(
+        extractor,
+        config={"objective": "task", "task": task, "variant": args.variant,
+                "arena_scale": float(extractor.arena_scale), "encoder": args.encoder,
+                "encoder_params": int(getattr(args, "encoder_params", 0)),
+                "pretraining": "set_transformer.rl.pretrain --domain hunt --objective task"},
+        head_state_dict={k: v.detach().cpu() for k, v in model.head.state_dict().items()},
+        epoch=epoch, val=val, args=vars(args)), path)
 
 
 def _task_add_arguments(parser, domain=None) -> None:
@@ -867,9 +858,9 @@ def _task_locate(args) -> dict:
 
 
 def _task_resolve_arguments(parser, args, domain, encoder) -> None:
-    if encoder.name not in TASK_ENCODERS:
-        parser.error(f"the task objective is implemented for --encoder "
-                     f"{' | '.join(TASK_ENCODERS)}, not {encoder.name!r}")
+    if not encoder.learned:
+        parser.error(f"the task objective needs a learned encoder ({' | '.join(TASK_ENCODERS)}); "
+                     f"{encoder.name!r} has no parameters to train")
     if args.data_path is None:
         if args.variant is None:
             parser.error("--data_path or --variant is needed: the task objective reads the "
