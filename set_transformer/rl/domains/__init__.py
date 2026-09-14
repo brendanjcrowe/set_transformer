@@ -1,9 +1,9 @@
 """Per-domain pieces of the RL harness: variant registries, env wrappers and factories,
 curriculum declarations, particle-filter glue, and one ``Domain`` record per problem.
 
-One module per domain (``ant_tag``, ``hunt``, ``odd_even``). These modules import no plotting backend
+One module per domain (``ant_tag``, ``car_flag``, ``hunt``, ``odd_even``). These modules import no plotting backend
 and load without MuJoCo (``import pdomains`` only registers env ids); the ``Domain`` record
-at the bottom of each (``ANT_TAG``, ``HUNT``, ``ODD_EVEN``) is what ``rl/train.py`` reads. Look a
+at the bottom of each (``ANT_TAG``, ``CAR_FLAG``, ``HUNT``, ``ODD_EVEN``) is what ``rl/train.py`` reads. Look a
 record up by name with :func:`get`; the module is imported on first use, so asking for
 ``odd_even`` never imports the Ant-Tag particle filters.
 
@@ -20,6 +20,7 @@ from set_transformer.rl.domains.base import Domain
 #: ``--domain`` choices: domain name -> (module, record attribute).
 DOMAIN_NAMES: dict[str, tuple[str, str]] = {
     "ant_tag": ("set_transformer.rl.domains.ant_tag", "ANT_TAG"),
+    "car_flag": ("set_transformer.rl.domains.car_flag", "CAR_FLAG"),
     "hunt": ("set_transformer.rl.domains.hunt", "HUNT"),
     "odd_even": ("set_transformer.rl.domains.odd_even", "ODD_EVEN"),
 }
