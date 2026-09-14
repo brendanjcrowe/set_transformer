@@ -518,7 +518,8 @@ def test_collect_npz_contract(collect_smart):
     # the variant's task heads and the env radii the labels are read against.
     assert set(meta) == {"variant", "env_id", "particle_filter_class", "num_particles", "dim_particles",
                          "particle_scale", "args", "command", "threads", "git", "behaviour",
-                         "label_arrays", "task_heads", "tag_radius", "visible_radius"}
+                         "label_arrays", "task_heads", "tag_radius", "visible_radius",
+                         "episode_counts", "waypoints_sampled"}                      # waypoint batch (2026-09-14)
     assert meta["variant"] == "smart" and meta["env_id"] == "pdomains-ant-tag-smart-v0"
     assert meta["particle_filter_class"] == "SmartAntTagParticleFilter"
     assert (meta["num_particles"], meta["dim_particles"], meta["particle_scale"]) == (100, 2, SCALE)

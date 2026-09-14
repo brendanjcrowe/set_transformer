@@ -1241,12 +1241,67 @@ def _pursuit_action(
     what makes the collected beliefs cover states an actual pursuer reaches,
     instead of only those a random walk stumbles into.
     """
+    return _goal_action(base_obs, particle_filter.estimate_opponent_pos(), locomotion_policy, vecnorm_stats)
+
+
+def _goal_action(base_obs: np.ndarray, goal_xy, locomotion_policy: "PPO", vecnorm_stats=None) -> np.ndarray:
+    """Action from the locomotion policy aimed at ``goal_xy`` (the body of :func:`_pursuit_action`,
+    moved in the waypoint batch of 2026-09-14: the belief mean and a sampled waypoint are two goals)."""
     policy_obs = base_obs.copy()
-    policy_obs[-2:] = particle_filter.estimate_opponent_pos()
+    policy_obs[-2:] = np.asarray(goal_xy, dtype=policy_obs.dtype)
     if vecnorm_stats is not None:
         policy_obs = _normalize_obs(policy_obs, vecnorm_stats)
     action, _ = locomotion_policy.predict(policy_obs, deterministic=False)
     return action
+
+
+def sample_waypoint(rng: np.random.Generator, ant_xy, target_xy, *, half_width: float, min_dist: float,
+                    target_clearance: float, tries: int = 50) -> np.ndarray:
+    """A point of the cage ``[-half_width, half_width]^2`` at least ``min_dist`` from the ant and at least
+    ``target_clearance`` from the TRUE target (so the walk stays blind and sweeps). Up to ``tries`` uniform
+    draws; if none satisfies both, the draw farthest from the ant among those clear of the target, else
+    the farthest from the ant. The target is a collection-time heuristic, never a label or an input."""
+    ant = np.asarray(ant_xy, dtype=np.float64)
+    target = np.asarray(target_xy, dtype=np.float64)
+    best, best_d = None, -1.0
+    for _ in range(int(tries)):
+        cand = rng.uniform(-half_width, half_width, size=2)
+        d_ant = float(np.linalg.norm(cand - ant))
+        clear = float(np.linalg.norm(cand - target)) >= target_clearance
+        if d_ant >= min_dist and clear:
+            return cand
+        score = d_ant + (half_width * 10.0 if clear else 0.0)
+        if score > best_d:
+            best, best_d = cand, score
+    return best
+
+
+class _WaypointWalk:
+    """The ``waypoint`` episode's driver: the locomotion policy walks to a sampled point; on arrival
+    (within ``reach``) or after ``patience`` steps without arriving (stuck on a wall) the next point is
+    drawn. ``n_sampled`` counts the waypoints of the episode."""
+
+    def __init__(self, args, state, env, half_width: float):
+        self.args, self.state, self.env, self.half_width = args, state, env, half_width
+        self.goal = None
+        self.steps_on_goal = 0
+        self.n_sampled = 0
+
+    def _resample(self, ant_xy):
+        u = self.env.unwrapped
+        self.goal = sample_waypoint(self.state.rng, ant_xy, u.get_target_pos(), half_width=self.half_width,
+                                    min_dist=self.args.waypoint_min_dist, target_clearance=self.args.waypoint_target_clearance)
+        self.steps_on_goal = 0
+        self.n_sampled += 1
+        self.state.waypoints_sampled += 1
+
+    def __call__(self, obs):
+        ant_xy = np.asarray(obs["obs"][:2], dtype=np.float64)
+        if (self.goal is None or np.linalg.norm(ant_xy - self.goal) <= self.args.waypoint_reach
+                or self.steps_on_goal >= self.args.waypoint_patience):
+            self._resample(ant_xy)
+        self.steps_on_goal += 1
+        return _goal_action(obs["obs"], self.goal, self.state.locomotion_policy, self.state.vecnorm_stats)
 
 
 def _weighted_spread(particles: np.ndarray, weights: np.ndarray) -> np.ndarray:
@@ -1407,6 +1462,26 @@ def _collect_add_arguments(parser) -> None:
     )
     parser.add_argument("--locomotion_policy_path", type=str, default=None)
     parser.add_argument("--locomotion_vecnorm_path", type=str, default=None)
+    w = parser.add_argument_group(
+        "waypoint episodes (2026-09-14): the locomotion policy walks to sampled points while BLIND at the "
+        "env's real visibility radius, so the file holds the sweeping beliefs a searching policy lives in "
+        "(v15 record 2026-09-08: 76-95 %% of a policy's steps are hollow perimeter frames, 19 %% of the "
+        "collector's file). Needs --locomotion_policy_path; without it these episodes are random.")
+    w.add_argument("--waypoint_fraction", type=float, default=0.0,
+                   help="Fraction of episodes of this type (drawn after fully-observed and pursuit; the rest "
+                        "are random). 0 = the historical three-type mix.")
+    w.add_argument("--waypoint_min_dist", type=float, default=None,
+                   help="A new waypoint is at least this far from the ant. ENV UNITS; default half the cage half-width.")
+    w.add_argument("--waypoint_target_clearance", type=float, default=None,
+                   help="... and at least this far from the TRUE target (collection-time heuristic only). "
+                        "ENV UNITS; default the env's visible radius.")
+    w.add_argument("--waypoint_reach", type=float, default=0.75,
+                   help="The ant has arrived when within this distance; the next waypoint is drawn. ENV UNITS.")
+    w.add_argument("--waypoint_patience", type=int, default=80,
+                   help="Steps without arriving before the next waypoint is drawn anyway (a wall).")
+    w.add_argument("--waypoint_radius", choices=("real", "range"), default="real",
+                   help="Visibility radius of a waypoint episode: the env's real one (default) or drawn from "
+                        "the --visibility_radius_min/max range like the other types.")
     parser.add_argument(
         "--rebalance_no_upsample", action="store_true",
         help="Rebalance by downsampling only: never duplicate rows to fill an "
@@ -1446,8 +1521,20 @@ def _collect_resolve_arguments(parser, args, domain) -> dict:
             print(f"Auto-detected VecNormalize stats: {candidate}")
 
     print(f"Env: {resolved_env_id}, particle filter: {resolved_pf.__name__}")
-    return {"env_id": resolved_env_id, "particle_filter_class": resolved_pf,
-            "env_facts": _env_facts(resolved_env_id)}
+    facts = _env_facts(resolved_env_id)
+    if not 0.0 <= args.waypoint_fraction <= 1.0:
+        parser.error(f"--waypoint_fraction {args.waypoint_fraction} is not in [0, 1]")
+    if args.fully_observed_fraction + args.pursuit_fraction + args.waypoint_fraction > 1.0 + 1e-9:
+        parser.error("--fully_observed_fraction + --pursuit_fraction + --waypoint_fraction exceeds 1")
+    if args.waypoint_min_dist is None:
+        args.waypoint_min_dist = 0.5 * float(get_ant_tag_arena_scale(resolved_env_id))
+    if args.waypoint_target_clearance is None:
+        args.waypoint_target_clearance = float(facts["visible_radius"])
+    if args.waypoint_fraction > 0:
+        print(f"Waypoint episodes: {args.waypoint_fraction:.0%}, min dist {args.waypoint_min_dist:g}, target "
+              f"clearance {args.waypoint_target_clearance:g}, reach {args.waypoint_reach:g}, patience "
+              f"{args.waypoint_patience}, radius {args.waypoint_radius}")
+    return {"env_id": resolved_env_id, "particle_filter_class": resolved_pf, "env_facts": facts}
 
 
 def _env_facts(env_id: str) -> dict:
@@ -1472,7 +1559,8 @@ def _collect_prepare(args, options):
     locomotion policy and its VecNormalize stats, the trajectory-type counts."""
     state = SimpleNamespace(rng=np.random.default_rng(args.seed), locomotion_policy=None,
                             vecnorm_stats=None,
-                            counts={"fully_observed": 0, "pursuit": 0, "random": 0})
+                            counts={"fully_observed": 0, "pursuit": 0, "waypoint": 0, "random": 0},
+                            waypoints_sampled=0)
     if args.locomotion_policy_path and os.path.exists(args.locomotion_policy_path):
         from stable_baselines3 import PPO   # imported here: the domain module is env-side code
         state.locomotion_policy = PPO.load(args.locomotion_policy_path)
@@ -1482,9 +1570,9 @@ def _collect_prepare(args, options):
             with open(args.locomotion_vecnorm_path, "rb") as handle:
                 state.vecnorm_stats = pickle.load(handle)
             print(f"Loaded VecNormalize stats from {args.locomotion_vecnorm_path}")
-    elif args.pursuit_fraction > 0 or args.fully_observed_fraction > 0:
-        print("WARNING: no locomotion policy provided; pursuit and "
-              "fully-observed trajectories fall back to random actions.")
+    elif args.pursuit_fraction > 0 or args.fully_observed_fraction > 0 or args.waypoint_fraction > 0:
+        print("WARNING: no locomotion policy provided; pursuit, fully-observed and "
+              "waypoint trajectories fall back to random actions.")
     return state
 
 
@@ -1513,21 +1601,32 @@ def _collect_begin_episode(args, options, state, env, episode):
     and return how to act for this trajectory."""
     rng = state.rng
     roll = rng.random()
+    has_policy = state.locomotion_policy is not None
     if roll < args.fully_observed_fraction:
         traj_type = "fully_observed"
-    elif (state.locomotion_policy is not None
-          and roll < args.fully_observed_fraction + args.pursuit_fraction):
+    elif has_policy and roll < args.fully_observed_fraction + args.pursuit_fraction:
         traj_type = "pursuit"
+    elif has_policy and roll < args.fully_observed_fraction + args.pursuit_fraction + args.waypoint_fraction:
+        traj_type = "waypoint"          # 2026-09-14: blind sweeps between sampled points
     else:
         traj_type = "random"
     state.counts[traj_type] += 1
 
-    radius = (_ALWAYS_VISIBLE_RADIUS if traj_type == "fully_observed"
-              else float(rng.uniform(args.visibility_radius_min, args.visibility_radius_max)))
+    if traj_type == "fully_observed":
+        radius = _ALWAYS_VISIBLE_RADIUS
+    elif traj_type == "waypoint" and args.waypoint_radius == "real":
+        radius = float(env.unwrapped.visible_radius)
+    else:
+        radius = float(rng.uniform(args.visibility_radius_min, args.visibility_radius_max))
     env.set_curriculum_radius(radius)
 
+    if traj_type == "waypoint":
+        # The walk needs the true target for its clearance rule; it reads it off the live env at each
+        # draw (the env has been reset by the time act() is first called).
+        return {}, _WaypointWalk(args, state, env, half_width=float(get_ant_tag_arena_scale(options["env_id"])))
+
     def act(obs):
-        if traj_type in ("pursuit", "fully_observed") and state.locomotion_policy is not None:
+        if traj_type in ("pursuit", "fully_observed") and has_policy:
             return _pursuit_action(
                 obs["obs"], _find_particle_filter(env),
                 state.locomotion_policy, state.vecnorm_stats,
@@ -1565,12 +1664,16 @@ def _collect_metadata_extras(args, options, particles, weights, steps) -> dict:
     facts = options["env_facts"]
     labels = TASK_LABELS + (DEN_LABELS if "den_radius" in facts else ())
     heads = VARIANTS[args.variant].task_heads if args.variant in VARIANTS else ()
-    return dict(label_arrays=list(labels), task_heads=list(heads), **facts)
+    return dict(label_arrays=list(labels), task_heads=list(heads), **facts,
+                episode_counts=options.get("episode_counts", {}), waypoints_sampled=options.get("waypoints_sampled", 0))
 
 
 def _collect_finish(args, options, state, n_snapshots) -> None:
-    print(f"Trajectories — " + ", ".join(f"{k}: {v}" for k, v in state.counts.items()))
+    print(f"Trajectories — " + ", ".join(f"{k}: {v}" for k, v in state.counts.items())
+          + (f"; waypoints sampled: {state.waypoints_sampled}" if state.counts.get("waypoint") else ""))
     print(f"Total snapshots (raw): {n_snapshots}")
+    options["episode_counts"] = dict(state.counts)          # for the metadata (the hook has no state)
+    options["waypoints_sampled"] = int(state.waypoints_sampled)
 
 
 def _collect_report(args, options, particles, weights, steps, stage) -> None:
@@ -1656,7 +1759,10 @@ def den_shares(particles: np.ndarray, weights: np.ndarray, dens: np.ndarray, rad
     per row. ``particles [S, N, 2]`` and ``dens [K, 2]`` (static, the four candidates) or
     ``[S, K, 2]`` (per row) in the same (raw) frame; weights are normalised per row first. The
     candidate discs never overlap (2.4 and 6.75 out on the diagonal, radius 0.4), so the shares sum
-    to one."""
+    to one. The rim counts as inside with a small tolerance: the env and the filter project the
+    target and the particles back ONTO the disc boundary at every step (a 0.5 step against a 0.4
+    radius), so a strict ``<= radius`` test dropped a third of the mass to floating point
+    (found 2026-09-14 on the waypoint-collector measurement)."""
     w = np.clip(np.asarray(weights, np.float64), 0.0, None)
     w = w / np.clip(w.sum(axis=1, keepdims=True), 1e-12, None)
     dens = np.asarray(dens, np.float64)
@@ -1664,7 +1770,7 @@ def den_shares(particles: np.ndarray, weights: np.ndarray, dens: np.ndarray, rad
         dens = np.broadcast_to(dens[None], (len(w),) + dens.shape)
     d = np.linalg.norm(np.asarray(particles, np.float64)[:, :, None, :]
                        - dens[:, None, :, :], axis=-1)                                 # [S, N, K]
-    inside = (w[:, :, None] * (d <= float(radius))).sum(axis=1)                       # [S, K]
+    inside = (w[:, :, None] * (d <= float(radius) * (1.0 + 1e-6) + 1e-9)).sum(axis=1)  # [S, K]; rim inside
     outside = np.clip(1.0 - inside.sum(axis=1, keepdims=True), 0.0, 1.0)
     return np.concatenate([inside, outside], axis=1).astype(np.float32)
 

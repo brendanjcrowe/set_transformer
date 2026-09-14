@@ -133,7 +133,8 @@ def test_ant_tag_collection_with_an_explicit_output_file(tmp_path, monkeypatch):
         meta = json.loads(str(z["metadata"]))
     assert set(meta) == {"variant", "env_id", "particle_filter_class", "num_particles", "dim_particles",
                          "particle_scale", "args", "command", "threads", "git", "behaviour",
-                         "label_arrays", "task_heads", "tag_radius", "visible_radius"}
+                         "label_arrays", "task_heads", "tag_radius", "visible_radius",
+                         "episode_counts", "waypoints_sampled"}                      # waypoint batch (2026-09-14)
     assert (meta["label_arrays"], meta["task_heads"], meta["tag_radius"]) == (["ant", "target", "step"], ["position"], 1.5)
     assert meta["particle_filter_class"] == "SmartAntTagParticleFilter" and meta["args"]["num_episodes"] == 1
 

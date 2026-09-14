@@ -65,7 +65,8 @@ def test_den_shares_on_hand_built_clouds():
     assert np.allclose(s, [[0, 0.6, 0.3, 0, 0.1]], atol=1e-6) and np.allclose(s.sum(1), 1.0)
     # unnormalised weights are normalised per row; a particle just inside the rim counts; per-row
     # centres ([S, K, 2]) give the same answer as the static table
-    rim = heavy + np.array([0.4 - 1e-6, 0.0])
+    rim = (heavy + np.array([0.4, 0.0])).astype(np.float32).astype(np.float64)   # a float32 rim point: 0.4000001 off
+    assert np.linalg.norm(rim - heavy) > 0.4 - 1e-7          # ON the rim, not inside it: the leash puts strays here
     s = ant_tag.den_shares(np.array([[rim, light]]), np.array([[2.0, 2.0]]), cand, 0.4)
     assert np.allclose(s, [[0, 0.5, 0.5, 0, 0]], atol=1e-6)
     assert np.array_equal(s, ant_tag.den_shares(np.array([[rim, light]]), np.array([[2.0, 2.0]]), cand[None], 0.4))
