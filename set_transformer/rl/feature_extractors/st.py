@@ -129,6 +129,9 @@ class SetTransformerFeaturesExtractor(BaseFeaturesExtractor):
         st_frozen: bool = False,
         num_post_sab: int = 2,
         output_norm: bool = False,
+        readout: str = "per_seed",
+        num_pma_seeds: int | None = None,
+        input_embed: bool = False,
     ):
         obs_dim = observation_space["obs"].shape[0]
         particle_dim = observation_space["particles"].shape[1]
@@ -172,6 +175,9 @@ class SetTransformerFeaturesExtractor(BaseFeaturesExtractor):
             ln=ln,
             num_post_sab=num_post_sab,
             output_norm=self.output_norm,
+            readout=readout,
+            num_pma_seeds=num_pma_seeds,
+            input_embed=input_embed,
         )
         self.encoder = pf_st.set_transformer
 
@@ -196,6 +202,13 @@ class SetTransformerFeaturesExtractor(BaseFeaturesExtractor):
             # Change A: compared when the checkpoint records it (checkpoints before 2026-09-19
             # do not, and were all built without it).
             output_norm=self.output_norm,
+            # 2026-09-19 (least-mass gap): the record's readout and input embedding as options.
+            # All three change parameter shapes, so a strict load would catch a mismatch anyway;
+            # recording them gives the flag-level message and lets the encoder table resolve
+            # them from the checkpoint. Absent from older checkpoints = the defaults.
+            readout=self.encoder.readout,
+            num_pma_seeds=int(self.encoder.num_pma_seeds),
+            input_embed=bool(self.encoder.input_embed),
             # The coordinate frame the encoder was trained in. A checkpoint
             # pretrained at one particle scale loads into an encoder fed
             # another without any shape changing (PITFALLS.md section 4 and
@@ -249,14 +262,17 @@ class SetTransformerFeaturesExtractor(BaseFeaturesExtractor):
                 return config.get(field)
             return getattr(config, field, None)
 
+        # Fields added after a checkpoint was written: every such checkpoint was built with the
+        # default, so a missing field means the default (not "skip"), and it is refused by an
+        # extractor built the other way. output_norm: change A (2026-09-19); readout /
+        # num_pma_seeds / input_embed: the least-mass record port (2026-09-19).
+        missing_means = {"output_norm": False, "readout": "per_seed", "input_embed": False,
+                         "num_pma_seeds": geometry.get("num_encodings")}
         mismatches = []
         for field, expected in geometry.items():
             actual = _get(field)
-            if actual is None and field == "output_norm":
-                # Change A (2026-09-19): every checkpoint written before the field existed was
-                # built WITHOUT the output normalisation, so a missing field means False, and
-                # such a checkpoint is refused by an extractor that normalises.
-                actual = False
+            if actual is None and field in missing_means:
+                actual = missing_means[field]
             if actual is None:
                 continue
             if isinstance(expected, bool):
@@ -274,7 +290,8 @@ class SetTransformerFeaturesExtractor(BaseFeaturesExtractor):
                 "geometry than this run requests:\n  "
                 + "\n  ".join(mismatches)
                 + "\nPass the matching --num_encodings/--dim_encoder/--num_inds/"
-                "--dim_hidden/--num_heads/--ln/--output_norm/--arena_scale flags (or "
+                "--dim_hidden/--num_heads/--ln/--output_norm/--st_readout/--st_pma_seeds/"
+                "--st_input_embed/--arena_scale flags (or "
                 "--no_st_weight_channel for an unweighted checkpoint). A "
                 "num_heads or arena_scale mismatch changes no parameter shape "
                 "and would otherwise load silently."

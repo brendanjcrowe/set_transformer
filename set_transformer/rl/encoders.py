@@ -585,7 +585,7 @@ def _cgf_callbacks(kwargs: dict, options: dict) -> list:
 
 #: Geometry a pretraining checkpoint's ``config`` may carry; a flag left unset takes the
 #: checkpoint's value, then the domain's default; an explicit disagreement is an error.
-ST_GEOMETRY_FLAGS = ("num_inds", "dim_hidden", "num_post_sab")
+ST_GEOMETRY_FLAGS = ("num_inds", "dim_hidden", "num_post_sab", "readout", "num_pma_seeds", "input_embed")
 
 
 def _st_add_arguments(parser: argparse.ArgumentParser, domain: Domain) -> None:
@@ -619,6 +619,20 @@ def _st_add_arguments(parser: argparse.ArgumentParser, domain: Domain) -> None:
              "off (every checkpoint before 2026-09-19); a pretrained checkpoint must have been built "
              "with the same setting (debug_plans/ch_fixes.md).")
     g.add_argument(
+        "--st_readout", dest="readout", choices=("per_seed", "flatten"), default=None,
+        help="How the pooled seed vectors become the belief features. per_seed (default, every "
+             "checkpoint before 2026-09-19): a shared Linear(dim_hidden -> dim_encoder) per seed. flatten: "
+             "the least-mass record's readout -- all seeds flattened into ONE Linear(seeds x dim_hidden -> "
+             "num_encodings x dim_encoder) followed by a GELU. Same resolution rule as --num_inds.")
+    g.add_argument(
+        "--st_pma_seeds", dest="num_pma_seeds", type=int, default=None,
+        help="Pooling (PMA) seeds when --st_readout flatten decouples them from the output shape "
+             "(the record: 5 seeds -> 64 features). Default: num_encodings. Same resolution rule as --num_inds.")
+    g.add_argument(
+        "--st_input_embed", dest="input_embed", action="store_const", const=True, default=None,
+        help="Linear(dim_input -> dim_hidden) before the first ISAB, as the record's encoder has. "
+             "Default off. Same resolution rule as --num_inds.")
+    g.add_argument(
         "--st_weight_channel", "--weight_channel", dest="weight_channel",
         action="store_true", default=True,
         help="Append the normalized PF weight (scaled by N) as an extra per-particle input "
@@ -642,7 +656,9 @@ def _st_resolve_arguments(parser: argparse.ArgumentParser, args: argparse.Namesp
     """
     d = domain.encoder_defaults.get("st", {})
     defaults = {"num_inds": d.get("num_inds", 32), "dim_hidden": d.get("dim_hidden", 128),
-                "num_post_sab": d.get("num_post_sab", 2)}
+                "num_post_sab": d.get("num_post_sab", 2),
+                # the least-mass record port (2026-09-19): default = the old encoder exactly
+                "readout": "per_seed", "num_pma_seeds": None, "input_embed": False}
     from_ckpt = {}
     path = args.pretrained_st_model_path
     if path:
@@ -659,6 +675,9 @@ def _st_resolve_arguments(parser: argparse.ArgumentParser, args: argparse.Namesp
     src = "checkpoint" if from_ckpt else "default"
     print(f"ST geometry: num_inds={args.num_inds} dim_hidden={args.dim_hidden} "
           f"num_post_sab={args.num_post_sab} ({src})")
+    if args.readout != "per_seed" or args.num_pma_seeds is not None or args.input_embed:
+        print(f"ST readout: readout={args.readout} num_pma_seeds={args.num_pma_seeds} "
+              f"input_embed={args.input_embed} ({src})")
 
 
 def _st_extractor_kwargs(args: argparse.Namespace) -> dict:
@@ -675,6 +694,9 @@ def _st_extractor_kwargs(args: argparse.Namespace) -> dict:
         pretrained_st_model_path=args.pretrained_st_model_path,
         st_frozen=args.st_frozen,
         output_norm=bool(getattr(args, "output_norm", False)),
+        readout=getattr(args, "readout", None) or "per_seed",
+        num_pma_seeds=getattr(args, "num_pma_seeds", None),
+        input_embed=bool(getattr(args, "input_embed", None) or False),
     )
 
 
