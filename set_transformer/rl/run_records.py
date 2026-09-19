@@ -487,6 +487,11 @@ def find_rl_run(domain: str, variant: str, encoder: str, seed: int, run_tag: str
     whose ``models/run_status.json`` says ``completed`` and whose ``models/<encoder>_agent.zip`` and
     ``models/vecnormalize.pkl`` exist. A folder whose status says ``failed``, has no status, or
     lacks either file is not a result and is skipped, so a driver re-runs that cell. Read-only.
+
+    The VecNormalize file is required only when the run used VecNormalize: a run whose
+    ``run_config.json`` records ``no_vec_normalize: true`` (``rl/train.py --no_vec_normalize``,
+    the hunt ``fixed`` recipe since 2026-09-19) never writes one, and its zip alone is the result.
+    Without that record (an older run, or no config file) the file is required as before.
     """
     root = output_root() if root is None else Path(root)
     folder = Path(root) / domain / variant / "rl" / encoder
@@ -503,9 +508,23 @@ def find_rl_run(domain: str, variant: str, encoder: str, seed: int, run_tag: str
             status = json.load(handle)
         if status.get("status") != "completed":
             continue
-        if (models / f"{encoder}_agent.zip").exists() and (models / "vecnormalize.pkl").exists():
+        if not (models / f"{encoder}_agent.zip").exists():
+            continue
+        if (models / "vecnormalize.pkl").exists() or not _run_used_vec_normalize(run):
             return run
     return None
+
+
+def _run_used_vec_normalize(run: Path) -> bool:
+    """False only when the run's ``run_config.json`` says ``no_vec_normalize`` is true."""
+    config_path = run / "run_config.json"
+    if not config_path.exists():
+        return True
+    try:
+        with open(config_path) as handle:
+            return not bool(json.load(handle).get("no_vec_normalize", False))
+    except (OSError, ValueError):
+        return True
 
 
 def data_dir(domain: str, variant: str, *, root: "str | os.PathLike | None" = None) -> Path:

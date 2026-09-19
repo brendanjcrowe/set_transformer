@@ -169,10 +169,13 @@ def test_latest_checkpoint_run_tag_filter_picks_the_right_arm_in_a_shared_object
                                                   experiment_name="cgf_belief_pretrain", run_tag="v3") == old
 
 
-def _fake_rl_run(root, encoder, leaf, *, status, zip_present=True, vecnorm_present=True):
+def _fake_rl_run(root, encoder, leaf, *, status, zip_present=True, vecnorm_present=True,
+                 no_vec_normalize=None):
     run = root / "odd_even" / "oe50_short" / "rl" / encoder / leaf
     models = run / "models"
     models.mkdir(parents=True)
+    if no_vec_normalize is not None:   # what rl/train.py records in run_config.json
+        (run / "run_config.json").write_text(json.dumps({"no_vec_normalize": no_vec_normalize}))
     if status is not None:
         run_records.write_run_status(str(models / f"{encoder}_agent.zip"), completed=(status == "completed"),
                                      error=None if status == "completed" else RuntimeError("x"),
@@ -234,3 +237,29 @@ def test_run_folders_lists_every_state_newest_first_by_the_leaf_rule(tmp_path):
                                    run_tag="w1_cgf_K_fixed_belief_kl", objective="belief_kl", root=root) == [pre]
     with pytest.raises(ValueError, match="needs the objective"):
         run_records.run_folders("odd_even", "oe50_short", "pretrain", "cgf", seed=0, root=root)
+
+
+def test_find_rl_run_needs_the_vecnormalize_file_only_when_the_run_used_vecnormalize(tmp_path):
+    """A --no_vec_normalize run (the hunt fixed recipe) never writes models/vecnormalize.pkl; its
+    zip + completed status IS the result. The 2026-09-19 ch_fixed_pre wave's first finished cell was
+    marked failed by the driver for lack of that file. A run that recorded VecNormalize on, or
+    recorded nothing, still needs the file."""
+    root = tmp_path
+    raw = _fake_rl_run(root, "st", "20260919_182246_seed3_ch_fixed_pre_st_task_nearest_frozen",
+                       status="completed", vecnorm_present=False, no_vec_normalize=True)
+    assert run_records.find_rl_run("hunt_like", "x", "st", 3, "ch_fixed_pre_st_task_nearest_frozen",
+                                   root=root) is None   # wrong domain: unaffected lookup
+    assert run_records.find_rl_run("odd_even", "oe50_short", "st", 3, "ch_fixed_pre_st_task_nearest_frozen",
+                                   root=root) == raw
+    _fake_rl_run(root, "st", "20260919_182246_seed4_ch_fixed_pre_st_task_nearest_frozen",
+                 status="completed", vecnorm_present=False, no_vec_normalize=False)
+    assert run_records.find_rl_run("odd_even", "oe50_short", "st", 4, "ch_fixed_pre_st_task_nearest_frozen",
+                                   root=root) is None
+    _fake_rl_run(root, "st", "20260919_182246_seed5_ch_fixed_pre_st_task_nearest_frozen",
+                 status="completed", vecnorm_present=False)          # no run_config.json at all
+    assert run_records.find_rl_run("odd_even", "oe50_short", "st", 5, "ch_fixed_pre_st_task_nearest_frozen",
+                                   root=root) is None
+    with_file = _fake_rl_run(root, "st", "20260919_182246_seed6_ch_fixed_pre_st_task_nearest_frozen",
+                             status="completed", no_vec_normalize=True)
+    assert run_records.find_rl_run("odd_even", "oe50_short", "st", 6, "ch_fixed_pre_st_task_nearest_frozen",
+                                   root=root) == with_file
