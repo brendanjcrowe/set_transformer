@@ -34,6 +34,12 @@ class TrainingConfig:
     # written before 2026-09-13 has, when the field did not exist and the constructor
     # default applied. Recorded in the checkpoint so the RL extractor builds the same shape.
     num_post_sab: int = 2
+    # 2026-09-19 (debug_plans/ch_fixes.md): layer-normalise the encoder's flattened code as its
+    # last operation (change A) and give the PFDecoder a learned attention temperature (change
+    # B). Both default OFF: every checkpoint written before this date has neither, and the RL
+    # extractor's geometry check compares output_norm when the checkpoint records it.
+    output_norm: bool = False
+    decoder_temperature: bool = False
 
     # Weighted particle sets (option B: mass in the measure, not the metric).
     # `dim_particles` always means the COORDINATE dimension D of a particle.

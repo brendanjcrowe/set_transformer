@@ -61,6 +61,13 @@ class STFeatureLoggingCallback(BaseCallback):
     No-op (and free) for encoders without cached features.
     """
 
+    #: Change A7 (2026-09-19): warn when the belief features are large enough to saturate the
+    #: PPO policy's tanh first layer. Measured on Cluster-Hunt: length ~9 is the record's regime,
+    #: ~25 saturates ~30 % of a freshly initialised layer, ~87 saturated 78 % and killed the arm
+    #: (src/diagnosis/FABLE_DIAGNOSIS_recon_st_failure.md).
+    WARN_FIRST_ROLLOUT = 20.0
+    WARN_ANY_ROLLOUT = 40.0
+
     def _on_step(self) -> bool:  # required abstract method
         return True
 
@@ -68,15 +75,30 @@ class STFeatureLoggingCallback(BaseCallback):
         extractor = getattr(self.model.policy, "features_extractor", None)
         features = getattr(extractor, "last_st_features", None)
         if features is None:
+            features = getattr(extractor, "last_features", None)   # the pooled extractors
+        if features is None:
             return
+        prefix = getattr(extractor, "feature_log_prefix", "st")
         with torch.no_grad():
             feats = features.detach().float()
             norms = torch.linalg.norm(feats, dim=1).cpu().numpy()
             std_mean = float(feats.std(dim=0).mean().cpu())
-        self.logger.record("st/feat_std_mean", std_mean)
+        self.logger.record(f"{prefix}/feat_std_mean", std_mean)
         for q in (0, 25, 50, 75, 90, 100):
-            self.logger.record(f"st/feat_norm_q{q}",
+            self.logger.record(f"{prefix}/feat_norm_q{q}",
                                float(np.percentile(norms, q)))
+        q50 = float(np.percentile(norms, 50))
+        n_seen = getattr(self, "_rollouts_seen", 0)
+        self._rollouts_seen = n_seen + 1
+        if n_seen == 0 and q50 > self.WARN_FIRST_ROLLOUT:
+            print(f"WARNING [{prefix}]: belief feature length (median L2 norm) is {q50:.1f} at the first "
+                  f"rollout (> {self.WARN_FIRST_ROLLOUT:g}). Features this large saturate the tanh policy "
+                  "MLP; the encoder output is not normalised (--output_norm) or the checkpoint was "
+                  "pretrained without it. See debug_plans/ch_fixes.md.", flush=True)
+        elif q50 > self.WARN_ANY_ROLLOUT and not getattr(self, "_warned_large", False):
+            self._warned_large = True
+            print(f"WARNING [{prefix}]: belief feature length grew to {q50:.1f} (> {self.WARN_ANY_ROLLOUT:g}) "
+                  f"at rollout {n_seen + 1}; the policy's tanh layer is likely saturating.", flush=True)
 
 
 class SetTransformerFeaturesExtractor(BaseFeaturesExtractor):
@@ -106,6 +128,7 @@ class SetTransformerFeaturesExtractor(BaseFeaturesExtractor):
         pretrained_st_model_path: str | None = None,
         st_frozen: bool = False,
         num_post_sab: int = 2,
+        output_norm: bool = False,
     ):
         obs_dim = observation_space["obs"].shape[0]
         particle_dim = observation_space["particles"].shape[1]
@@ -117,6 +140,10 @@ class SetTransformerFeaturesExtractor(BaseFeaturesExtractor):
         self.weight_channel = bool(weight_channel)
         self.st_frozen = bool(st_frozen)
         self.num_particles = num_particles
+        # Change A (2026-09-19, debug_plans/ch_fixes.md): the encoder's flattened code is
+        # layer-normalised (no affine) as its last op. Default OFF so every zip and checkpoint
+        # written before this date rebuilds the encoder it was trained with.
+        self.output_norm = bool(output_norm)
         # Cached by forward() for STFeatureLoggingCallback. Not a buffer:
         # it must not enter the checkpoint or move with .to().
         self.last_st_features: torch.Tensor | None = None
@@ -144,6 +171,7 @@ class SetTransformerFeaturesExtractor(BaseFeaturesExtractor):
             num_heads=num_heads,
             ln=ln,
             num_post_sab=num_post_sab,
+            output_norm=self.output_norm,
         )
         self.encoder = pf_st.set_transformer
 
@@ -165,6 +193,9 @@ class SetTransformerFeaturesExtractor(BaseFeaturesExtractor):
             # check skips fields the checkpoint does not carry, and those
             # checkpoints were all built with the default 2.
             num_post_sab=int(num_post_sab),
+            # Change A: compared when the checkpoint records it (checkpoints before 2026-09-19
+            # do not, and were all built without it).
+            output_norm=self.output_norm,
             # The coordinate frame the encoder was trained in. A checkpoint
             # pretrained at one particle scale loads into an encoder fed
             # another without any shape changing (PITFALLS.md section 4 and
@@ -221,6 +252,11 @@ class SetTransformerFeaturesExtractor(BaseFeaturesExtractor):
         mismatches = []
         for field, expected in geometry.items():
             actual = _get(field)
+            if actual is None and field == "output_norm":
+                # Change A (2026-09-19): every checkpoint written before the field existed was
+                # built WITHOUT the output normalisation, so a missing field means False, and
+                # such a checkpoint is refused by an extractor that normalises.
+                actual = False
             if actual is None:
                 continue
             if isinstance(expected, bool):
@@ -238,7 +274,7 @@ class SetTransformerFeaturesExtractor(BaseFeaturesExtractor):
                 "geometry than this run requests:\n  "
                 + "\n  ".join(mismatches)
                 + "\nPass the matching --num_encodings/--dim_encoder/--num_inds/"
-                "--dim_hidden/--num_heads/--ln/--arena_scale flags (or "
+                "--dim_hidden/--num_heads/--ln/--output_norm/--arena_scale flags (or "
                 "--no_st_weight_channel for an unweighted checkpoint). A "
                 "num_heads or arena_scale mismatch changes no parameter shape "
                 "and would otherwise load silently."

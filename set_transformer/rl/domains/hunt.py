@@ -401,7 +401,10 @@ def _resolve_arguments(parser, args) -> dict:
         args.n_active_curriculum = variant.default_n_active_curriculum
     if args.hit_radius_curriculum is None:
         args.hit_radius_curriculum = variant.default_hit_radius_curriculum
-    if args.total_timesteps == parser.get_default("total_timesteps") \
+    # Change C (2026-09-19): "left at the default" is the trainer's marker, not a value comparison.
+    # Before this an EXPLICIT --total_timesteps 3000000 on cluster_hunt (equal to the domain
+    # default) was silently swapped for the variant's 1,500,000 (debug_plans/ch_fixes.md).
+    if not getattr(args, "total_timesteps_given", True) \
             and variant.default_total_timesteps != args.total_timesteps:
         args.total_timesteps = variant.default_total_timesteps
         print(f"--total_timesteps left at the domain default; using the {args.variant} "

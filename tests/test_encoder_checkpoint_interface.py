@@ -152,3 +152,62 @@ def test_both_objectives_write_the_same_encoder_for_the_same_extractor(name, tmp
     for f in ("belief.pt", "task.pt"):
         c = _build(name, path=str(tmp_path / f))
         verify_matches_checkpoint(c.reference_state(str(tmp_path / f)), c.encoder_state_dict(), str(tmp_path / f))
+
+
+# --------------------------------------------------------------------------
+# Change A (2026-09-19, debug_plans/ch_fixes.md): the output normalisation flag.
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("name", ["st", "deepset", "pointnet"])
+def test_output_norm_default_off_is_the_old_forward_and_on_normalises(name):
+    """Default off computes exactly what the encoder computed before the flag existed; on gives a
+    flattened code of mean 0 and length sqrt(width) for every input, from the same weights."""
+    torch.manual_seed(0)
+    off = _build(name).eval()
+    on = _build(name, output_norm=True).eval()
+    on.encoder.load_state_dict(off.encoder.state_dict())
+    obs = _obs()
+    with torch.no_grad():
+        f_off = off(obs)[:, 3:]
+        f_on = on(obs)[:, 3:]
+    width = f_off.shape[1]
+    assert torch.allclose(f_on, torch.nn.functional.layer_norm(f_off, (width,)), atol=1e-5)
+    assert torch.allclose(f_on.mean(dim=1), torch.zeros(2), atol=1e-5)
+    assert torch.allclose(f_on.norm(dim=1), torch.full((2,), float(width) ** 0.5), atol=1e-3)
+    assert off.checkpoint_config()["output_norm"] is False and on.checkpoint_config()["output_norm"] is True
+
+
+@pytest.mark.parametrize("name", ["st", "deepset", "pointnet"])
+def test_output_norm_mismatch_is_refused_both_ways_and_a_missing_field_means_off(name, tmp_path):
+    """A normalised code and a raw one are different features: a checkpoint built either way must not
+    load into an extractor built the other way. A checkpoint from before the field existed (no
+    ``output_norm`` in its config) was built without it and is refused by a normalising extractor."""
+    on_path, off_path, legacy_path = (tmp_path / f"{name}_{k}.pt" for k in ("on", "off", "legacy"))
+    torch.save(encoder_checkpoint(_build(name, output_norm=True)), on_path)
+    torch.save(encoder_checkpoint(_build(name)), off_path)
+    legacy = encoder_checkpoint(_build(name))
+    legacy["config"] = {k: v for k, v in legacy["config"].items() if k != "output_norm"}
+    torch.save(legacy, legacy_path)
+    with pytest.raises(RuntimeError, match="output_norm"):
+        _build(name, path=str(on_path))                        # new-style into an old-style extractor
+    with pytest.raises(RuntimeError, match="output_norm"):
+        _build(name, path=str(off_path), output_norm=True)     # old-style into a normalising extractor
+    with pytest.raises(RuntimeError, match="output_norm"):
+        _build(name, path=str(legacy_path), output_norm=True)  # pre-flag checkpoint: no field = off
+    _build(name, path=str(on_path), output_norm=True)          # matching: loads
+    _build(name, path=str(legacy_path))                        # pre-flag checkpoint into default: loads
+
+
+def test_pf_decoder_temperature_adds_a_parameter_only_when_asked_and_starts_at_one():
+    """Change B: default off registers no parameter (old autoencoder checkpoints still load strictly);
+    on, T = exp(0) = 1 at init, so the first forward equals the plain decoder's."""
+    from set_transformer.modules import PFDecoder
+    torch.manual_seed(0)
+    plain = PFDecoder(4, 16, N, D)
+    warm = PFDecoder(4, 16, N, D, learn_temperature=True)
+    assert set(warm.state_dict()) - set(plain.state_dict()) == {"log_temperature"}
+    assert float(warm.log_temperature) == 0.0
+    warm.load_state_dict(plain.state_dict(), strict=False)
+    code = torch.randn(2, 3, 4) * 10
+    with torch.no_grad():
+        assert torch.allclose(plain(code), warm(code))

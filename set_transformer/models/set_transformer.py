@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from set_transformer.modules import ISAB, PMA, SAB
 
@@ -37,11 +38,22 @@ class SetTransformer(nn.Module):
         num_heads: int = 4,
         ln: bool = False,
         num_post_sab: int = 2,
+        output_norm: bool = False,
     ) -> None:
         super(SetTransformer, self).__init__()
         if num_post_sab < 0:
             raise ValueError(f"num_post_sab must be >= 0, got {num_post_sab}")
         self.num_post_sab = int(num_post_sab)
+        # 2026-09-19 (debug_plans/ch_fixes.md, change A1): when on, the flattened
+        # num_outputs x dim_output code is layer-normalised WITHOUT learned gain or bias as
+        # the encoder's LAST operation, so the features a policy reads always have mean 0 and
+        # length sqrt(num_outputs * dim_output), whatever the weights do. The reconstruction
+        # objective's softmax decoder otherwise rewards large codes (Cluster-Hunt: length ~87,
+        # saturating the PPO policy's tanh layer). Default OFF: an old checkpoint or zip
+        # rebuilds the encoder without it and computes exactly what it did before.
+        self.output_norm = bool(output_norm)
+        self.num_outputs = int(num_outputs)
+        self.dim_output = int(dim_output)
         self.enc = nn.Sequential(
             ISAB(dim_input, dim_hidden, num_heads, num_inds, ln=ln),
             ISAB(dim_hidden, dim_hidden, num_heads, num_inds, ln=ln),
@@ -62,4 +74,9 @@ class SetTransformer(nn.Module):
         Returns:
             torch.Tensor: Output tensor of shape (batch_size, num_outputs, dim_output)
         """
-        return self.dec(self.enc(X))
+        out = self.dec(self.enc(X))
+        if self.output_norm:
+            flat = out.reshape(out.size(0), -1)
+            flat = F.layer_norm(flat, (flat.size(-1),))
+            out = flat.reshape(out.size(0), self.num_outputs, self.dim_output)
+        return out

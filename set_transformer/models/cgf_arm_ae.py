@@ -75,7 +75,7 @@ class CGFArmAutoencoder(nn.Module):
 
     def __init__(self, extractor: WeightedCGFFeaturesExtractor, num_particles: int,
                  dim_particles: int, particle_scale: float, num_encodings: int = 8,
-                 dim_hidden: int = 128, weighted: bool = True) -> None:
+                 dim_hidden: int = 128, weighted: bool = True, decoder_temperature: bool = False) -> None:
         super().__init__()
         if not np.isclose(float(extractor.arena_scale), float(particle_scale)):
             raise ValueError(
@@ -101,7 +101,7 @@ class CGFArmAutoencoder(nn.Module):
         self.dim_encoder = width // num_encodings
         self.weighted = bool(weighted)
         self.decoder = PFDecoder(self.dim_encoder, dim_hidden, self.num_particles,
-                                 self.dim_particles)
+                                 self.dim_particles, learn_temperature=decoder_temperature)
 
     # -- input convention shared with Trainer._model_input --------------------------
     def split_input(self, X: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

@@ -174,7 +174,9 @@ class Trainer:
             common["dim_particles"] = self.config.dim_particles + 1
             common["dim_output_particles"] = self.config.dim_particles
         if self.config.model_type == "pf_st":
-            model = PFSetTransformer(**common, num_post_sab=self.config.num_post_sab)
+            model = PFSetTransformer(**common, num_post_sab=self.config.num_post_sab,
+                                     output_norm=self.config.output_norm,
+                                     decoder_temperature=self.config.decoder_temperature)
         elif self.config.model_type == "set_vae":
             model = SetVAE(**common)
         elif self.config.model_type == "set_vqvae":
@@ -185,7 +187,8 @@ class Trainer:
                 **common,
             )
         elif self.config.model_type == "ds_ae":
-            model = DeepSetAE(**common)
+            model = DeepSetAE(**common, output_norm=self.config.output_norm,
+                              decoder_temperature=self.config.decoder_temperature)
         elif self.config.model_type == "ds_vae":
             model = DeepSetVAE(**common)
         elif self.config.model_type == "ds_vqvae":

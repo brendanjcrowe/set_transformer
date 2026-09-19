@@ -94,6 +94,7 @@ class _PooledFeaturesExtractor(BaseFeaturesExtractor):
         pooling: str | None = None,
         pretrained_model_path: str | None = None,
         frozen: bool = False,
+        output_norm: bool = False,
     ):
         pooling = pooling or self.POOLINGS[0]
         if pooling not in self.POOLINGS:
@@ -120,14 +121,22 @@ class _PooledFeaturesExtractor(BaseFeaturesExtractor):
         self.pooling = pooling
         self.num_encodings, self.dim_encoder, self.dim_hidden = num_encodings, dim_encoder, dim_hidden
         self.dim_input = particle_dim + (1 if self.weight_channel else 0)
+        # Change A (2026-09-19, debug_plans/ch_fixes.md): layer-normalised code as the encoder's
+        # last op; default OFF so old zips / checkpoints rebuild the encoder they were trained with.
+        self.output_norm = bool(output_norm)
         self.encoder = self.ENCODER_CLS(dim_input=self.dim_input, num_outputs=num_encodings,
-                                        dim_output=dim_encoder, dim_hidden=dim_hidden)
+                                        dim_output=dim_encoder, dim_hidden=dim_hidden,
+                                        output_norm=self.output_norm)
         self._geometry = dict(
             encoder=self.ENCODER_NAME, num_encodings=int(num_encodings),
             dim_encoder=int(dim_encoder), dim_hidden=int(dim_hidden),
             weight_channel=self.weight_channel, pooling=pooling,
             arena_scale=self.arena_scale, dim_input=int(self.dim_input),
+            output_norm=self.output_norm,
         )
+        # Cached by forward() for STFeatureLoggingCallback (change A7): not a buffer.
+        self.last_features: torch.Tensor | None = None
+        self.feature_log_prefix = self.ENCODER_NAME
         self._frozen = False
         if pretrained_model_path:
             self._load_pretrained_encoder(pretrained_model_path)
@@ -160,11 +169,17 @@ class _PooledFeaturesExtractor(BaseFeaturesExtractor):
         x, w = self._prepare(obs_dict)
         phi = self.encoder.enc(x)                                                # [B, N, H]
         code = self.encoder.dec(self._pool(phi, w))                              # [B, K*d]
+        if self.output_norm:
+            # Change A: this path calls enc / dec directly (weighted pooling in between), so the
+            # model's own forward() -- where the same normalisation lives -- is NOT run here.
+            code = torch.nn.functional.layer_norm(code, (code.shape[-1],))
         return code.reshape(code.shape[0], self.num_encodings, self.dim_encoder)
 
     def forward(self, obs_dict: dict[str, torch.Tensor]) -> torch.Tensor:
         code = self.encode(obs_dict)
-        return torch.cat([obs_dict["obs"], code.reshape(code.shape[0], -1)], dim=-1)
+        flat = code.reshape(code.shape[0], -1)
+        self.last_features = flat.detach()
+        return torch.cat([obs_dict["obs"], flat], dim=-1)
 
     # -- pretrained / frozen ------------------------------------------------------------
     def encoder_parameter_count(self) -> int:
@@ -192,6 +207,14 @@ class _PooledFeaturesExtractor(BaseFeaturesExtractor):
                     raise RuntimeError(
                         f"Checkpoint {path} records {field}={recorded}, this run has "
                         f"{self._geometry[field]}; pass matching --{field}.")
+            recorded_on = get("output_norm")
+            if recorded_on is None:
+                recorded_on = False    # change A: pre-2026-09-19 checkpoints have no field and no normalisation
+            if bool(recorded_on) != self.output_norm:
+                raise RuntimeError(
+                    f"Checkpoint {path} was pretrained with output_norm={bool(recorded_on)}, this run "
+                    f"has output_norm={self.output_norm}; pass --output_norm to match (or drop it). "
+                    "A layer-normalised code and a raw one are different features (debug_plans/ch_fixes.md).")
             recorded_wc = get("weighted_particles")
             if recorded_wc is not None and bool(recorded_wc) != self.weight_channel:
                 raise RuntimeError(

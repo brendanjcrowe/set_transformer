@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class DeepSet(nn.Module):
@@ -17,11 +18,15 @@ class DeepSet(nn.Module):
     """
 
     def __init__(
-        self, dim_input: int, num_outputs: int, dim_output: int, dim_hidden: int = 128
+        self, dim_input: int, num_outputs: int, dim_output: int, dim_hidden: int = 128,
+        output_norm: bool = False,
     ) -> None:
         super(DeepSet, self).__init__()
         self.num_outputs = num_outputs
         self.dim_output = dim_output
+        # 2026-09-19 (debug_plans/ch_fixes.md, A3): layer-normalise the flattened code (no
+        # learned gain / bias) as the last operation; default OFF = today's forward exactly.
+        self.output_norm = bool(output_norm)
         self.enc = nn.Sequential(
             nn.Linear(dim_input, dim_hidden),
             nn.ReLU(),
@@ -51,5 +56,8 @@ class DeepSet(nn.Module):
             torch.Tensor: Output tensor of shape (batch_size, num_outputs, dim_output)
         """
         X = self.enc(X).mean(-2)
-        X = self.dec(X).reshape(-1, self.num_outputs, self.dim_output)
+        X = self.dec(X)
+        if self.output_norm:
+            X = F.layer_norm(X, (X.size(-1),))
+        X = X.reshape(-1, self.num_outputs, self.dim_output)
         return X

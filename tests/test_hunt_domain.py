@@ -240,6 +240,9 @@ def test_eval_env_sits_at_the_final_values_which_are_the_registered_defaults():
 def test_resolve_arguments_fills_the_variant_schedules_and_horizon():
     parser = train_mod.build_parser(HUNT, encoders.get("gaussian"))
     args = parser.parse_args(["--variant", "cluster_hunt"])
+    args.total_timesteps_given = args.total_timesteps is not None   # what rl/train.py sets (change C)
+    if args.total_timesteps is None:
+        args.total_timesteps = HUNT.default_total_timesteps
     assert HUNT.resolve_arguments(parser, args) == {}
     assert args.n_active_curriculum == "0:1,0.4:5,1:5"
     assert args.hit_radius_curriculum == "0:1.6,0.4:0.6,1:0.6"
@@ -250,6 +253,24 @@ def test_resolve_arguments_fills_the_variant_schedules_and_horizon():
     HUNT.resolve_arguments(parser, args)
     assert args.total_timesteps == 1000 and args.hit_radius_curriculum is None
     assert HUNT.schedules(args) == ()
+
+
+def test_an_explicit_horizon_equal_to_the_domain_default_is_honoured():
+    """Change C (2026-09-19, debug_plans/ch_fixes.md): before it, ``--total_timesteps 3000000`` on
+    cluster_hunt equalled the domain default and was silently swapped for the variant's 1,500,000
+    (the omak `ch3m` probe had to ask for 3000001). The trainer now marks whether the flag was given;
+    the variant default applies only when it was not."""
+    parser = train_mod.build_parser(HUNT, encoders.get("gaussian"))
+    given = parser.parse_args(["--variant", "cluster_hunt", "--total_timesteps", "3000000"])
+    given.total_timesteps_given = True
+    HUNT.resolve_arguments(parser, given)
+    assert given.total_timesteps == 3_000_000
+    omitted = parser.parse_args(["--variant", "cluster_hunt"])
+    assert omitted.total_timesteps is None                      # the parser default is None now
+    omitted.total_timesteps = HUNT.default_total_timesteps      # what rl/train.py fills in
+    omitted.total_timesteps_given = False
+    HUNT.resolve_arguments(parser, omitted)
+    assert omitted.total_timesteps == 1_500_000
 
 
 # --------------------------------------------------------------------------

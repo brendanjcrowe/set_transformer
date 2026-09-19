@@ -422,7 +422,12 @@ def _add_common_arguments(parser: argparse.ArgumentParser, domain: Domain, encod
              f"<variant>/rl/{encoder.name} (legacy: {domain.name}_{encoder.name}[_<variant>]). "
              "For a sweep that needs its own tree.")
     parser.add_argument("--algorithm", type=str, default="PPO", choices=sorted(ALGORITHMS))
-    parser.add_argument("--total_timesteps", type=int, default=domain.default_total_timesteps)
+    parser.add_argument(
+        "--total_timesteps", type=int, default=None,
+        help=f"Default: the domain's {domain.default_total_timesteps:,}, or the variant's recorded "
+             "horizon where the domain declares one (hunt, msearch). An explicit value is always "
+             "honoured (2026-09-19: before this, an explicit value equal to the domain default was "
+             "silently swapped for the variant's; debug_plans/ch_fixes.md change C).")
     parser.add_argument("--n_envs", type=int, default=4)
     parser.add_argument("--learning_rate", type=float, default=3e-4)
     parser.add_argument("--batch_size", type=int, default=64)
@@ -567,6 +572,11 @@ def main(argv: Sequence[str] | None = None, *, domain: Domain | str | None = Non
     if args.list_variants:
         domain.print_variants()
         return None
+    # Change C (2026-09-19): remember whether the horizon was given, so a domain's per-variant
+    # default applies only when it was not (rl/domains/{hunt,msearch}.py::_resolve_arguments).
+    args.total_timesteps_given = args.total_timesteps is not None
+    if args.total_timesteps is None:
+        args.total_timesteps = domain.default_total_timesteps
     _encoders.check_pretrained_path(parser, args, encoder)
 
     # -- resolution: shared defaults, the domain's flags, the encoder's flags, the start mode --

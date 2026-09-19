@@ -25,7 +25,8 @@ class PFDecoder(nn.Module):
         encoder_dim: int, 
         hidden_dim: int, 
         n_particles: int, 
-        n_vars: int
+        n_vars: int,
+        learn_temperature: bool = False,
     ) -> None:
         super(PFDecoder, self).__init__()
         self.n_particles = n_particles
@@ -38,6 +39,14 @@ class PFDecoder(nn.Module):
             nn.Linear(self.hidden_dim, n_vars),
         )
         self.query_vectors = nn.Parameter(torch.randn(n_particles, self.encoder_dim))
+        # 2026-09-19 (debug_plans/ch_fixes.md, change B): one learned scalar multiplying the
+        # attention scores before the softmax, stored as its log (T = exp(0) = 1 at init, so a
+        # run starts as exactly today's computation). It lets the decoder sharpen its attention
+        # without asking the encoder for large codes (the Cluster-Hunt failure). Default OFF
+        # registers NO parameter, so every old autoencoder checkpoint still loads strictly.
+        self.learn_temperature = bool(learn_temperature)
+        if self.learn_temperature:
+            self.log_temperature = nn.Parameter(torch.zeros(()))
 
     def forward(self, encoded_features: torch.Tensor) -> torch.Tensor:
         """Forward pass of the PFDecoder.
@@ -52,6 +61,8 @@ class PFDecoder(nn.Module):
         attention_weights = torch.matmul(
             self.query_vectors, encoded_features.transpose(-1, -2)
         )
+        if getattr(self, "learn_temperature", False):
+            attention_weights = attention_weights * torch.exp(self.log_temperature)
         attention_weights = torch.softmax(attention_weights, dim=-1)
         attended_features = torch.matmul(attention_weights, encoded_features)
 

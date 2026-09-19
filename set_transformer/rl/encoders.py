@@ -613,6 +613,12 @@ def _st_add_arguments(parser: argparse.ArgumentParser, domain: Domain) -> None:
                    help="LayerNorm inside the attention blocks. Default on.")
     g.add_argument("--no_ln", "--no_layer_norm", dest="ln", action="store_false")
     g.add_argument(
+        "--output_norm", action="store_true", default=False,
+        help="Layer-normalise the encoder's flattened code (no learned gain / bias) as its last "
+             "operation, so the belief features always have mean 0 and length sqrt(width). Default "
+             "off (every checkpoint before 2026-09-19); a pretrained checkpoint must have been built "
+             "with the same setting (debug_plans/ch_fixes.md).")
+    g.add_argument(
         "--st_weight_channel", "--weight_channel", dest="weight_channel",
         action="store_true", default=True,
         help="Append the normalized PF weight (scaled by N) as an extra per-particle input "
@@ -668,6 +674,7 @@ def _st_extractor_kwargs(args: argparse.Namespace) -> dict:
         weight_channel=args.weight_channel,
         pretrained_st_model_path=args.pretrained_st_model_path,
         st_frozen=args.st_frozen,
+        output_norm=bool(getattr(args, "output_norm", False)),
     )
 
 
@@ -700,6 +707,9 @@ def _pooled_add_arguments(cls: type, name: str):
                             "PointNetAE checkpoint.")
         g.add_argument("--pooling", type=str, default=None, choices=cls.POOLINGS,
                        help=f"Pool operator; default {cls.POOLINGS[0]!r}.")
+        g.add_argument("--output_norm", action="store_true", default=False,
+                       help="Layer-normalise the flattened code (no affine) as the encoder's last "
+                            "operation; default off; must match the checkpoint (debug_plans/ch_fixes.md).")
     return add
 
 
@@ -707,7 +717,8 @@ def _pooled_extractor_kwargs(args: argparse.Namespace) -> dict:
     return dict(num_encodings=args.num_encodings, dim_encoder=args.dim_encoder,
                 dim_hidden=args.dim_hidden, arena_scale=args.arena_scale,
                 weight_channel=args.weight_channel, pooling=args.pooling,
-                pretrained_model_path=args.pretrained_model_path, frozen=args.frozen)
+                pretrained_model_path=args.pretrained_model_path, frozen=args.frozen,
+                output_norm=bool(getattr(args, "output_norm", False)))
 
 
 def _kmoments_add_arguments(parser: argparse.ArgumentParser, domain: Domain) -> None:
@@ -722,7 +733,8 @@ def _pooled_encoder(name: str, cls: type) -> Encoder:
         add_arguments=_pooled_add_arguments(cls, name),
         resolve_arguments=_no_resolution,
         extractor_kwargs=_pooled_extractor_kwargs,
-        callbacks=lambda kwargs, options: [],
+        # A7 (2026-09-19): the same feature-length logger / guard as the ST arm (tags <name>/feat_*).
+        callbacks=lambda kwargs, options: [STFeatureLoggingCallback()],
         pretrained_dest="pretrained_model_path", frozen_dest="frozen",
         lr_scale_dest="encoder_lr_scale", unfreeze_dest="unfreeze_at",
         start_mode_aliases=(("--pretrained_model_path",), (), (), ()),

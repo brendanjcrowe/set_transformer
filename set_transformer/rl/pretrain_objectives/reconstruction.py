@@ -167,6 +167,13 @@ def add_arguments(parser: argparse.ArgumentParser, domain=None) -> None:
         d.add_argument("--num_post_sab", type=int, default=2, help="Recorded only for the CGF arm.")
     if "--no_layer_norm" not in have:
         d.add_argument("--no_layer_norm", "--no_ln", dest="ln", action="store_false", default=True)
+    # Change B (2026-09-19, debug_plans/ch_fixes.md): a learned attention temperature in the
+    # PFDecoder, so it sharpens its softmax without asking the encoder for large codes. Default
+    # off (no parameter added); recorded in TrainingConfig. --output_norm (change A) comes from
+    # the encoder table for the ST and pooled arms.
+    d.add_argument("--decoder_temperature", action="store_true", default=False,
+                   help="Learned scalar temperature on the PFDecoder's attention scores (init 1). "
+                        "Default off.")
 
     a = parser.add_argument_group("reconstruction objective: latent metric alignment "
                                   "(optional; needs 2b_precompute_emd.py first)")
@@ -456,6 +463,8 @@ def run(args: argparse.Namespace, ctx: PretrainContext) -> PretrainResult:
         num_heads=args.num_heads,
         use_layer_norm=bool(args.ln),          # 7.2: the table's spelling of --no_layer_norm
         num_post_sab=int(args.num_post_sab),   # 7.2: configurable (was the constructor's fixed 2)
+        output_norm=bool(getattr(args, "output_norm", False)),          # change A (2026-09-19)
+        decoder_temperature=bool(getattr(args, "decoder_temperature", False)),   # change B
         weighted_particles=weighted,
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
@@ -538,7 +547,7 @@ def run(args: argparse.Namespace, ctx: PretrainContext) -> PretrainResult:
             cgf_extractor, num_particles=args.num_particles,
             dim_particles=args.dim_particles, particle_scale=applied_scale,
             num_encodings=args.num_encodings, dim_hidden=args.dim_hidden,
-            weighted=weighted)
+            weighted=weighted, decoder_temperature=training_config.decoder_temperature)
         training_config.model_type = "cgf_arm_ae"
         print(f"CGF arm encoder: {cgf_extractor._cgf_geometry}")
         print(f"  block width {cgf_extractor.readout_dim} -> decoder code "
@@ -555,7 +564,8 @@ def run(args: argparse.Namespace, ctx: PretrainContext) -> PretrainResult:
         model = PooledArmAutoencoder(
             pooled_extractor, num_particles=args.num_particles,
             dim_particles=args.dim_particles, particle_scale=applied_scale,
-            dim_hidden=args.dim_hidden, weighted=weighted)
+            dim_hidden=args.dim_hidden, weighted=weighted,
+            decoder_temperature=training_config.decoder_temperature)
         training_config.model_type = "pooled_arm_ae"
         print(f"{encoder_name} arm encoder: {pooled_extractor.checkpoint_config()}")
         print(f"  code {model.num_encodings} x {model.dim_encoder}; "

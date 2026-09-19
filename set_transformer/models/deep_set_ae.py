@@ -21,6 +21,8 @@ class DeepSetAE(nn.Module):
         num_encodings: int,
         dim_encoder: int,
         dim_hidden: int = 128,
+        output_norm: bool = False,
+        decoder_temperature: bool = False,
         **_: Any,
     ) -> None:
         super().__init__()
@@ -29,8 +31,10 @@ class DeepSetAE(nn.Module):
             num_outputs=num_encodings,
             dim_output=dim_encoder,
             dim_hidden=dim_hidden,
+            output_norm=output_norm,
         )
-        self.decoder = PFDecoder(dim_encoder, dim_hidden, num_particles, dim_particles)
+        self.decoder = PFDecoder(dim_encoder, dim_hidden, num_particles, dim_particles,
+                                 learn_temperature=decoder_temperature)
 
     def encode(self, X: torch.Tensor) -> torch.Tensor:
         """Encode a particle set to its `(batch, num_encodings, dim_encoder)` code."""

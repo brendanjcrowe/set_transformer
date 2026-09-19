@@ -48,6 +48,8 @@ class PFSetTransformer(nn.Module):
         ln: bool = False,
         dim_output_particles: int | None = None,
         num_post_sab: int = 2,
+        output_norm: bool = False,
+        decoder_temperature: bool = False,
     ) -> None:
         super(PFSetTransformer, self).__init__()
         if dim_output_particles is None:
@@ -63,9 +65,11 @@ class PFSetTransformer(nn.Module):
             num_heads=num_heads,
             ln=ln,
             num_post_sab=num_post_sab,
+            output_norm=output_norm,
         )
         self.decoder = PFDecoder(
-            dim_encoder, dim_hidden, num_particles, dim_output_particles
+            dim_encoder, dim_hidden, num_particles, dim_output_particles,
+            learn_temperature=decoder_temperature,
         )
 
     def encode(self, X: torch.Tensor) -> torch.Tensor:

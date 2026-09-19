@@ -360,8 +360,8 @@ def _resolve_arguments(parser, args) -> dict:
     variant = resolve(args.variant)
     if args.shaping is None:
         args.shaping = variant.default_shaping
-    if args.total_timesteps == parser.get_default("total_timesteps") \
-            and variant.default_total_timesteps != args.total_timesteps:
+    if not getattr(args, "total_timesteps_given", True) \
+            and variant.default_total_timesteps != args.total_timesteps:   # change C, 2026-09-19
         args.total_timesteps = variant.default_total_timesteps
     print(f"msearch variant {args.variant!r}: training shaping {args.shaping}"
           + (f" (scale {SHAPING_SCALE:g})" if args.shaping == "info_gain" else "")
