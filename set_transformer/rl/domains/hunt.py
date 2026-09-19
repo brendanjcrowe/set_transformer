@@ -82,6 +82,7 @@ from set_transformer.rl.pretrain_objectives.task_head import (   # 10.9: the sha
     TaskData as _TaskData,
     TaskEncoderWithHead,   # noqa: F401 - re-exported (tests, entry points)
     add_task_arguments,
+    parse_val_sources,      # noqa: F401 - re-exported (tests import it from here)
     build_task_extractor,   # noqa: F401 - re-exported
     check_variant_and_geometry,
     extractor_geometry,   # noqa: F401 - re-exported
@@ -728,9 +729,11 @@ class TaskData(_TaskData):
 
     LABELS = ("centers", "alive", "counts", "sigmas", "target", "target_index")
 
-    def __init__(self, path: str, val_frac: float, device: torch.device):
+    def __init__(self, path: str, val_frac: float, device: torch.device,
+                 val_sources: tuple[int, ...] | None = None):
         super().__init__(path, val_frac, device, labels=("agent", *self.LABELS), obs_key="agent",
-                         scale_default=ARENA_SCALE, collect_hint=_COLLECT_HINT, kind="hunt dataset")
+                         scale_default=ARENA_SCALE, collect_hint=_COLLECT_HINT, kind="hunt dataset",
+                         val_sources=val_sources)
 
 
 
@@ -794,7 +797,8 @@ def _task_resolve_arguments(parser, args, domain, encoder) -> None:
 
 
 def _task_prepare(parser, args, domain, encoder, device):
-    data = TaskData(args.data_path, args.val_frac, torch.device(device))
+    data = TaskData(args.data_path, args.val_frac, torch.device(device),
+                    val_sources=parse_val_sources(getattr(args, "val_sources", None)))
     check_variant_and_geometry(parser, args, data)
     return data
 

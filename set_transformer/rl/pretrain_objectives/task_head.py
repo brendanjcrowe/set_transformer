@@ -45,7 +45,8 @@ class TaskData:
 
     def __init__(self, path: str, val_frac: float, device: torch.device, *, labels: tuple[str, ...],
                  obs_key: str, scale_default: float, collect_hint: str,
-                 optional: tuple[str, ...] = ("source_round",), kind: str = "task dataset"):
+                 optional: tuple[str, ...] = ("source_round",), kind: str = "task dataset",
+                 val_sources: tuple[int, ...] | None = None):
         with np.load(path, allow_pickle=True) as z:
             missing = [k for k in ("particles", "weights", *labels) if k not in z.files]
             if missing:
@@ -65,6 +66,32 @@ class TaskData:
         self.val = {k: torch.as_tensor(v[n - n_val:]).to(device) for k, v in arrays.items()}
         self.num_particles = int(arrays["particles"].shape[1])
         self.dim_particles = int(arrays["particles"].shape[2])
+        # 2026-09-19 (src/scripts/least_mass_gap/NOTES.md, wave 2): the validation LOSS that drives
+        # ReduceLROnPlateau and picks the best epoch can be restricted to the tail rows whose
+        # `source_round` is in `val_sources` (a DAgger file: 0 = scripted collection, 1.. = states the
+        # policy of that round visited). The record validated on policy rows only; validating on the
+        # mixed tail (43 % easy scripted rows on least-mass) cost the record's own code ~10 points of
+        # held-out policy-row identify accuracy. The TRAINING rows and the held-out tail are unchanged;
+        # the reported metrics still cover the whole tail and every source. None = the whole tail.
+        self.val_sources = tuple(int(s) for s in val_sources) if val_sources else None
+        self.val_loss_rows: torch.Tensor | None = None
+        if self.val_sources is not None:
+            if "source_round" not in arrays:
+                raise ValueError(f"--val_sources {self.val_sources} but {path} has no source_round array "
+                                 "(a collected file has one source; only imported / merged DAgger files "
+                                 "mark their rows)")
+            rows = np.flatnonzero(np.isin(arrays["source_round"][n - n_val:], self.val_sources))
+            if len(rows) == 0:
+                raise ValueError(f"no validation row has source_round in {self.val_sources}")
+            self.val_loss_rows = torch.as_tensor(rows, device=device)
+
+    def val_loss_batches(self, batch_size: int):
+        """The validation rows the loss is computed over, in chunks: the whole tail (slices) or the
+        `val_sources` rows (index tensors)."""
+        if self.val_loss_rows is None:
+            return (slice(i, min(i + batch_size, self.n_val)) for i in range(0, self.n_val, batch_size))
+        rows = self.val_loss_rows
+        return (rows[i:i + batch_size] for i in range(0, len(rows), batch_size))
 
     def obs(self, split: dict, index) -> dict:
         """What the RL extractor is handed: the passthrough observation, the RAW cloud (the
@@ -79,6 +106,15 @@ class TaskData:
                              f"expected {self.n_train}/{self.n_val}")
         self.train[key] = train.to(self.device)
         self.val[key] = val.to(self.device)
+
+
+def parse_val_sources(text: str | None) -> tuple[int, ...] | None:
+    """``--val_sources 1,2`` -> (1, 2); None / empty -> None (validate on the whole tail). Shared by every
+    domain's task objective so the flag means one thing everywhere (a domain that forwards it to a file
+    without ``source_round`` gets :class:`TaskData`'s refusal, not a silently ignored flag)."""
+    if text is None or not str(text).strip():
+        return None
+    return tuple(int(s) for s in str(text).split(",") if s.strip())
 
 
 class TaskEncoderWithHead(nn.Module):
@@ -143,6 +179,12 @@ def add_task_arguments(parser, *, dataset_help: str) -> None:
                    help=f"{dataset_help} Default: the variant's dataset under the output root.")
     g.add_argument("--val_frac", type=float, default=0.1,
                    help="Last fraction of rows (rollout order, so episode-disjoint) held out.")
+    g.add_argument("--val_sources", type=str, default=None,
+                   help="Comma-separated source_round values (e.g. 1,2 = policy-visited rows of a DAgger file). "
+                        "The validation LOSS that halves the learning rate and picks the best epoch is then "
+                        "computed on the held-out rows from these sources only, as the record did (it validated "
+                        "on policy rows). Training rows, the held-out tail and the reported per-source metrics "
+                        "are unchanged. Default: the whole tail.")
     t = parser.add_argument_group("task objective: training (the record's settings)")
     t.add_argument("--num_epochs", type=int, default=120)
     t.add_argument("--patience", type=int, default=15,
@@ -229,15 +271,20 @@ def run_task_training(args, ctx, *, data: TaskData, obs_dim: int, out_dim: int,
     opt = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
     sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, factor=0.5, patience=5)
 
+    n_val_loss = data.n_val if data.val_loss_rows is None else int(len(data.val_loss_rows))
+    if data.val_sources is not None:
+        print(f"[{label}] validation loss (LR schedule + best epoch) on the {n_val_loss:,} held-out rows "
+              f"with source_round in {data.val_sources}; metrics still reported on all {data.n_val:,}", flush=True)
+
     def val_loss():
         model.eval()
         tot, n = 0.0, 0
         with torch.no_grad():
-            for i in range(0, data.n_val, 2048):
-                s = slice(i, min(i + 2048, data.n_val))
+            for s in data.val_loss_batches(2048):
                 b = {k: v[s] for k, v in data.val.items()}
-                tot += float(loss_fn(model(data.obs(data.val, s)), b)) * (s.stop - s.start)
-                n += s.stop - s.start
+                count = (s.stop - s.start) if isinstance(s, slice) else int(len(s))
+                tot += float(loss_fn(model(data.obs(data.val, s)), b)) * count
+                n += count
         return tot / max(n, 1)
 
     best, best_epoch, best_state, best_head, bad, hist = float("inf"), None, None, None, 0, []
@@ -306,6 +353,7 @@ def run_task_training(args, ctx, *, data: TaskData, obs_dim: int, out_dim: int,
                          {"loss": best, **metrics}, checkpoint_config)
     (run_dir / "metrics.json").write_text(json.dumps(
         dict(best_val=best, best_epoch=best_epoch, epochs=len(hist), minutes=(time.time() - t0) / 60,
+             val_sources=data.val_sources, val_loss_rows=n_val_loss,
              val_metrics=metrics, val_metrics_by_source=by_source, history=hist), indent=2))
     print(f"[{label}] best_val={best:.5f} (epoch {best_epoch})  "
           + "  ".join(f"{k}={v:.4f}" for k, v in metrics.items())

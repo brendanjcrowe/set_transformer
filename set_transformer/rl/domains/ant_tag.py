@@ -102,6 +102,7 @@ from set_transformer.rl.pretrain_objectives.task_head import (   # 10.9: the sha
     add_task_arguments,
     check_variant_and_geometry,
     locate_from_dataset,
+    parse_val_sources,
     resolve_task_arguments,
     run_task_training,
     task_run_name,
@@ -1863,10 +1864,14 @@ class AntTagTaskData(_TaskData):
     """The labelled Ant-Tag dataset: the ant position is the ``obs`` passthrough; the den
     arrays are required when the variant's heads include ``den_mass``."""
 
-    def __init__(self, path: str, val_frac: float, device: torch.device, *, heads: tuple[str, ...]):
+    def __init__(self, path: str, val_frac: float, device: torch.device, *, heads: tuple[str, ...],
+                 val_sources: tuple[int, ...] | None = None):
         labels = TASK_LABELS + (DEN_LABELS if "den_mass" in heads else ())
+        # `val_sources` is forwarded (2026-09-19) so `--val_sources` is never accepted and silently ignored:
+        # an Ant-Tag file has no `source_round` array, so the base class refuses it with a clear message.
         super().__init__(path, val_frac, device, labels=labels, obs_key="ant", scale_default=float("nan"),
-                         collect_hint=_TASK_COLLECT_HINT, kind="labelled Ant-Tag dataset")
+                         collect_hint=_TASK_COLLECT_HINT, kind="labelled Ant-Tag dataset",
+                         val_sources=val_sources)
 
 
 def _head_slices(heads: tuple[str, ...]) -> list[tuple[str, slice]]:
@@ -1935,7 +1940,8 @@ def _task_prepare(parser, args, domain, encoder, device):
         parser.error(f"variant {variant_name!r} declares no task heads (Variant.task_heads); the task "
                      f"objective is defined for: " + ", ".join(n for n, v in VARIANTS.items() if v.task_heads))
     try:
-        data = AntTagTaskData(args.data_path, args.val_frac, torch.device(device), heads=heads)
+        data = AntTagTaskData(args.data_path, args.val_frac, torch.device(device), heads=heads,
+                              val_sources=parse_val_sources(getattr(args, "val_sources", None)))
     except ValueError as exc:            # missing label arrays, an unsplittable file: a command-line refusal
         parser.error(str(exc))
     if "particle_scale" not in data.metadata:
