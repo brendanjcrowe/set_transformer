@@ -14,6 +14,14 @@ This module is NOT a generic objective (it is not in ``GENERIC``): a domain decl
 :func:`run_task_training`. It imports nothing from ``rl/domains`` at module level, so a domain
 module may import it at the top (the domains package imports the domain modules, which import
 this; a module-level import back into ``rl/domains`` would close the cycle).
+
+LATENT METRIC ALIGNMENT (2026-09-19; ``change_mds/online_alignment_2026-09-19.md``). ``--align_lambda > 0``
+adds ``lambda * (1 - pearson_r)`` between the pairwise distances of the encoder's features and the
+debiased Sinkhorn divergences between the same clouds, computed per batch from the batch itself
+(``latent_alignment.OnlineAlignment``; ``--sinkhorn_blur`` in the encoder's normalised frame, the raw
+cloud divided by the dataset's scale as the extractor does). The validation LOSS that picks the best
+epoch stays the task loss alone (the Trainer's rule); ``val_align_r`` is reported beside it on a fixed
+pair sample of the held-out rows. At the default lambda 0 the loop is the record's, untouched.
 """
 
 from __future__ import annotations
@@ -29,6 +37,9 @@ import gymnasium as gym
 import numpy as np
 import torch
 import torch.nn as nn
+
+from set_transformer.latent_alignment import (LambdaRamp, OnlineAlignment, add_alignment_arguments,
+                                              resolve_sinkhorn_blur)
 
 
 class TaskData:
@@ -192,6 +203,10 @@ def add_task_arguments(parser, *, dataset_help: str) -> None:
     t.add_argument("--batch_size", type=int, default=256)
     t.add_argument("--learning_rate", type=float, default=1e-3)
     t.add_argument("--head_hidden", type=int, default=256)
+    # 2026-09-19: the alignment term (online targets), off at the default lambda 0.
+    al = parser.add_argument_group("task objective: latent metric alignment (optional; online "
+                                   "Sinkhorn targets, read only with --align_lambda > 0)")
+    add_alignment_arguments(al, sinkhorn=True)     # --sinkhorn_blur: None -> the domain's default
 
 
 def locate_from_dataset(args) -> dict:
@@ -209,6 +224,7 @@ def resolve_task_arguments(parser, args, domain, encoder, *, collect_hint: str) 
     if not encoder.learned:
         parser.error(f"the task objective needs a learned encoder (st | cgf | deepset | pointnet); "
                      f"{encoder.name!r} has no parameters to train")
+    resolve_sinkhorn_blur(args, domain)          # 2026-09-19: the domain's default when omitted
     if args.data_path is None:
         if args.variant is None:
             parser.error("--data_path or --variant is needed: the task objective reads the "
@@ -276,6 +292,42 @@ def run_task_training(args, ctx, *, data: TaskData, obs_dim: int, out_dim: int,
         print(f"[{label}] validation loss (LR schedule + best epoch) on the {n_val_loss:,} held-out rows "
               f"with source_round in {data.val_sources}; metrics still reported on all {data.n_val:,}", flush=True)
 
+    # 2026-09-19 (online alignment): the latent metric-alignment term on the encoder's features, its
+    # targets computed per batch from the batch's own clouds (divided by the dataset's scale, as the
+    # extractor does). Off at the default lambda 0: the loop below is then the record's, untouched --
+    # no Sinkhorn call, no pair draw, nothing added to the loss.
+    align_lambda = float(getattr(args, "align_lambda", 0.0) or 0.0)
+    align = ramp = align_record = None
+    val_align_pairs = val_align_targets = None
+    if align_lambda > 0:
+        blur_source = resolve_sinkhorn_blur(args, getattr(ctx, "domain", None))   # a caller that skipped resolve
+        align = OnlineAlignment(blur=float(args.sinkhorn_blur), scaling=float(args.sinkhorn_scaling),
+                                metric=args.align_metric, pairs=args.align_pairs,
+                                seed=int(getattr(args, "seed", 0) or 0))
+        ramp = LambdaRamp(align_lambda, int(args.align_warmup_epochs), int(args.align_ramp_epochs))
+        val_align_pairs = align.fixed_pairs(data.n_val, args.align_val_pairs)
+        val_align_targets = align.targets(data.val["particles"] / data.particle_scale,
+                                          data.val["weights"], val_align_pairs)
+        align_record = {"lambda": align_lambda, "warmup_epochs": int(args.align_warmup_epochs),
+                        "ramp_epochs": int(args.align_ramp_epochs), **align.record(),
+                        "val_pairs": int(len(val_align_pairs[0]))}
+        print(f"[{label}] latent alignment ON: lambda={align_lambda} ({args.align_metric}), warmup "
+              f"{args.align_warmup_epochs} / ramp {args.align_ramp_epochs} epochs; online targets (blur "
+              f"{args.sinkhorn_blur} [{blur_source}], scaling {args.sinkhorn_scaling}, {args.align_pairs} pairs "
+              f"per batch); val_align_r over {len(val_align_pairs[0])} fixed pairs of the {data.n_val:,} held-out rows; "
+              f"the validation loss stays the task loss alone", flush=True)
+        if args.align_warmup_epochs + args.align_ramp_epochs >= args.num_epochs:
+            print(f"[{label}] WARNING: warmup + ramp >= num_epochs: lambda never reaches its target, "
+                  "so no checkpoint from this run is fully aligned", flush=True)
+
+    def val_align_r() -> float:
+        model.eval()
+        feats = []
+        with torch.no_grad():
+            for s in range(0, data.n_val, 2048):
+                feats.append(model.features(data.obs(data.val, slice(s, min(s + 2048, data.n_val)))))
+        return align.correlation(torch.cat(feats), val_align_pairs, val_align_targets)
+
     def val_loss():
         model.eval()
         tot, n = 0.0, 0
@@ -293,10 +345,24 @@ def run_task_training(args, ctx, *, data: TaskData, obs_dim: int, out_dim: int,
         model.train()
         perm = torch.randperm(data.n_train, device=device)
         run = 0.0
+        lam_epoch = ramp(ep) if ramp is not None else 0.0
+        run_align = run_r = 0.0
+        n_r = 0
         for i in range(0, data.n_train, args.batch_size):
             j = perm[i:i + args.batch_size]
             b = {k: v[j] for k, v in data.train.items()}
-            loss = loss_fn(model(data.obs(data.train, j)), b)
+            if align is None:
+                loss = loss_fn(model(data.obs(data.train, j)), b)
+            else:
+                # the same forward, split so the features feed the alignment term too
+                feats = model.features(data.obs(data.train, j))
+                loss = loss_fn(model.head(feats), b)
+                a_loss, r, _ = align.term(feats, b["particles"] / data.particle_scale, b["weights"])
+                loss = loss + lam_epoch * a_loss
+                run_align += float(a_loss.detach()) * len(j)
+                if r is not None:
+                    run_r += float(r.detach()) * len(j)
+                    n_r += len(j)
             opt.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -304,7 +370,12 @@ def run_task_training(args, ctx, *, data: TaskData, obs_dim: int, out_dim: int,
             run += float(loss.detach()) * len(j)
         v = val_loss()
         sched.step(v)
-        hist.append({"epoch": ep, "train": run / data.n_train, "val": v})
+        entry = {"epoch": ep, "train": run / data.n_train, "val": v}
+        if align is not None:
+            # `train` above includes lambda * align (the Trainer's epoch loss does the same)
+            entry.update(align=run_align / data.n_train, align_r=(run_r / n_r if n_r else float("nan")),
+                         align_lambda=lam_epoch, val_align_r=val_align_r())
+        hist.append(entry)
         if v < best - 1e-6:
             best, best_epoch, bad = v, ep, 0
             # Snapshot the HEAD as well as the encoder: the metrics below are computed with
@@ -320,6 +391,17 @@ def run_task_training(args, ctx, *, data: TaskData, obs_dim: int, out_dim: int,
         (run_dir / "history.json").write_text(json.dumps(hist, indent=1))
         if bad >= args.patience:
             break
+    if align is not None:
+        # Model selection is by the task's validation loss, blind to alignment. If the best epoch
+        # predates the end of the ramp, checkpoint_best.pt is only partially aligned; say so, and
+        # record it (the Trainer's rule).
+        align_record["lambda_at_best_epoch"] = float(ramp(best_epoch))
+        align_record["val_align_r_at_best_epoch"] = float(hist[best_epoch]["val_align_r"])
+        checkpoint_config = {**checkpoint_config, "alignment": align_record}
+        if align_record["lambda_at_best_epoch"] < align_lambda:
+            print(f"[{label}] WARNING: best-by-val-loss epoch {best_epoch} has align_lambda="
+                  f"{align_record['lambda_at_best_epoch']:.3f} < target {align_lambda}; "
+                  "checkpoint_best.pt is NOT fully aligned", flush=True)
     save_task_checkpoint(model, checkpoint_dir / "checkpoint_last.pt", args, len(hist) - 1,
                          {"loss": hist[-1]["val"]}, checkpoint_config)
 
@@ -354,7 +436,8 @@ def run_task_training(args, ctx, *, data: TaskData, obs_dim: int, out_dim: int,
     (run_dir / "metrics.json").write_text(json.dumps(
         dict(best_val=best, best_epoch=best_epoch, epochs=len(hist), minutes=(time.time() - t0) / 60,
              val_sources=data.val_sources, val_loss_rows=n_val_loss,
-             val_metrics=metrics, val_metrics_by_source=by_source, history=hist), indent=2))
+             val_metrics=metrics, val_metrics_by_source=by_source, alignment=align_record,
+             history=hist), indent=2))
     print(f"[{label}] best_val={best:.5f} (epoch {best_epoch})  "
           + "  ".join(f"{k}={v:.4f}" for k, v in metrics.items())
           + f"  ({(time.time() - t0) / 60:.1f} min) -> {checkpoint_dir}", flush=True)

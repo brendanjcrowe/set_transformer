@@ -959,6 +959,7 @@ def _cgf_t_init_max_default(args):
 HUNT = Domain(
     name="hunt",
     particle_dim=2,
+    default_sinkhorn_blur=0.02,      # 2026-09-19: the recipes' recorded blur
     default_variant="least_mass",
     variants=VARIANTS,
     resolve=resolve,

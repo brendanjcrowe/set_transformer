@@ -128,6 +128,8 @@ from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize
 
 import pdomains  # noqa: F401 - registers the pdomains-odd-even-* envs
+from set_transformer.latent_alignment import (LambdaRamp, OnlineAlignment, add_alignment_arguments,
+                                              resolve_sinkhorn_blur)
 from set_transformer.rl.particle_filters.odd_even import (
     OddEvenBootstrapParticleFilter,
     OddEvenExactSupportParticleFilter,
@@ -1703,14 +1705,16 @@ def evaluate_belief_head(model, batches: BeliefBatches, objective: str, batch_si
 
 
 def save_belief_checkpoint(model: BeliefEncoderWithHead, path: Path, args, epoch: int,
-                           val: dict, geometry: dict) -> None:
+                           val: dict, geometry: dict, alignment: dict | None = None) -> None:
     """The format the RL arm's extractor loads, assembled by
     :func:`~set_transformer.rl.pretrained_encoder.encoder_checkpoint` from the extractor's own
     `checkpoint_state()` / `checkpoint_config()` (batch 10.4; before it an if-chain on the encoder
     name lived here: ST keys under ``set_transformer.``, CGF the whole state). ``geometry`` is the
     same record the extractor reports and is kept in the signature for the entry point; the
     extractor's is written. Top-level ``particle_scale`` (the Trainer's convention) is new since
-    10.4; the loaders compare it with their ``arena_scale``."""
+    10.4; the loaders compare it with their ``arena_scale``. ``alignment`` (2026-09-19): the
+    online latent metric-alignment record of the run, written into the config when the term
+    was on; absent otherwise, so the recorded checkpoints' shape is unchanged."""
     from set_transformer.rl.pretrained_encoder import encoder_checkpoint   # noqa: PLC0415 - cycle
     torch.save(encoder_checkpoint(
         model.extractor,
@@ -1720,7 +1724,8 @@ def save_belief_checkpoint(model: BeliefEncoderWithHead, path: Path, args, epoch
                 "encoder_params": int(getattr(args, "encoder_params", 0)),
                 # The producer's historical name, kept so the recorded checkpoints' readers
                 # keep working; the unified record block is batch 7.5's.
-                "pretraining": "3_pretrain_st_belief.py"},
+                "pretraining": "3_pretrain_st_belief.py",
+                **({"alignment": alignment} if alignment is not None else {})},
         head_state_dict={k: v.detach().cpu() for k, v in model.head.state_dict().items()},
         epoch=epoch, val=val, args=vars(args)), path)
 
@@ -1765,6 +1770,12 @@ def _belief_add_arguments(parser: argparse.ArgumentParser, domain=None) -> None:
                    help="probe_cgf_mode_readout.py's default, so rows join its table")
     p.add_argument("--probe_splits", type=int, default=5)
     p.add_argument("--skip_probe", action="store_true")
+    # 2026-09-19: the latent metric-alignment term with online Sinkhorn targets (the exact
+    # posterior on the shared support, weighted: an unweighted target is identically zero here);
+    # off at the default lambda 0. Spelled by the shared helper, as the task objective's.
+    al = parser.add_argument_group("exact-posterior objective: latent metric alignment (optional; "
+                                   "online Sinkhorn targets, read only with --align_lambda > 0)")
+    add_alignment_arguments(al, sinkhorn=True)     # --sinkhorn_blur: None -> the domain's default
 
 
 def _belief_resolve_arguments(parser, args, domain, encoder) -> None:
@@ -1776,6 +1787,7 @@ def _belief_resolve_arguments(parser, args, domain, encoder) -> None:
                      "<registry key> (--list_variants shows them)")
     if args.init_from and encoder.name != "st":
         raise SystemExit("--init_from is implemented for --encoder st only")
+    resolve_sinkhorn_blur(args, domain)          # 2026-09-19: the domain's default when omitted
     # 10.5 (decision 6): where the beliefs come from, decided once, printed, recorded.
     if args.data_source == "rolled":
         if args.data_path:
@@ -1924,6 +1936,43 @@ def _belief_run(args, ctx: PretrainContext, target: str) -> PretrainResult:
         entropy = float(-(val_b.weights * w.log()).sum(dim=-1).mean())
         print(f"val posterior entropy (loss floor for belief_kl): {entropy:.4f}")
 
+    # 2026-09-19 (online alignment): the latent metric-alignment term on the encoder's features,
+    # its targets the debiased Sinkhorn divergences between the batch's own beliefs (the shared
+    # centred support divided by the state scale, as the extractor does; the exact posteriors as
+    # the weights). Off at the default lambda 0: the loop below is then the recorded one, untouched.
+    align_lambda = float(getattr(args, "align_lambda", 0.0) or 0.0)
+    align = ramp = align_record = None
+    val_align_pairs = val_align_targets = None
+    if align_lambda > 0:
+        blur_source = resolve_sinkhorn_blur(args, getattr(ctx, "domain", None))   # a caller that skipped resolve
+        align = OnlineAlignment(blur=float(args.sinkhorn_blur), scaling=float(args.sinkhorn_scaling),
+                                metric=args.align_metric, pairs=args.align_pairs,
+                                seed=int(getattr(args, "seed", 0) or 0))
+        ramp = LambdaRamp(align_lambda, int(args.align_warmup_epochs), int(args.align_ramp_epochs))
+        val_align_pairs = align.fixed_pairs(val_b.n_rows, args.align_val_pairs)
+        val_align_targets = align.targets(val_b.particles.expand(val_b.n_rows, -1, -1) / scale,
+                                          val_b.weights, val_align_pairs)
+        align_record = {"lambda": align_lambda, "warmup_epochs": int(args.align_warmup_epochs),
+                        "ramp_epochs": int(args.align_ramp_epochs), **align.record(),
+                        "val_pairs": int(len(val_align_pairs[0]))}
+        print(f"latent alignment ON: lambda={align_lambda} ({args.align_metric}), warmup "
+              f"{args.align_warmup_epochs} / ramp {args.align_ramp_epochs} epochs; online targets (blur "
+              f"{args.sinkhorn_blur} [{blur_source}] = {args.sinkhorn_blur * scale:.3f} states, scaling {args.sinkhorn_scaling}, "
+              f"{args.align_pairs} pairs per batch); val_align_r over {len(val_align_pairs[0])} fixed pairs "
+              f"of the {val_b.n_rows} held-out rows; the validation loss stays the objective's alone")
+        if args.align_warmup_epochs + args.align_ramp_epochs >= args.num_epochs:
+            print("WARNING: warmup + ramp >= num_epochs: lambda never reaches its target, so no "
+                  "checkpoint from this run is fully aligned")
+
+    def _val_align_r() -> float:
+        model.eval()
+        feats = []
+        with torch.no_grad():
+            for start in range(0, val_b.n_rows, 2048):
+                index = torch.arange(start, min(start + 2048, val_b.n_rows), device=device)
+                feats.append(model.features(val_b.obs(index)))
+        return align.correlation(torch.cat(feats), val_align_pairs, val_align_targets)
+
     # ---- train ---------------------------------------------------------------
     history, best_val, best_epoch = [], float("inf"), None
     for epoch in range(1, args.num_epochs + 1):
@@ -1932,10 +1981,25 @@ def _belief_run(args, ctx: PretrainContext, target: str) -> PretrainResult:
             model.extractor.eval()
         perm = torch.randperm(train_b.n_rows, device=device)
         running, t_epoch = 0.0, time.time()
+        lam_epoch = ramp(epoch - 1) if ramp is not None else 0.0     # the ramp counts epochs from 0
+        run_align = run_r = 0.0
+        n_r = 0
         for start in range(0, train_b.n_rows, args.batch_size):
             index = perm[start:start + args.batch_size]
-            logits = model(train_b.obs(index))
-            loss = belief_loss(logits, train_b, index, target)
+            if align is None:
+                logits = model(train_b.obs(index))
+                loss = belief_loss(logits, train_b, index, target)
+            else:
+                # the same forward, split so the features feed the alignment term too
+                obs = train_b.obs(index)
+                feats = model.features(obs)
+                loss = belief_loss(model.head(feats), train_b, index, target)
+                a_loss, r, _ = align.term(feats, obs["particles"] / scale, obs["weights"])
+                loss = loss + lam_epoch * a_loss
+                run_align += float(a_loss.detach()) * len(index)
+                if r is not None:
+                    run_r += float(r.detach()) * len(index)
+                    n_r += len(index)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(trainable, 1.0)
@@ -1945,11 +2009,18 @@ def _belief_run(args, ctx: PretrainContext, target: str) -> PretrainResult:
         metrics = evaluate_belief_head(model, val_b, target, 2048, transient_max_step)
         metrics.update(epoch=epoch, train_loss=running / train_b.n_rows,
                        lr=scheduler.get_last_lr()[0], seconds=time.time() - t_epoch)
+        if align is not None:
+            # train_loss above includes lambda * align (the Trainer's epoch loss does the same)
+            metrics.update(align=run_align / train_b.n_rows, align_r=(run_r / n_r if n_r else float("nan")),
+                           align_lambda=lam_epoch, val_align_r=_val_align_r())
         history.append(metrics)
         flag = ""
         if metrics["loss"] < best_val:
             best_val, best_epoch = metrics["loss"], epoch
-            save_belief_checkpoint(model, checkpoint_dir / "checkpoint_best.pt", args, epoch, metrics, geometry)
+            save_belief_checkpoint(model, checkpoint_dir / "checkpoint_best.pt", args, epoch, metrics, geometry,
+                                   alignment=None if align_record is None else
+                                   {**align_record, "lambda_at_best_epoch": lam_epoch,
+                                    "val_align_r_at_best_epoch": metrics["val_align_r"]})
             flag = "  *best*"
         print(f"epoch {epoch:3d} | train {metrics['train_loss']:.4f} | val {metrics['loss']:.4f} | "
               f"head mode acc tr/st {metrics['head_mode_acc']['transient']:.3f}/"
@@ -1959,7 +2030,17 @@ def _belief_run(args, ctx: PretrainContext, target: str) -> PretrainResult:
               f"feat std {metrics['feature_abs_std']:.2e} | eff.rank {metrics['feature_eff_rank']:.1f} | "
               f"{metrics['seconds']:.0f}s{flag}", flush=True)
         (run_dir / "history.json").write_text(json.dumps(history, indent=1))
-    save_belief_checkpoint(model, checkpoint_dir / "checkpoint_last.pt", args, args.num_epochs, history[-1], geometry)
+    if align_record is not None and best_epoch is not None:
+        # Model selection is by the objective's validation loss, blind to alignment (the Trainer's
+        # rule); say so when the best epoch predates the end of the ramp.
+        align_record["lambda_at_best_epoch"] = float(ramp(best_epoch - 1))
+        align_record["val_align_r_at_best_epoch"] = float(history[best_epoch - 1]["val_align_r"])
+        if align_record["lambda_at_best_epoch"] < align_lambda:
+            print(f"WARNING: best-by-val-loss epoch {best_epoch} has align_lambda="
+                  f"{align_record['lambda_at_best_epoch']:.3f} < target {align_lambda}; "
+                  "checkpoint_best.pt is NOT fully aligned")
+    save_belief_checkpoint(model, checkpoint_dir / "checkpoint_last.pt", args, args.num_epochs, history[-1], geometry,
+                           alignment=align_record)
     print(f"best val loss {best_val:.4f}; checkpoints in {checkpoint_dir}")
 
     checkpoints = {"best": checkpoint_dir / "checkpoint_best.pt", "last": checkpoint_dir / "checkpoint_last.pt"}
@@ -2470,6 +2551,7 @@ def _cgf_t_init_max_default(args):
 ODD_EVEN = Domain(
     name="odd_even",
     particle_dim=1,
+    default_sinkhorn_blur=0.02,      # 2026-09-19: the recipes' recorded blur
     default_variant="oe50",
     variants=VARIANTS,
     resolve=resolve,

@@ -164,3 +164,156 @@ def test_lambda_ramp_without_ramp_is_a_step():
 def test_lambda_ramp_rejects_negative_epochs():
     with pytest.raises(ValueError):
         LambdaRamp(target=1.0, warmup_epochs=-1)
+
+
+# ---------------------------------------------------------------------------------------
+# Online targets (2026-09-19): the pair sampler, the pair-subset distances, the per-batch
+# Sinkhorn targets against the precomputed matrix, and the loss on a pair subset.
+# ---------------------------------------------------------------------------------------
+
+from set_transformer.latent_alignment import (  # noqa: E402
+    OnlineAlignment,
+    all_pairs,
+    latent_pair_distances,
+    parse_pairs,
+    sample_pairs,
+    sinkhorn_pair_targets,
+)
+
+
+def test_parse_pairs_accepts_all_or_a_positive_budget():
+    assert parse_pairs("all") == "all" and parse_pairs(" ALL ") == "all"
+    assert parse_pairs("2016") == 2016 and parse_pairs(64) == 64
+    for bad in ("0", "-3", "some", None):
+        with pytest.raises(ValueError, match="align_pairs"):
+            parse_pairs(bad)
+
+
+def test_sample_pairs_all_is_the_upper_triangle_in_order():
+    """'all' (or a budget at or above B(B-1)/2) gives the matrix path's pairs in its order, so a
+    target read with these indices equals flatten_upper_triangle of the matrix."""
+    a, b = sample_pairs(5, "all")
+    ia, ib = all_pairs(5)
+    assert torch.equal(a, ia) and torch.equal(b, ib)
+    a2, b2 = sample_pairs(5, 10)
+    assert torch.equal(a2, ia) and torch.equal(b2, ib)
+    m = _symmetric(5)
+    assert torch.equal(m[a, b], flatten_upper_triangle(m))
+
+
+def test_sample_pairs_budget_covers_every_row_without_self_or_duplicate_pairs():
+    """A budget is filled with ceil(P / B) permutations of the batch, so every row is in some
+    pair; no (i, i) pairs, no duplicates, a < b, at most the budget."""
+    B, budget = 64, 256                       # 4 permutations, nothing cut
+    a, b = sample_pairs(B, budget, torch.Generator().manual_seed(3))
+    assert 0.9 * budget <= len(a) <= budget and torch.all(a < b)
+    assert len(torch.unique(a * B + b)) == len(a)
+    assert set(a.tolist()) | set(b.tolist()) == set(range(B))
+    a, b = sample_pairs(B, 100, torch.Generator().manual_seed(3))     # cut to the budget
+    assert len(a) == 100 and torch.all(a < b) and len(torch.unique(a * B + b)) == 100
+
+
+def test_sample_pairs_uses_its_own_generator_and_leaves_the_global_stream_alone():
+    torch.manual_seed(0)
+    before = torch.rand(3)
+    torch.manual_seed(0)
+    sample_pairs(32, 40, torch.Generator().manual_seed(1))
+    assert torch.equal(before, torch.rand(3))
+    x = sample_pairs(32, 40, torch.Generator().manual_seed(1))
+    y = sample_pairs(32, 40, torch.Generator().manual_seed(1))
+    assert torch.equal(x[0], y[0]) and torch.equal(x[1], y[1])
+
+
+@pytest.mark.parametrize("metric", ["cosine", "euclidean"])
+def test_latent_pair_distances_equal_the_triangle_subset(metric):
+    z = torch.randn(9, 3, 4, generator=torch.Generator().manual_seed(0))
+    full = latent_pairwise_distances(z, metric)
+    a, b = all_pairs(9)
+    torch.testing.assert_close(latent_pair_distances(z, (a, b), metric), full, atol=1e-6, rtol=1e-5)
+    sub = torch.tensor([0, 5, 17, 35])
+    torch.testing.assert_close(latent_pair_distances(z, (a[sub], b[sub]), metric), full[sub],
+                               atol=1e-6, rtol=1e-5)
+
+
+def test_online_targets_equal_the_precomputed_matrix_entries(tmp_path):
+    """The whole point: the same divergence as emd_matrix.compute_matrix (weighted, debiased),
+    computed for the listed pairs only; uniform weights equal the unweighted call."""
+    from geomloss import SamplesLoss
+    from set_transformer.emd_matrix import compute_matrix
+    g = torch.Generator().manual_seed(0)
+    pts = torch.rand(16, 10, 2, generator=g) * 2 - 1
+    w = torch.rand(16, 10, generator=g) ** 2
+    w = w / w.sum(dim=1, keepdim=True)
+    matrix = compute_matrix(pts.numpy(), tmp_path / "m.npy", blur=0.05, block=8, verify=False,
+                            device="cpu", weights=w.numpy())
+    reference = flatten_upper_triangle(torch.from_numpy(np.array(matrix)))
+    ot = SamplesLoss("sinkhorn", p=2, blur=0.05, scaling=0.5)
+    a, b = all_pairs(16)
+    # the matrix debiases by hand (self terms once per cloud), geomloss per pair: <1e-3 apart
+    # by emd_matrix's own verify_against_geomloss bound (1.2e-4 measured here)
+    torch.testing.assert_close(sinkhorn_pair_targets(pts, w, ot, (a, b)), reference, atol=1e-3, rtol=0)
+    sub = torch.tensor([3, 40, 77, 119])
+    torch.testing.assert_close(sinkhorn_pair_targets(pts, w, ot, (a[sub], b[sub]), chunk=3),
+                               reference[sub], atol=1e-3, rtol=0)
+    uniform = torch.full((16, 10), 0.1)
+    torch.testing.assert_close(sinkhorn_pair_targets(pts, None, ot, (a, b)),
+                               sinkhorn_pair_targets(pts, uniform, ot, (a, b)), atol=1e-5, rtol=0)
+    # the weight rule is the loss's own: zero mass is refused, not silently made uniform
+    with pytest.raises(ValueError, match="sum to zero"):
+        sinkhorn_pair_targets(pts, torch.zeros(16, 10), ot, (a, b))
+
+
+def test_pearson_loss_on_a_pair_subset_matches_the_flat_form():
+    z = torch.randn(8, 4, generator=torch.Generator().manual_seed(1))
+    m = _symmetric(8)
+    loss_full, r_full = PearsonAlignmentLoss()(z, m)
+    a, b = all_pairs(8)
+    loss_pairs, r_pairs = PearsonAlignmentLoss()(z, m[a, b], pairs=(a, b))
+    assert loss_pairs.item() == pytest.approx(loss_full.item(), abs=1e-6)
+    assert r_pairs.item() == pytest.approx(r_full.item(), abs=1e-6)
+    with pytest.raises(ValueError, match="flat"):
+        PearsonAlignmentLoss()(z, m, pairs=(a, b))
+
+
+def test_online_alignment_term_is_differentiable_and_records_its_settings():
+    oa = OnlineAlignment(blur=0.05, pairs=20, seed=0)
+    g = torch.Generator().manual_seed(2)
+    pts = torch.rand(8, 10, 2, generator=g)
+    w = torch.rand(8, 10, generator=g)
+    z = torch.randn(8, 4, generator=g).requires_grad_(True)
+    loss, r, n = oa.term(z, pts, w)
+    assert 0 < n <= 20 and r is not None
+    loss.backward()
+    assert z.grad is not None and torch.isfinite(z.grad).all()
+    assert oa.record() == {"target": "online", "metric": "cosine", "pairs": 20, "blur": 0.05,
+                           "scaling": 0.5, "p": 2, "pair_seed": 0}
+    p1, p2 = oa.fixed_pairs(30, 50), oa.fixed_pairs(30, 50)      # drawn from seed + 1, every time
+    assert torch.equal(p1[0], p2[0]) and torch.equal(p1[1], p2[1]) and len(p1[0]) == 50
+    # Odd-Even keeps its posteriors in float64: accepted on float32 particles
+    loss64, _, _ = oa.term(z.detach(), pts, w.double())
+    assert torch.isfinite(loss64)
+    assert np.isfinite(oa.correlation(z.detach(), p1 if False else oa.fixed_pairs(8, 10),
+                                      oa.targets(pts, w, oa.fixed_pairs(8, 10))))
+    with pytest.raises(ValueError, match="positive"):
+        OnlineAlignment(blur=0.0)
+
+
+def test_resolve_sinkhorn_blur_fills_the_domain_default_only_when_omitted():
+    """2026-09-19: a command that omits --sinkhorn_blur gets the DOMAIN's default (Domain.default_sinkhorn_blur),
+    the package's 0.05 for a domain without one; a given value is kept; the source is recorded; idempotent."""
+    from types import SimpleNamespace
+    from set_transformer.latent_alignment import PACKAGE_SINKHORN_BLUR, resolve_sinkhorn_blur
+    dom = SimpleNamespace(default_sinkhorn_blur=0.02)
+    a = SimpleNamespace(sinkhorn_blur=None)
+    assert resolve_sinkhorn_blur(a, dom) == "domain default" and a.sinkhorn_blur == 0.02
+    assert resolve_sinkhorn_blur(a, dom) == "domain default" and a.sinkhorn_blur == 0.02      # idempotent
+    b = SimpleNamespace(sinkhorn_blur=0.01)
+    assert resolve_sinkhorn_blur(b, dom) == "given" and b.sinkhorn_blur == 0.01 and b.sinkhorn_blur_source == "given"
+    c = SimpleNamespace(sinkhorn_blur=None)
+    assert resolve_sinkhorn_blur(c, None) == "package default" and c.sinkhorn_blur == PACKAGE_SINKHORN_BLUR == 0.05
+    d = SimpleNamespace(sinkhorn_blur=None)
+    assert resolve_sinkhorn_blur(d, SimpleNamespace()) == "package default"                  # a domain without the field
+    # the four pretraining domains declare the recipes' recorded values; Car-Flag keeps the fallback
+    from set_transformer.rl import domains
+    assert {n: domains.get(n).default_sinkhorn_blur for n in ("hunt", "odd_even", "msearch", "ant_tag", "car_flag")} == \
+        {"hunt": 0.02, "odd_even": 0.02, "msearch": 0.02, "ant_tag": 0.01, "car_flag": 0.05}

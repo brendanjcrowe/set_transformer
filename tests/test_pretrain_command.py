@@ -299,21 +299,22 @@ def test_variant_flag_must_belong_to_the_domain(dataset, tmp_path, capsys):
 
 
 def test_a_flag_of_another_objective_is_refused_with_the_default_named(dataset, tmp_path, capsys):
-    """A reconstruction flag (--sinkhorn_blur) without --objective on odd_even: the domain's default
+    """A reconstruction flag (--loss_type) without --objective on odd_even: the domain's default
     (belief_kl) applies, and the error says so instead of a bare 'unrecognized arguments'. (Until 10.5
-    the test used --data_path, which the exact-posterior objectives now take.)"""
+    the test used --data_path, which the exact-posterior objectives now take; until 2026-09-19
+    --sinkhorn_blur, which they now take for the online alignment target's geometry.)"""
     with pytest.raises(SystemExit) as exc:
         pretrain.main(["--domain", "odd_even", "--encoder", "st", "--variant", "oe50_short",
-                       "--sinkhorn_blur", "0.02", "--base_dir", str(tmp_path), "--dry_run"])
+                       "--loss_type", "sinkhorn", "--base_dir", str(tmp_path), "--dry_run"])
     err = capsys.readouterr().err
-    assert exc.value.code == 2 and "unrecognized arguments: --sinkhorn_blur" in err
+    assert exc.value.code == 2 and "unrecognized arguments: --loss_type" in err
     assert "odd_even's default 'belief_kl' applies; --list_objectives shows the others" in err
     # With the objective named, the same typo is a plain unrecognized-argument error.
     with pytest.raises(SystemExit):
         pretrain.main(["--domain", "odd_even", "--encoder", "st", "--objective", "belief_kl", "--variant",
-                       "oe50_short", "--sinkhorn_blur", "0.02", "--base_dir", str(tmp_path), "--dry_run"])
+                       "oe50_short", "--loss_type", "sinkhorn", "--base_dir", str(tmp_path), "--dry_run"])
     err = capsys.readouterr().err
-    assert "unrecognized arguments: --sinkhorn_blur" in err and "default" not in err
+    assert "unrecognized arguments: --loss_type" in err and "default" not in err
 
 
 # ---------------------------------------------------------------------------

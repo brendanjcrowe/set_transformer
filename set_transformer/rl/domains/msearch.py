@@ -601,6 +601,7 @@ def _cgf_t_init_max_default(args):
 MSEARCH = Domain(
     name="msearch",
     particle_dim=2,
+    default_sinkhorn_blur=0.02,      # 2026-09-19: the recipes' recorded blur
     default_variant="msearch",
     variants=VARIANTS,
     resolve=resolve,

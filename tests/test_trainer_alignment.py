@@ -208,3 +208,73 @@ def test_trainer_load_checkpoint_roundtrip(tmp_path, weighted_npz):
     assert fresh.global_step == trainer.global_step
     for a, b in zip(fresh.model.parameters(), trainer.model.parameters()):
         assert torch.equal(a, b)
+
+
+# ---------------------------------------------------------------------------------------
+# Online targets (2026-09-19): align_target="online" needs no matrix and no indexed loader,
+# gives the matrix path's numbers on the same batch, trains, and records what it did.
+# ---------------------------------------------------------------------------------------
+
+def test_online_alignment_needs_no_matrix_and_no_indexed_loader(tmp_path, weighted_npz):
+    t = _trainer(tmp_path, weighted_npz, "online", indexed=False,
+                 align_lambda=0.2, align_target="online")
+    assert t.align_loss is not None and t.emd_matrix is None and t.online_alignment is not None
+    assert not t._indexed_loader
+    # the held-out metric: one fixed pair sample over the val rows, its targets computed once
+    assert t._val_align_pair_index is not None
+    assert len(t._val_align_pairs) == len(t._val_align_pair_index[0])
+    assert np.isfinite(t._validation_alignment_r())
+    with pytest.raises(ValueError, match="align_target"):
+        _trainer(tmp_path, weighted_npz, "badtarget", indexed=False,
+                 align_lambda=0.2, align_target="disk")
+    with pytest.raises(ValueError, match="align_pairs"):
+        _trainer(tmp_path, weighted_npz, "badpairs", indexed=False,
+                 align_lambda=0.2, align_target="online", align_pairs="some")
+    # the matrix path is untouched: its refusals still fire with the default target
+    with pytest.raises(ValueError, match="emd_matrix_path"):
+        _trainer(tmp_path, weighted_npz, "nomatrix2", indexed=True, align_lambda=0.2)
+
+
+def test_online_term_equals_the_matrix_term_on_the_same_batch(tmp_path, weighted_npz, emd_matrix_path):
+    """Same clouds, same latent: the per-batch targets ARE the matrix entries, so the two ways
+    of aligning give the same term (measured 8e-7 apart; the matrix's manual debiasing vs
+    geomloss's own). The held-out metric agrees too: every pair of the val rows is in the
+    fixed sample when the budget covers them all."""
+    m = _trainer(tmp_path, weighted_npz, "m", indexed=True, align_lambda=0.5,
+                 emd_matrix_path=emd_matrix_path)
+    o = _trainer(tmp_path, weighted_npz, "o", indexed=False, align_lambda=0.5,
+                 align_target="online", align_pairs="all")
+    particles, weights, idx = m._split_batch(next(iter(m.train_loader)))
+    recon, aux, latent = m._forward_with_latent(m._model_input(particles, weights), need_latent=True)
+    _, cm = m._compose_loss(recon, particles, aux, target_weights=weights, latent=latent,
+                            batch_indices=idx, align_lambda=0.5)
+    total_o, co = o._compose_loss(recon, particles, aux, target_weights=weights, latent=latent,
+                                  batch_indices=None, align_lambda=0.5)
+    assert cm["recon"] == co["recon"]
+    assert co["align"] == pytest.approx(cm["align"], abs=1e-4)
+    assert co["align_r"] == pytest.approx(cm["align_r"], abs=1e-4)
+    assert total_o.item() == pytest.approx(co["recon"] + 0.5 * co["align"], rel=1e-5)
+    assert o._validation_alignment_r() == pytest.approx(m._validation_alignment_r(), abs=1e-3)
+
+
+def test_online_alignment_trains_and_records_the_target(tmp_path, weighted_npz):
+    aligned = _trainer(tmp_path, weighted_npz, "online_train", indexed=False, num_epochs=12,
+                       align_lambda=1.0, align_target="online", align_pairs="all")
+    r_before = aligned._validation_alignment_r()
+    _epoch_losses(aligned)
+    r_after = aligned._validation_alignment_r()
+    assert np.isfinite(r_after) and r_after > 0.7, (r_before, r_after)
+    val_loss, metrics = aligned.evaluate()
+    assert "align_r" in metrics and np.isfinite(metrics["align_r"]) and np.isfinite(val_loss)
+    # a budget below every pair runs too (the sampler's own stream), and the checkpoint says
+    # what the target was: online, its pairs, blur and scaling, and no matrix path
+    budget = _trainer(tmp_path, weighted_npz, "online_budget", indexed=False, num_epochs=2,
+                      align_lambda=1.0, align_target="online", align_pairs=32)
+    budget.train()
+    ck = torch.load(budget.exp_config.checkpoint_dir / "checkpoint_latest.pt",
+                    map_location="cpu", weights_only=False)
+    al = ck["alignment"]
+    assert al["target"] == "online" and al["emd_matrix_path"] is None and al["pairs"] == 32
+    assert al["blur"] == BLUR and al["scaling"] == 0.5 and al["val_pairs"] == 20000
+    assert al["lambda"] == 1.0 and al["lambda_at_best_epoch"] == 1.0
+    assert ck["config"].align_target == "online" and ck["config"].align_pairs == 32

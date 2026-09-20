@@ -2145,6 +2145,7 @@ def _cgf_t_bound_default(variant: str) -> float:
 ANT_TAG = Domain(
     name="ant_tag",
     particle_dim=2,
+    default_sinkhorn_blur=0.01,      # 2026-09-19: the recipes' recorded blur
     default_variant="base",
     variants=VARIANTS,
     resolve=resolve,

@@ -298,6 +298,32 @@ def test_train_st_alignment_needs_a_matrix(tiny_dataset, tmp):
     assert "--align_lambda > 0 needs --emd_matrix_path" in proc.stderr
 
 
+def test_train_st_online_alignment_needs_no_matrix(tiny_dataset, tmp):
+    """2026-09-19: --align_target online computes the targets per batch from the batch's own
+    clouds; no matrix, no sidecar, no row cap. The two ways cannot be mixed."""
+    proc = _run(TRAIN_ST, ["--data_path", str(tiny_dataset), *ST_FLAGS, "--base_dir", str(tmp / "online"),
+                           "--align_lambda", "0.2", "--align_target", "online", "--num_epochs", "1"], tmp)
+    assert proc.returncode == 0, _tail(proc)
+    assert "Latent alignment: lambda=0.2" in proc.stdout and "target online" in proc.stdout
+    proc = _run(TRAIN_ST, ["--data_path", str(tiny_dataset), *ST_FLAGS, "--base_dir", str(tmp / "x"),
+                           "--align_lambda", "0.2", "--align_target", "online",
+                           "--emd_matrix_path", str(tmp / "none.npy")], tmp)
+    assert proc.returncode == 2 and "takes no --emd_matrix_path" in proc.stderr
+    proc = _run(TRAIN_ST, ["--help"], tmp)
+    for flag in ("--align_target", "--align_pairs", "--align_val_pairs"):
+        assert flag in proc.stdout, flag
+    # 2026-09-19 (user OK): a reconstruction command that omits --sinkhorn_blur gets the DOMAIN's default
+    # (Ant-Tag 0.01), not geomloss's 0.05, and the run says where the value came from
+    proc = _run(TRAIN_ST, ["--data_path", str(tiny_dataset), *ST_FLAGS, "--base_dir", str(tmp / "blur"),
+                           "--num_epochs", "1"], tmp)
+    assert proc.returncode == 0, _tail(proc)
+    assert "sinkhorn_blur=0.01" in proc.stdout and "domain default" in proc.stdout
+    proc = _run(TRAIN_ST, ["--data_path", str(tiny_dataset), *ST_FLAGS, "--base_dir", str(tmp / "blur2"),
+                           "--num_epochs", "1", "--sinkhorn_blur", "0.03"], tmp)
+    assert proc.returncode == 0, _tail(proc)
+    assert "sinkhorn_blur=0.03" in proc.stdout and "; given)" in proc.stdout
+
+
 def test_train_st_refuses_a_matrix_whose_sidecar_disagrees(tiny_dataset, tmp):
     matrix = tmp / "fake_emd.npy"
     np.save(matrix, np.zeros((S, S), dtype=np.float32))

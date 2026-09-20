@@ -42,6 +42,7 @@ from ..data.dataset import IndexedDataset, POMDPDataset
 from ..emd_matrix import load_matrix
 from ..latent_alignment import (
     LambdaRamp,
+    OnlineAlignment,
     PearsonAlignmentLoss,
     flatten_upper_triangle,
     latent_pairwise_distances,
@@ -372,38 +373,57 @@ class Trainer:
     def _setup_alignment(self) -> None:
         """Wire the alignment term up from config, or leave it off.
 
-        On: loads the pairwise-EMD matrix (memmap; its size must match the
-        base dataset exactly), builds the Pearson loss and the lambda ramp,
-        and fixes a held-out set of val rows for val/align_r.
+        On: builds the Pearson loss and the lambda ramp, and fixes a held-out
+        set of val rows for val/align_r. Where the TARGET distances come from
+        is config.align_target (2026-09-19): "matrix" loads the pairwise-EMD
+        matrix (memmap; its size must match the base dataset exactly) and
+        needs an indexed loader; "online" builds an OnlineAlignment that
+        computes the same divergence between the batch's own clouds at every
+        step (sinkhorn_blur / sinkhorn_scaling), needs no matrix and no row
+        indices, and draws ONE fixed pair sample over the val rows for the
+        metric. Both leave the rest of the trainer identical.
         """
         base, indexed = self._unwrap_dataset(self.train_loader.dataset)
         self._base_dataset = base
         self._indexed_loader = indexed
         self.align_loss = None
         self.emd_matrix = None
+        self.online_alignment = None
         self._lambda_ramp = None
         self._val_align_indices = None
         self._val_align_pairs = None
+        self._val_align_pair_index = None
 
         lam = float(getattr(self.config, "align_lambda", 0.0) or 0.0)
         if lam <= 0.0:
             return
+        target = str(getattr(self.config, "align_target", "matrix") or "matrix")
+        if target not in ("matrix", "online"):
+            raise ValueError(f"align_target must be 'matrix' or 'online', got {target!r}")
         path = getattr(self.config, "emd_matrix_path", None)
-        if not path:
-            raise ValueError(
-                "align_lambda > 0 requires emd_matrix_path (the pairwise EMD "
-                "matrix over the dataset; see 2b_precompute_emd.py)")
-        if not indexed:
-            raise ValueError(
-                "align_lambda > 0 requires the loaders to carry dataset row "
-                "indices: build them with get_data_loader(indexed=True)")
+        if target == "matrix":
+            if not path:
+                raise ValueError(
+                    "align_lambda > 0 requires emd_matrix_path (the pairwise EMD "
+                    "matrix over the dataset; see 2b_precompute_emd.py)")
+            if not indexed:
+                raise ValueError(
+                    "align_lambda > 0 requires the loaders to carry dataset row "
+                    "indices: build them with get_data_loader(indexed=True)")
         if not isinstance(base, POMDPDataset):
             raise ValueError(
                 f"alignment needs a POMDPDataset at the base of the loader, "
                 f"got {type(base).__name__}")
         n = len(base)
-        self.emd_matrix = load_matrix(Path(path), n, mmap=True)
-        self.align_loss = PearsonAlignmentLoss(self.config.align_metric)
+        if target == "matrix":
+            self.emd_matrix = load_matrix(Path(path), n, mmap=True)
+            self.align_loss = PearsonAlignmentLoss(self.config.align_metric)
+        else:
+            self.online_alignment = OnlineAlignment(
+                blur=self.config.sinkhorn_blur, scaling=self.config.sinkhorn_scaling,
+                metric=self.config.align_metric, pairs=self.config.align_pairs,
+                seed=int(self.config.seed))
+            self.align_loss = self.online_alignment.loss
         self._lambda_ramp = LambdaRamp(
             lam, self.config.align_warmup_epochs, self.config.align_ramp_epochs)
 
@@ -411,14 +431,26 @@ class Trainer:
         val_idx = np.asarray(getattr(val_dataset, "indices", np.arange(n)), dtype=np.int64)
         val_idx = np.sort(val_idx)[: int(self.config.align_val_max_samples)]
         if len(val_idx) >= 2:
-            sub = np.array(self.emd_matrix[np.ix_(val_idx, val_idx)], dtype=np.float32)
             self._val_align_indices = val_idx
-            self._val_align_pairs = flatten_upper_triangle(torch.from_numpy(sub))
+            if self.emd_matrix is not None:
+                sub = np.array(self.emd_matrix[np.ix_(val_idx, val_idx)], dtype=np.float32)
+                self._val_align_pairs = flatten_upper_triangle(torch.from_numpy(sub))
+            else:
+                # The held-out pairs and their targets are computed ONCE: the clouds never
+                # change, and a metric on a fixed sample is comparable across epochs.
+                pairs = self.online_alignment.fixed_pairs(len(val_idx), self.config.align_val_pairs)
+                particles, weights = self._rows_tensors(val_idx)
+                self._val_align_pair_index = pairs
+                self._val_align_pairs = self.online_alignment.targets(particles, weights, pairs).cpu()
+        wording = (f"matrix {path} over {n} rows" if self.emd_matrix is not None else
+                   f"online targets (blur {self.config.sinkhorn_blur}, scaling "
+                   f"{self.config.sinkhorn_scaling}, {self.config.align_pairs} pairs per batch)")
+        n_val_pairs = 0 if self._val_align_pairs is None else int(len(self._val_align_pairs))
         self.logger.info(
             f"Latent alignment ON: lambda={lam} ({self.config.align_metric}), "
             f"warmup {self.config.align_warmup_epochs} ep, ramp "
-            f"{self.config.align_ramp_epochs} ep, matrix {path} over {n} rows, "
-            f"val_r over {len(val_idx)} held-out rows")
+            f"{self.config.align_ramp_epochs} ep, {wording}, "
+            f"val_r over {len(val_idx)} held-out rows ({n_val_pairs} pairs)")
 
     def _align_lambda(self, epoch: int) -> float:
         return 0.0 if self._lambda_ramp is None else float(self._lambda_ramp(epoch))
@@ -427,14 +459,21 @@ class Trainer:
         """What a checkpoint records about alignment (None when off)."""
         if self.align_loss is None:
             return None
-        return {
+        path = getattr(self.config, "emd_matrix_path", None)
+        record = {
             "lambda": float(self.config.align_lambda),
             "metric": self.config.align_metric,
             "warmup_epochs": int(self.config.align_warmup_epochs),
             "ramp_epochs": int(self.config.align_ramp_epochs),
-            "emd_matrix_path": str(self.config.emd_matrix_path),
+            # 2026-09-19: "matrix" (the recorded runs; the path below) or "online"
+            "target": "online" if self.online_alignment is not None else "matrix",
+            "emd_matrix_path": str(path) if path else None,
             "lambda_at_best_epoch": self._align_lambda(self.best_epoch),
         }
+        if self.online_alignment is not None:
+            record.update(self.online_alignment.record())      # pairs, blur, scaling, p, pair_seed
+            record["val_pairs"] = int(self.config.align_val_pairs)
+        return record
 
     def _forward_with_latent(self, model_input, need_latent: bool):
         """``(recon, aux, latent)`` from one encoder pass.
@@ -462,28 +501,38 @@ class Trainer:
             f"latent alignment is not supported for model_type="
             f"{self.config.model_type!r}")
 
+    def _rows_tensors(self, rows):
+        """``(particles, weights)`` of the given BASE dataset rows on the training device
+        (``weights`` None for an unweighted dataset). The body of the val-row loop of
+        ``_validation_alignment_r`` (2026-09-19: moved out so the online setup can fetch the
+        same rows for its fixed targets)."""
+        base = self._base_dataset
+        samples = [base[int(i)] for i in rows]
+        if base.is_weighted:
+            particles = torch.stack([p for p, _ in samples])
+            weights = torch.stack([w for _, w in samples])
+        else:
+            particles, weights = torch.stack(samples), None
+        particles = particles.to(self.config.device)
+        weights = None if weights is None else weights.to(self.config.device)
+        return particles, weights
+
     def _validation_alignment_r(self) -> float:
-        """Pearson r between latent and EMD distances over the fixed val rows."""
+        """Pearson r between latent and target distances over the fixed val rows: every
+        pair against the matrix, or (online) the fixed pair sample against its targets."""
         if self._val_align_indices is None:
             return float("nan")
         self.model.eval()
         codes = []
-        base = self._base_dataset
         with torch.no_grad():
             for s in range(0, len(self._val_align_indices), 256):
-                rows = self._val_align_indices[s:s + 256]
-                samples = [base[int(i)] for i in rows]
-                if base.is_weighted:
-                    particles = torch.stack([p for p, _ in samples])
-                    weights = torch.stack([w for _, w in samples])
-                else:
-                    particles, weights = torch.stack(samples), None
-                particles = particles.to(self.config.device)
-                weights = None if weights is None else weights.to(self.config.device)
+                particles, weights = self._rows_tensors(self._val_align_indices[s:s + 256])
                 _, _, z = self._forward_with_latent(
                     self._model_input(particles, weights), need_latent=True)
                 codes.append(z.reshape(z.shape[0], -1))
         z = torch.cat(codes, dim=0)
+        if self._val_align_pair_index is not None:
+            return self.online_alignment.correlation(z, self._val_align_pair_index, self._val_align_pairs)
         r = pearson_r(latent_pairwise_distances(z, self.config.align_metric),
                       self._val_align_pairs.to(z.device))
         return float("nan") if r is None else float(r)
@@ -552,6 +601,9 @@ class Trainer:
         `latent` + `batch_indices` (+ `align_lambda`) add the latent metric-
         alignment term: 1 - pearson_r between the batch's latent pairwise
         distances and the matching entries of the precomputed EMD matrix.
+        With online targets (2026-09-19) `batch_indices` is not needed: the
+        targets are the debiased Sinkhorn divergences between the batch's own
+        clouds (`target`, `target_weights`), computed here under no_grad.
         The term is added even at lambda 0 during warmup so its value is
         logged; only its weight is 0. evaluate() passes no latent, so the
         VALIDATION loss stays reconstruction-only and model selection is
@@ -568,16 +620,20 @@ class Trainer:
             )
         total = recon_loss
         components = {"recon": recon_loss.item()}
-        if (self.align_loss is not None and latent is not None
-                and batch_indices is not None):
-            sub = np.array(self.emd_matrix[np.ix_(batch_indices, batch_indices)],
-                           dtype=np.float32)
-            align_term, r = self.align_loss(latent, torch.from_numpy(sub).to(latent.device))
-            total = total + align_lambda * align_term
-            components["align"] = float(align_term.detach())
-            components["align_lambda"] = float(align_lambda)
-            if r is not None:
-                components["align_r"] = float(r.detach())
+        if self.align_loss is not None and latent is not None:
+            align_term = r = None
+            if self.online_alignment is not None:
+                align_term, r, _ = self.online_alignment.term(latent, target, target_weights)
+            elif batch_indices is not None:
+                sub = np.array(self.emd_matrix[np.ix_(batch_indices, batch_indices)],
+                               dtype=np.float32)
+                align_term, r = self.align_loss(latent, torch.from_numpy(sub).to(latent.device))
+            if align_term is not None:
+                total = total + align_lambda * align_term
+                components["align"] = float(align_term.detach())
+                components["align_lambda"] = float(align_lambda)
+                if r is not None:
+                    components["align_r"] = float(r.detach())
         if "kl" in aux:
             total = total + self.config.kl_weight * aux["kl"]
             components["kl"] = aux["kl"].item()

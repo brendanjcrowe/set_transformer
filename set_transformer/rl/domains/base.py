@@ -315,3 +315,9 @@ class Domain:
 
     def variant_names(self) -> list[str]:
         return sorted(self.variants)
+    #: 2026-09-19 (online alignment): the Sinkhorn blur this problem's pretraining uses when a command
+    #: omits ``--sinkhorn_blur`` -- the reconstruction loss's and the alignment target's, in the
+    #: encoder's normalised frame. One source for every objective; the recipes pass the same value
+    #: explicitly, so run records stay self-describing. The package fallback 0.05 (geomloss's default)
+    #: applies to a domain that does not set it (Car-Flag, which pretrains nothing).
+    default_sinkhorn_blur: float = 0.05

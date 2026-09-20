@@ -107,6 +107,17 @@ class TrainingConfig:
     # Held-out latent<->EMD correlation is computed over at most this many
     # val rows (pairs grow quadratically: 2000 rows = 2M pairs).
     align_val_max_samples: int = 2000
+    # 2026-09-19 (online alignment; change_mds/online_alignment_2026-09-19.md): where the
+    # target distances come from. "matrix" (the default; every recorded run): the file above.
+    # "online": the debiased Sinkhorn divergence between the batch's OWN input clouds,
+    # computed per batch under no_grad with sinkhorn_blur / sinkhorn_scaling
+    # (latent_alignment.OnlineAlignment) -- no matrix, no sidecar, no row cap, no indexed
+    # loader. align_pairs is the pairs-per-batch budget ("all" or an int;
+    # latent_alignment.sample_pairs) and align_val_pairs the size of the fixed held-out pair
+    # sample behind val/align_r. Neither is read in matrix mode or at lambda 0.
+    align_target: str = "matrix"
+    align_pairs: Union[int, str] = 2016
+    align_val_pairs: int = 20000
 
     # Hardware
     device: str = "cuda" if torch.cuda.is_available() else "cpu"

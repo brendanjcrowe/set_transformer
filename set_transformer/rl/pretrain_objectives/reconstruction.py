@@ -28,6 +28,12 @@ itself. ``--encoder deepset|pointnet`` (batch 10.11, 2026-09-14) pretrains the p
 extractor the same way (``models/pooled_arm_ae.py``: weight channel, weighted / masked pool) and
 exports ``checkpoints/checkpoint_best_<encoder>_arm.pt``; alignment (``--align_lambda``) runs on
 every one of the four, the Trainer reading ``encode()`` off each arm autoencoder.
+
+ONLINE ALIGNMENT TARGETS (2026-09-19; ``change_mds/online_alignment_2026-09-19.md``). ``--align_target
+online`` computes the target distances per batch from the batch's own clouds (the same debiased
+Sinkhorn, the run's ``--sinkhorn_blur`` / ``--sinkhorn_scaling``; ``latent_alignment.OnlineAlignment``)
+instead of reading ``--emd_matrix_path``: no step 2b, no sidecar checks, no row cap, no indexed loader,
+``--align_pairs`` pairs per batch. The default stays ``matrix``, so every recorded command is unchanged.
 """
 
 from __future__ import annotations
@@ -44,6 +50,7 @@ import torch.multiprocessing as mp
 
 from set_transformer.data.dataset import get_data_loader
 from set_transformer.emd_matrix import dataset_sha256, read_sidecar
+from set_transformer.latent_alignment import add_alignment_arguments, resolve_sinkhorn_blur
 from set_transformer.models.arm_export import export_arm_checkpoint
 from set_transformer.models.cgf_arm_ae import CGFArmAutoencoder, make_arm_extractor
 from set_transformer.models.pooled_arm_ae import PooledArmAutoencoder, make_pooled_arm_extractor
@@ -139,9 +146,12 @@ def add_arguments(parser: argparse.ArgumentParser, domain=None) -> None:
              "weighted sets; chamfer is unweighted only. (emd is the eval "
              "metric and has no gradient; hausdorff is broken upstream.)")
     lo.add_argument(
-        "--sinkhorn_blur", type=float, default=0.05,
+        "--sinkhorn_blur", type=float, default=None,
         help="Sinkhorn regularization in COORDINATE UNITS; must be well below "
-             "the smallest belief structure to resolve.")
+             "the smallest belief structure to resolve. Default (2026-09-19): the domain's "
+             "default_sinkhorn_blur (0.02 hunt / Odd-Even / msearch, 0.01 Ant-Tag; the recipes' "
+             "recorded values); 0.05 (geomloss's default, this flag's default before that date) "
+             "for a domain that declares none. Every recorded reconstruction command passed the flag.")
     lo.add_argument("--sinkhorn_scaling", type=float, default=0.5)
 
     # The decoder's geometry (and, for the ST arm, the encoder's -- the same PFSetTransformer
@@ -176,7 +186,15 @@ def add_arguments(parser: argparse.ArgumentParser, domain=None) -> None:
                         "Default off.")
 
     a = parser.add_argument_group("reconstruction objective: latent metric alignment "
-                                  "(optional; needs 2b_precompute_emd.py first)")
+                                  "(optional; --align_target matrix needs 2b_precompute_emd.py "
+                                  "first, online needs nothing)")
+    a.add_argument(
+        "--align_target", type=str, default="matrix", choices=["matrix", "online"],
+        help="Where the target distances come from (2026-09-19). matrix (default): the "
+             "precomputed file, --emd_matrix_path. online: the same debiased Sinkhorn "
+             "divergence between the batch's own clouds, computed per batch with this run's "
+             "--sinkhorn_blur / --sinkhorn_scaling; no matrix, no row cap, --align_pairs pairs "
+             "per batch.")
     a.add_argument(
         "--align_lambda", type=float, default=0.0,
         help="Weight of the latent metric-alignment term, 1 - pearson_r between "
@@ -195,6 +213,7 @@ def add_arguments(parser: argparse.ArgumentParser, domain=None) -> None:
                    help="Epochs over which lambda ramps linearly to its target.")
     a.add_argument("--align_val_max_samples", type=int, default=2000,
                    help="Val rows used for the held-out val/align_r metric.")
+    add_alignment_arguments(a, budget_only=True)      # --align_pairs / --align_val_pairs (online)
 
 
 def locate(args: argparse.Namespace) -> dict:
@@ -206,6 +225,7 @@ def locate(args: argparse.Namespace) -> dict:
 def resolve_arguments(parser: argparse.ArgumentParser, args: argparse.Namespace,
                       domain, encoder) -> None:
     """The checks that need no data (the script ran them right after parsing)."""
+    resolve_sinkhorn_blur(args, domain)          # 2026-09-19: the domain's default when omitted
     if args.data_path is None:
         # 7.5 (decision 1): the dataset the collector puts under the run root for this variant.
         if not getattr(args, "variant", None):
@@ -225,9 +245,12 @@ def resolve_arguments(parser: argparse.ArgumentParser, args: argparse.Namespace,
                      f"encoder {encoder.name!r} has no reconstruction path"
                      + ("" if encoder.learned else " (an analytic encoder has no parameters to pretrain)")
                      + ".")
-    if args.emd_matrix_path is None and args.align_lambda > 0:
+    if args.emd_matrix_path is None and args.align_lambda > 0 and args.align_target == "matrix":
         parser.error("--align_lambda > 0 needs --emd_matrix_path "
-                     "(run 2b_precompute_emd.py on this dataset first)")
+                     "(run 2b_precompute_emd.py on this dataset first, or --align_target online)")
+    if args.align_target == "online" and args.emd_matrix_path is not None:
+        parser.error("--align_target online computes its targets per batch and takes no "
+                     "--emd_matrix_path (drop one of the two)")
     if args.max_samples is not None and int(args.max_samples) <= 0:
         parser.error("--max_samples must be positive")
     if args.align_lambda < 0:
@@ -299,9 +322,19 @@ def prepare(parser: argparse.ArgumentParser, args: argparse.Namespace, domain, e
     # checked before any data is loaded; frame and row count are checked
     # again against the loaded dataset below.
     aligning = args.align_lambda > 0
+    # 2026-09-19: the sidecar, the row cap and the indexed loader belong to the MATRIX target;
+    # online targets need none of them (the dataset is loaded exactly as for the plain arm).
+    matrix_mode = aligning and args.align_target == "matrix"
     max_samples = args.max_samples
     sidecar = None
-    if aligning:
+    if aligning and not matrix_mode:
+        budget = args.align_pairs
+        n_all = args.batch_size * (args.batch_size - 1) // 2
+        per_batch = n_all if budget == "all" else min(int(budget), n_all)
+        if per_batch < 120:
+            print(f"WARNING: {per_batch} pairs per batch (--batch_size {args.batch_size}, "
+                  f"--align_pairs {budget}) for the alignment correlation; 120 is the practical floor.")
+    if matrix_mode:
         if not args.emd_matrix_path:
             parser.error("--align_lambda > 0 needs --emd_matrix_path "
                          "(run 2b_precompute_emd.py on this dataset first)")
@@ -347,7 +380,7 @@ def prepare(parser: argparse.ArgumentParser, args: argparse.Namespace, domain, e
         particle_scale=particle_scale,
         particle_centre=particle_centre,
         seed=args.seed,
-        indexed=aligning,
+        indexed=matrix_mode,
         max_samples=max_samples,
     )
     print(f"Dataset: {train_size} train / {val_size} val samples "
@@ -484,8 +517,11 @@ def run(args: argparse.Namespace, ctx: PretrainContext) -> PretrainResult:
         align_metric=args.align_metric,
         align_warmup_epochs=args.align_warmup_epochs,
         align_ramp_epochs=args.align_ramp_epochs,
-        emd_matrix_path=args.emd_matrix_path if aligning else None,
+        emd_matrix_path=args.emd_matrix_path if (aligning and args.align_target == "matrix") else None,
         align_val_max_samples=args.align_val_max_samples,
+        align_target=args.align_target,                     # 2026-09-19: matrix | online
+        align_pairs=args.align_pairs,
+        align_val_pairs=args.align_val_pairs,
         log_freq=args.log_freq,
         eval_freq=args.eval_freq,
         save_freq=args.save_freq,
@@ -510,8 +546,19 @@ def run(args: argparse.Namespace, ctx: PretrainContext) -> PretrainResult:
     print(f"Coordinates mapped as (x - {applied_centre}) / {applied_scale} "
           f"[particle_centre / particle_scale]; seed={args.seed}; "
           f"sinkhorn_blur={args.sinkhorn_blur} "
-          f"(= {args.sinkhorn_blur * applied_scale:.4f} env units)")
-    if aligning:
+          f"(= {args.sinkhorn_blur * applied_scale:.4f} env units; "
+          f"{getattr(args, 'sinkhorn_blur_source', 'given')})")
+    if aligning and sidecar is None:
+        print(f"Latent alignment: lambda={args.align_lambda} ({args.align_metric}), "
+              f"warmup {args.align_warmup_epochs} / ramp {args.align_ramp_epochs} epochs "
+              f"of {args.num_epochs}; target online (debiased Sinkhorn between the batch's "
+              f"clouds, blur {args.sinkhorn_blur}, scaling {args.sinkhorn_scaling}, "
+              f"{'weighted' if weighted else 'uniform'}; {args.align_pairs} pairs per batch, "
+              f"{args.align_val_pairs} fixed val pairs)")
+        if args.align_warmup_epochs + args.align_ramp_epochs >= args.num_epochs:
+            print("WARNING: warmup + ramp >= num_epochs: lambda never reaches its "
+                  "target, so no checkpoint from this run is fully aligned.")
+    elif aligning:
         print(f"Latent alignment: lambda={args.align_lambda} ({args.align_metric}), "
               f"warmup {args.align_warmup_epochs} / ramp {args.align_ramp_epochs} epochs "
               f"of {args.num_epochs}; matrix {args.emd_matrix_path} "
