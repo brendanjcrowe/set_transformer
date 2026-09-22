@@ -301,6 +301,9 @@ def test_the_file_path_never_reaches_a_generator_and_is_reproducible(tiny_datase
         payload = torch.load(result.rl_checkpoint, map_location="cpu", weights_only=False)
         assert "data" not in payload["config"], "a file-backed checkpoint gains no new key"
         assert "data" not in payload["pretraining_run"]
+        # 2026-09-22 (plan 11.3 item 2): nor does its metrics.json; the recorded layout ends in `history`
+        metrics = json.loads((Path(result.run_dir) / "metrics.json").read_text())
+        assert "data" not in metrics and list(metrics)[-1] == "history"
     assert histories[0] == histories[1]
     assert json.loads(histories[0])[0].keys() == {"epoch", "train", "val"}
 
@@ -332,6 +335,8 @@ def test_fresh_pretraining_round_trips_into_the_rl_extractor(encoder, variant, t
     assert record["k_choices"] == list(hunt.N_ACTIVE_CHOICES[hunt.resolve(variant).task])
     assert record["generator_constants"] == hunt._env_config(variant).to_dict()
     assert payload["config"]["data"]["data_source"] == "fresh"
+    # metrics.json says so too (a generated run only; a file run's has no such key, test (c))
+    assert json.loads((Path(result.run_dir) / "metrics.json").read_text())["data"]["data_source"] == "fresh"
     # run_config.json carries the flags, and the trainer accepts the checkpoint
     config = json.loads((Path(result.run_dir) / "run_config.json").read_text())
     assert config["data_source"] == "fresh" and config["fresh_rows_per_epoch"] == 512
@@ -339,6 +344,56 @@ def test_fresh_pretraining_round_trips_into_the_rl_extractor(encoder, variant, t
     train_mod.main(["--domain", "hunt", "--encoder", encoder, "--variant", variant,
                     "--pretrained_path", str(result.rl_checkpoint), "--frozen",
                     "--output_root", str(tmp_path / "root"), "--dry_run", *flags])
+
+
+def test_task_nearest_round_trips_on_fresh_cluster_hunt_layouts(tmp_path, monkeypatch, capsys):
+    """2026-09-22 (plan 11.3 item 3): Cluster-Hunt's campaign objective shares the fresh-layout code
+    with `task` and was never run on generated rows. Its loss reads the generated `centers` / `alive`
+    (the nearest live centre is recomputed per batch), so the same round trip must hold."""
+    monkeypatch.setattr(run_records, "git_provenance", lambda: {})
+    result = pretrain.main(["--domain", "hunt", "--encoder", "st", "--objective", "task_nearest",
+                            "--variant", "cluster_hunt", "--data_source", "fresh",
+                            "--fresh_rows_per_epoch", "512", "--fresh_val_rows", "256", "--num_epochs", "3",
+                            "--batch_size", "64", "--device", "cpu", "--output_root", str(tmp_path / "root"),
+                            *ST_SMALL])
+    out = capsys.readouterr().out
+    assert result.rl_checkpoint.exists() and "Verified:" in out and "max|delta| = 0.0" in out
+    assert {"identify_acc", "loc_mae", "within_1.0"} <= set(result.summary)     # the pick-a-target metrics
+    payload = torch.load(result.rl_checkpoint, map_location="cpu", weights_only=False)
+    assert payload["config"]["objective"] == "task_nearest" and payload["config"]["task"] == "nearest"
+    assert payload["pretraining_run"]["data"]["data_source"] == "fresh"
+    assert payload["pretraining_run"]["objective"] == "task_nearest"
+    assert payload["head_state_dict"]["4.weight"].shape[0] == 2                 # one offset, not K slots
+    monkeypatch.setattr(run_records, "tee_stdout_stderr", lambda path: None)
+    train_mod.main(["--domain", "hunt", "--encoder", "st", "--variant", "cluster_hunt",
+                    "--pretrained_path", str(result.rl_checkpoint), "--frozen",
+                    "--output_root", str(tmp_path / "root"), "--dry_run", *ST_SMALL])
+
+
+def test_fresh_epoch_seed_honours_an_explicit_zero(tiny_dataset, tmp_path, monkeypatch):
+    """2026-09-22 (plan 11.3 item 1): `fresh_seed or seed` read an explicit --fresh_seed 0 as "not
+    given" and seeded the epoch stream from --seed, while the held-out set and the record used 0."""
+    from argparse import Namespace
+    assert task_head.fresh_epoch_seed(Namespace(fresh_seed=0, seed=3)) == 2       # the bug gave 5
+    assert task_head.fresh_epoch_seed(Namespace(fresh_seed=None, seed=3)) == 5    # default: seed
+    assert task_head.fresh_epoch_seed(Namespace(fresh_seed=7, seed=3)) == 9
+    assert task_head.fresh_epoch_seed(Namespace(seed=4)) == 6                     # Ant-Tag: no flag at all
+    # and the loop uses it: the stream handed to the first refresh_epoch is default_rng(0 + 2)'s
+    monkeypatch.setattr(run_records, "git_provenance", lambda: {})
+    seen = []
+    original = task_head.GeneratedTaskData.refresh_epoch
+
+    def spy(self, rng):
+        seen.append(rng.bit_generator.state)
+        return original(self, rng)
+
+    monkeypatch.setattr(task_head.GeneratedTaskData, "refresh_epoch", spy)
+    result = _pretrain(tmp_path, "--variant", "most_var", "--data_source", "fresh", "--fresh_seed", "0",
+                       "--seed", "3", "--fresh_rows_per_epoch", "128", "--fresh_val_rows", "64",
+                       "--num_epochs", "1")
+    assert seen[0] == np.random.default_rng(2).bit_generator.state
+    payload = torch.load(result.rl_checkpoint, map_location="cpu", weights_only=False)
+    assert payload["pretraining_run"]["data"]["fresh_seed"] == 0
 
 
 def test_fresh_rows_differ_every_epoch(tmp_path, monkeypatch):

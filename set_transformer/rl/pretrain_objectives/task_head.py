@@ -487,6 +487,20 @@ def _resolve_fresh_arguments(parser, args, domain, source: str) -> None:
         parser.error("--fresh_val_rows must be at least 1")
 
 
+def fresh_epoch_seed(args) -> int:
+    """The seed of the per-epoch generator stream in :func:`run_task_training`: ``--fresh_seed + 2``
+    (the held-out set is drawn from ``--fresh_seed + 1``), or ``--seed + 2`` for a domain whose task
+    objective offers no ``--fresh_seed`` (Ant-Tag; its file-backed data ignores the stream anyway).
+
+    2026-09-22 (plan 11.3 item 1): this was ``fresh_seed or seed``, which treats an explicit
+    ``--fresh_seed 0`` as "not given" and seeds the epoch stream from ``--seed`` while the held-out set
+    and the checkpoint's record use 0, so the run was not reproducible from its own record.
+    """
+    fresh_seed = getattr(args, "fresh_seed", None)
+    base = fresh_seed if fresh_seed is not None else (getattr(args, "seed", None) or 0)
+    return int(base) + 2
+
+
 def resolve_k_choices(args, default: tuple[int, ...]) -> tuple[int, ...]:
     """``--k_choices 2,3,5,5`` -> (2, 3, 5, 5); not given -> the collector's own draw for the task.
     Repeats are meaningful (they weight the draw), so the list is not deduplicated."""
@@ -632,7 +646,7 @@ def run_task_training(args, ctx, *, data: TaskData, obs_dim: int, out_dim: int,
     t0 = time.time()
     # 2026-09-21 (fresh layouts): the generator's stream, separate from torch's, so a run's rows
     # are reproducible from --fresh_seed alone; a file-backed data object ignores it.
-    epoch_rng = np.random.default_rng(int(getattr(args, "fresh_seed", None) or args.seed or 0) + 2)
+    epoch_rng = np.random.default_rng(fresh_epoch_seed(args))
     for ep in range(args.num_epochs):
         data.refresh_epoch(epoch_rng)
         model.train()
@@ -744,11 +758,16 @@ def run_task_training(args, ctx, *, data: TaskData, obs_dim: int, out_dim: int,
             print(f"  val source {r}: rows={m['rows']}  " + "  ".join(f"{k}={v:.4f}" for k, v in m.items() if k != "rows"))
     save_task_checkpoint(model, checkpoint_dir / "checkpoint_best.pt", args, best_epoch,
                          {"loss": best, **metrics}, checkpoint_config)
-    (run_dir / "metrics.json").write_text(json.dumps(
-        dict(best_val=best, best_epoch=best_epoch, epochs=len(hist), minutes=(time.time() - t0) / 60,
-             val_sources=data.val_sources, val_loss_rows=n_val_loss,
-             val_metrics=metrics, val_metrics_by_source=by_source, alignment=align_record,
-             data=provenance, history=hist), indent=2))
+    record = dict(best_val=best, best_epoch=best_epoch, epochs=len(hist), minutes=(time.time() - t0) / 60,
+                  val_sources=data.val_sources, val_loss_rows=n_val_loss,
+                  val_metrics=metrics, val_metrics_by_source=by_source, alignment=align_record)
+    if provenance.get("data_source", "file") != "file":
+        # 2026-09-22 (plan 11.3 item 2): what the rows were generated from, for a generated run ONLY --
+        # the rule the checkpoint record follows (rl/pretrain.py), so a file-backed run's metrics.json
+        # keeps exactly the layout every recorded run has.
+        record["data"] = provenance
+    record["history"] = hist
+    (run_dir / "metrics.json").write_text(json.dumps(record, indent=2))
     print(f"[{label}] best_val={best:.5f} (epoch {best_epoch})  "
           + "  ".join(f"{k}={v:.4f}" for k, v in metrics.items())
           + f"  ({(time.time() - t0) / 60:.1f} min) -> {checkpoint_dir}", flush=True)
