@@ -34,13 +34,24 @@ online`` computes the target distances per batch from the batch's own clouds (th
 Sinkhorn, the run's ``--sinkhorn_blur`` / ``--sinkhorn_scaling``; ``latent_alignment.OnlineAlignment``)
 instead of reading ``--emd_matrix_path``: no step 2b, no sidecar checks, no row cap, no indexed loader,
 ``--align_pairs`` pairs per batch. The default stays ``matrix``, so every recorded command is unchanged.
+
+FRESH LAYOUTS (2026-09-22; ``change_mds/fresh_layout_reconstruction_2026-09-22.md``;
+``rl/pretrain_objectives/fresh_layouts.py``). For a domain that declares ``Domain.fresh_layouts``
+(hunt) the objective offers ``--data_source file | fresh | mixed``: ``fresh`` draws every epoch's
+training clouds anew from the variant's own reset rules and reads no file, ``mixed`` adds them to
+the file's training rows; the held-out rows are drawn once. The loaders are ``Subset``s over one
+``POMDPDataset`` subclass whose sampler regenerates the training block at the top of every epoch,
+so the Trainer and the dataset module are unchanged. ``file`` is the default and is the path
+above, byte for byte; the four other domains never see the group. Refused under ``fresh`` /
+``mixed``: ``--align_target matrix`` with a lambda, ``--emd_matrix_path``, ``--num_workers > 0``;
+under ``fresh`` also ``--data_path`` and ``--max_samples``. Online alignment is the aligned twin.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
@@ -48,13 +59,20 @@ import numpy as np
 import torch
 import torch.multiprocessing as mp
 
-from set_transformer.data.dataset import get_data_loader
+from set_transformer.data.dataset import get_data_loader, get_dataset
 from set_transformer.emd_matrix import dataset_sha256, read_sidecar
 from set_transformer.latent_alignment import add_alignment_arguments, resolve_sinkhorn_blur
 from set_transformer.models.arm_export import export_arm_checkpoint
 from set_transformer.models.cgf_arm_ae import CGFArmAutoencoder, make_arm_extractor
 from set_transformer.models.pooled_arm_ae import PooledArmAutoencoder, make_pooled_arm_extractor
 from set_transformer.rl.domains.base import Objective, PretrainContext, PretrainResult
+from set_transformer.rl.pretrain_objectives.fresh_layouts import (   # 2026-09-22: fresh layouts
+    add_fresh_layout_arguments,
+    build_generated_loaders,
+    data_source_of,
+    resolve_fresh_arguments,
+    resolve_k_choices,
+)
 from set_transformer.training.config import ExperimentConfig, TrainingConfig
 from set_transformer.training.trainer import Trainer
 
@@ -123,6 +141,24 @@ def add_arguments(parser: argparse.ArgumentParser, domain=None) -> None:
              "train on identical rows.")
     g.add_argument("--num_workers", type=int, default=0)
     g.add_argument("--train_split", type=float, default=0.8)
+    if domain is not None and getattr(domain, "fresh_layouts", None) is not None:
+        # 2026-09-22 (fresh layouts; rl/pretrain_objectives/fresh_layouts.py): offered only for a
+        # domain that declares Domain.fresh_layouts (hunt). `file` is the default, so every recorded
+        # command means exactly what it meant before, and the other domains never see the group.
+        f = parser.add_argument_group(
+            "reconstruction objective: fresh layouts (training clouds drawn from the variant's own "
+            "reset rules instead of a collected file, anew every epoch; a file freezes one layout per "
+            "episode and the encoder memorises them)")
+        add_fresh_layout_arguments(
+            f,
+            rows_help="Generated training rows per epoch. Default: 100,000 under --data_source fresh "
+                      "(most_var's file has 87,091 training rows, so the cosine schedule and the "
+                      "step-counted eval / save frequencies see about the same steps per epoch); "
+                      "the file's own training-row count under mixed.",
+            val_select_help="Which held-out rows form the validation loss that picks checkpoint_best. "
+                            "Default: generated under --data_source fresh (the only choice there); "
+                            "mean (both blocks in one loader, averaged per batch) under mixed; file = "
+                            "the file's held-out split only, as every recorded reconstruction run had.")
 
     t = parser.add_argument_group("reconstruction objective: training")
     t.add_argument("--num_epochs", type=int, default=100)
@@ -222,11 +258,40 @@ def locate(args: argparse.Namespace) -> dict:
     return {"variant": metadata.get("variant"), "env_id": metadata.get("env_id")}
 
 
+def _resolve_generated_arguments(parser: argparse.ArgumentParser, args: argparse.Namespace,
+                                 domain, source: str) -> None:
+    """``--data_source fresh | mixed`` on this objective: the shared defaults and checks
+    (``--variant``, the generator, the seeds, the row budget, ``--val_select``), then the refusals
+    of plan section 3.4 -- what cannot be true of rows that are regenerated every epoch."""
+    resolve_fresh_arguments(parser, args, domain, source)
+    if source == "fresh" and args.data_path:
+        parser.error("--data_source fresh generates every training cloud from the variant's env "
+                     "rules and reads no dataset; drop --data_path, or pass --data_source mixed "
+                     "to train on the file's rows as well")
+    if args.align_lambda > 0 and args.align_target == "matrix":
+        parser.error(f"--data_source {source}: no precomputed matrix can index rows that are "
+                     "regenerated every epoch; use --align_target online (the aligned twin) or "
+                     "--data_source file")
+    if args.emd_matrix_path is not None:
+        parser.error(f"--data_source {source} takes no --emd_matrix_path: the rows it trains on "
+                     "are not the matrix's rows")
+    if source == "fresh" and args.max_samples is not None:
+        parser.error("--max_samples caps a FILE's rows and --data_source fresh reads none; "
+                     "--fresh_rows_per_epoch is the budget")
+    if args.num_workers > 0:
+        parser.error(f"--data_source {source} needs --num_workers 0: the training block is "
+                     "regenerated in the main process at the top of every epoch, and a worker "
+                     "process would train on a stale copy")
+
+
 def resolve_arguments(parser: argparse.ArgumentParser, args: argparse.Namespace,
                       domain, encoder) -> None:
     """The checks that need no data (the script ran them right after parsing)."""
     resolve_sinkhorn_blur(args, domain)          # 2026-09-19: the domain's default when omitted
-    if args.data_path is None:
+    source = data_source_of(args)                # 2026-09-22: "file" for a domain without the group
+    if source != "file":
+        _resolve_generated_arguments(parser, args, domain, source)
+    if args.data_path is None and source != "fresh":
         # 7.5 (decision 1): the dataset the collector puts under the run root for this variant.
         if not getattr(args, "variant", None):
             parser.error("--data_path not given: pass it, or --variant <registry key> to take "
@@ -275,6 +340,64 @@ class ReconstructionData:
     max_samples: int | None
     particle_scale: float | None
     particle_centre: float | None
+    #: 2026-09-22: ``file`` (the default), ``fresh`` or ``mixed``.
+    data_source: str = "file"
+    #: What ``rl/pretrain.py`` stamps into every produced checkpoint as ``pretraining_run.data``.
+    #: For a file run exactly ``{"data_source": "file"}``, which the hook DROPS, so a recorded
+    #: checkpoint's record keeps the keys it had; a generated run records what it trained on.
+    record: dict = field(default_factory=lambda: {"data_source": "file"})
+
+    def provenance(self) -> dict:
+        return dict(self.record)
+
+
+def _generated_loaders(args: argparse.Namespace, spec, source: str, device: str, *, weighted: bool,
+                       particle_scale: float | None, particle_centre: float | None,
+                       max_samples: int | None):
+    """The loaders of ``--data_source fresh | mixed`` and the record for the checkpoint (plan
+    sections 3.2 and 3.5). ``mixed`` loads the file exactly as the plain path does (same weights /
+    scale / centre / row-cap rules through ``get_dataset``) and splits it with the same seeded call,
+    so the file half of a mixed run is the plain run's rows."""
+    k_choices = resolve_k_choices(args, spec.k_choices)
+    file_dataset = None
+    rows = args.fresh_rows_per_epoch
+    if source == "mixed":
+        file_dataset = get_dataset(args.data_path, device, load_weights=weighted,
+                                   particle_scale=particle_scale, particle_centre=particle_centre,
+                                   max_samples=max_samples)
+        if rows is None:
+            rows = int(args.train_split * len(file_dataset))    # the file's training count, as split
+            print(f"--fresh_rows_per_epoch not given; the file's own {rows:,} training rows")
+        scale, centre = float(file_dataset.particle_scale), float(file_dataset.particle_centre)
+    else:
+        scale, centre = float(particle_scale), float(particle_centre)
+    train_loader, val_loader, train_size, val_size, base = build_generated_loaders(
+        generator=spec.generator, k_choices=k_choices, source=source, val_select=args.val_select,
+        rows_per_epoch=int(rows), val_rows=int(args.fresh_val_rows), fresh_seed=int(args.fresh_seed),
+        seed=int(args.seed), particle_scale=scale, particle_centre=centre, weighted=weighted,
+        device=device, batch_size=args.batch_size, file_dataset=file_dataset,
+        train_split=args.train_split)
+    file_train = train_size - base.n_train
+    steps = -(-train_size // int(args.batch_size))
+    print(f"Fresh layouts ({source}): variant {args.variant}, {base.n_train:,} generated training rows "
+          f"per epoch" + (f" + the file's {file_train:,}" if file_dataset is not None else "")
+          + f" = {train_size:,} rows / {steps:,} steps per epoch at batch {args.batch_size}; "
+          f"held-out {val_size:,} rows (--val_select {args.val_select}); fresh_seed {args.fresh_seed} "
+          f"(held-out stream +1, epoch stream +2); k_choices {list(k_choices)}; frame "
+          f"(x - {centre}) / {scale}; {'weighted' if weighted else 'unweighted'} particle sets")
+    if source == "fresh":
+        print("--train_split is not read under --data_source fresh: the held-out rows are the "
+              "--fresh_val_rows generated ones.")
+    record = {"data_source": source, "val_select": args.val_select,
+              "fresh_rows_per_epoch": int(base.n_train), "fresh_val_rows": int(base.n_val),
+              "fresh_seed": int(args.fresh_seed), "k_choices": list(k_choices),
+              "generator_constants": dict(spec.constants), "env_id": spec.env_id,
+              "particle_scale": scale, "particle_centre": centre}
+    if file_dataset is not None:
+        record["file_rows_per_epoch"] = int(file_train)
+        record["file_val_rows"] = int(len(file_dataset) - file_train)
+        record["file"] = str(args.data_path)
+    return train_loader, val_loader, train_size, val_size, record
 
 
 def prepare(parser: argparse.ArgumentParser, args: argparse.Namespace, domain, encoder,
@@ -293,8 +416,13 @@ def prepare(parser: argparse.ArgumentParser, args: argparse.Namespace, domain, e
 
     # Does the dataset carry PF weights? np.load on an .npz is lazy, so this
     # reads the archive index only, not the arrays.
+    # 2026-09-22: `fresh` reads no file; the generator writes uniform weights, so its rows count
+    # as weighted unless --ignore_weights (the hunt files carry the same uniform weights).
+    source = data_source_of(args)
     dataset_has_weights = False
-    if args.data_path.endswith(".npz"):
+    if source == "fresh":
+        dataset_has_weights = True
+    elif args.data_path.endswith(".npz"):
         with np.load(args.data_path) as archive:
             dataset_has_weights = "weights" in archive.files
     # 7.2: the ST arm's --no_st_weight_channel means the same as --ignore_weights (no mass
@@ -316,6 +444,20 @@ def prepare(parser: argparse.ArgumentParser, args: argparse.Namespace, domain, e
     # mapping (Odd-Even centres its state range on 0; Ant-Tag's centre is
     # 0 already). None = the value recorded in the dataset, 0.0 if none.
     particle_centre = 0.0 if args.no_particle_scaling else None
+    spec = None
+    if source != "file":
+        # 2026-09-22: the domain's generator for this variant, bound to the live env config.
+        spec = domain.fresh_layouts(args.variant) if getattr(domain, "fresh_layouts", None) else None
+        if spec is None:
+            parser.error(f"--data_source {source}: domain {domain.name} declares no fresh layouts "
+                         f"for variant {args.variant!r}; use --data_source file")
+        if source == "fresh":
+            # No file to read the frame from: the collector's frame for this variant (hunt: the
+            # arena scale 10 and centre 0 it writes into every file).
+            if particle_scale is None:
+                particle_scale = float(spec.particle_scale)
+            if particle_centre is None:
+                particle_centre = float(spec.particle_centre)
 
     # Alignment: the matrix must have been built from this exact dataset,
     # in this frame, with this metric. Everything the sidecar records is
@@ -370,21 +512,29 @@ def prepare(parser: argparse.ArgumentParser, args: argparse.Namespace, domain, e
                   "the alignment correlation; 16 (120 pairs) is the practical floor.")
 
     # Load data
-    train_loader, val_loader, train_size, val_size = get_data_loader(
-        batch_size=args.batch_size,
-        data_path=args.data_path,
-        device=device,
-        train_split=args.train_split,
-        num_workers=args.num_workers,
-        load_weights=weighted,
-        particle_scale=particle_scale,
-        particle_centre=particle_centre,
-        seed=args.seed,
-        indexed=matrix_mode,
-        max_samples=max_samples,
-    )
-    print(f"Dataset: {train_size} train / {val_size} val samples "
-          f"({'weighted' if weighted else 'unweighted'} particle sets)")
+    record = {"data_source": "file"}
+    if source == "file":
+        train_loader, val_loader, train_size, val_size = get_data_loader(
+            batch_size=args.batch_size,
+            data_path=args.data_path,
+            device=device,
+            train_split=args.train_split,
+            num_workers=args.num_workers,
+            load_weights=weighted,
+            particle_scale=particle_scale,
+            particle_centre=particle_centre,
+            seed=args.seed,
+            indexed=matrix_mode,
+            max_samples=max_samples,
+        )
+        print(f"Dataset: {train_size} train / {val_size} val samples "
+              f"({'weighted' if weighted else 'unweighted'} particle sets)")
+    else:
+        # 2026-09-22: generated rows (plus the file's under mixed); loaders are Subsets over one
+        # POMDPDataset subclass, so everything below reads them as it reads a file's.
+        train_loader, val_loader, train_size, val_size, record = _generated_loaders(
+            args, spec, source, device, weighted=weighted, particle_scale=particle_scale,
+            particle_centre=particle_centre, max_samples=max_samples)
 
     # The dataset is ground truth for the set geometry. Adopt it when the user
     # said nothing, and refuse a contradiction rather than train on it.
@@ -427,7 +577,7 @@ def prepare(parser: argparse.ArgumentParser, args: argparse.Namespace, domain, e
         train_loader=train_loader, val_loader=val_loader, train_size=train_size,
         val_size=val_size, base_dataset=base_dataset, weighted=weighted, aligning=aligning,
         sidecar=sidecar, max_samples=max_samples, particle_scale=particle_scale,
-        particle_centre=particle_centre)
+        particle_centre=particle_centre, data_source=source, record=record)
 
 
 def _pooled_kwargs(encoder, args: argparse.Namespace, *, arena_scale: float, weighted: bool,
@@ -459,7 +609,8 @@ def _export_arm(args: argparse.Namespace, experiment_config: ExperimentConfig, e
         dst = experiment_config.checkpoint_dir / f"checkpoint_{tag}_{suffix}.pt"
         export_arm_checkpoint(
             src, dst, extractor, encoder_name=encoder_name, particle_centre=particle_centre,
-            objective=objective, data_path=args.data_path,
+            objective=objective,
+            data_path=args.data_path or f"generated:{getattr(args, 'variant', None)}",   # 2026-09-22
             extra_config={"weighted_pretraining": bool(weighted),
                           "sinkhorn_blur": args.sinkhorn_blur,
                           "sinkhorn_scaling": args.sinkhorn_scaling})

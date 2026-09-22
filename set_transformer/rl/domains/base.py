@@ -237,6 +237,28 @@ class Collection:
 
 
 @dataclass(frozen=True)
+class FreshLayouts:
+    """What a domain gives the GENERIC objectives so they can draw a variant's rows from its env's
+    reset rules instead of reading a collected file (2026-09-22; the reconstruction objective's
+    ``--data_source fresh | mixed``, ``rl/pretrain_objectives/fresh_layouts.py``). A domain declares
+    ``Domain.fresh_layouts(variant) -> FreshLayouts | None`` (None: that variant has no generator);
+    a domain that declares nothing offers no such flags and keeps its command line."""
+
+    #: ``generator(k_choices, n, rng) -> dict`` with at least ``particles`` ``[n, N, D]``
+    #: (agent-relative, RAW env units) and ``weights`` ``[n, N]``; the env constants are bound.
+    generator: Callable
+    #: The collector's own draw of live-cluster counts: ``--k_choices``' default.
+    k_choices: tuple[int, ...]
+    #: The frame the rows are stored in, ``(x - particle_centre) / particle_scale``: what the
+    #: collector writes into a file of this variant, so a generated run and a file run share it.
+    particle_scale: float
+    particle_centre: float
+    env_id: str
+    #: The env constants the layouts are drawn from, recorded in the checkpoint (``cfg.to_dict()``).
+    constants: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
 class Domain:
     """One problem, as the trainer sees it. See the module docstring."""
 
@@ -321,3 +343,8 @@ class Domain:
     #: explicitly, so run records stay self-describing. The package fallback 0.05 (geomloss's default)
     #: applies to a domain that does not set it (Car-Flag, which pretrains nothing).
     default_sinkhorn_blur: float = 0.05
+    #: 2026-09-22 (fresh layouts on the generic objectives): ``fresh_layouts(variant) ->
+    #: FreshLayouts | None`` (see :class:`FreshLayouts`). None, the default: the generic
+    #: reconstruction objective offers no ``--data_source`` for this domain and its command line
+    #: is unchanged. Only hunt declares it.
+    fresh_layouts: Callable[[str], "FreshLayouts | None"] | None = None

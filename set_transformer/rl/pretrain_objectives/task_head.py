@@ -40,6 +40,18 @@ import torch.nn as nn
 
 from set_transformer.latent_alignment import (LambdaRamp, OnlineAlignment, add_alignment_arguments,
                                               resolve_sinkhorn_blur)
+# 2026-09-22: the fresh-layout flag group and its resolution live in fresh_layouts.py, shared with
+# the generic reconstruction objective; the names below are re-exported from here (rl/domains/hunt.py,
+# rl/domains/ant_tag.py and the tests import them off this module).
+from set_transformer.rl.pretrain_objectives.fresh_layouts import (  # noqa: F401 - re-exported
+    DATA_SOURCES,
+    DEFAULT_FRESH_ROWS_PER_EPOCH,
+    add_fresh_layout_arguments,
+    data_source_of,
+    fresh_epoch_seed,
+    resolve_fresh_arguments,
+    resolve_k_choices,
+)
 
 
 class TaskData:
@@ -344,9 +356,6 @@ def save_task_checkpoint(model: TaskEncoderWithHead, path: Path, args, epoch: in
 
 
 #: ``--data_source`` (2026-09-21, fresh layouts): where the TRAINING rows of one epoch come from.
-DATA_SOURCES = ("file", "fresh", "mixed")
-
-
 def add_task_arguments(parser, *, dataset_help: str, fresh_layouts: bool = False) -> None:
     """The flags every task objective has: the data and the record's training settings.
 
@@ -371,26 +380,15 @@ def add_task_arguments(parser, *, dataset_help: str, fresh_layouts: bool = False
             "task objective: fresh layouts (rows drawn from the variant's own reset rules instead "
             "of a collected file; a collected file freezes one layout per episode and the encoder "
             "memorises them -- most_var 0.371 -> 0.885 identify on fresh rows)")
-        f.add_argument("--data_source", choices=DATA_SOURCES, default="file",
-                       help="Where an epoch's TRAINING rows come from. file (the default): the "
-                            "collected dataset, unchanged. fresh: layouts generated anew every "
-                            "epoch from the variant's env rules (no dataset is read). mixed: the "
-                            "file's training rows AND generated rows in every epoch.")
-        f.add_argument("--fresh_rows_per_epoch", type=int, default=None,
-                       help="Generated rows per epoch. Default: 100,000 under --data_source fresh; "
-                            "the file's own training-row count under mixed (which keeps the "
-                            "epoch-counted LR plateau and early stopping on the scale they were "
-                            "tuned at -- halving rows per epoch once collapsed the LR to 2e-06).")
-        f.add_argument("--fresh_val_rows", type=int, default=20000,
-                       help="A FIXED generated validation set, drawn once from --fresh_seed + 1.")
-        f.add_argument("--fresh_seed", type=int, default=None,
-                       help="The generator's stream, separate from torch's. Default: --seed.")
-        f.add_argument("--k_choices", type=str, default=None,
-                       help="Comma list the number of live clusters is drawn from per generated "
-                            "row, with repeats for weight. Default: the collector's own "
-                            "(pick_target 2,3,4,5,5,5; collect_all 1,2,3,4,5,5,5).")
-        f.add_argument("--val_select", choices=("file", "generated", "mean"), default=None,
-                       help="Which held-out loss halves the learning rate and picks the best "
+        # 2026-09-22: the six flags are defined once in fresh_layouts.py (shared with the generic
+        # reconstruction objective); the two help strings below are this door's own and unchanged.
+        add_fresh_layout_arguments(
+            f,
+            rows_help="Generated rows per epoch. Default: 100,000 under --data_source fresh; "
+                      "the file's own training-row count under mixed (which keeps the "
+                      "epoch-counted LR plateau and early stopping on the scale they were "
+                      "tuned at -- halving rows per epoch once collapsed the LR to 2e-06).",
+            val_select_help="Which held-out loss halves the learning rate and picks the best "
                             "epoch. Default: file under --data_source file, generated under "
                             "fresh, mean (the average of the two, what the standalone scripts "
                             "did) under mixed.")
@@ -414,17 +412,6 @@ def locate_from_dataset(args) -> dict:
     from set_transformer.rl.pretrain_objectives.reconstruction import dataset_metadata  # noqa: PLC0415
     meta = dataset_metadata(args.data_path)
     return {"variant": meta.get("variant"), "env_id": meta.get("env_id")}
-
-
-def data_source_of(args) -> str:
-    """``--data_source``, or ``file`` for a domain that does not offer the flag."""
-    return str(getattr(args, "data_source", "file") or "file")
-
-
-#: ``--fresh_rows_per_epoch`` when a ``fresh`` run leaves it out (a ``mixed`` run takes the file's
-#: own training-row count instead, so its steps per epoch stay on the scale the schedules were
-#: tuned at). Section 1.3 of the plan.
-DEFAULT_FRESH_ROWS_PER_EPOCH = 100_000
 
 
 def resolve_task_arguments(parser, args, domain, encoder, *, collect_hint: str,
@@ -460,57 +447,8 @@ def resolve_task_arguments(parser, args, domain, encoder, *, collect_hint: str,
         parser.error(f"dataset {args.data_path} does not exist ({collect_hint})")
 
 
-def _resolve_fresh_arguments(parser, args, domain, source: str) -> None:
-    """The generated sources' own checks and defaults (2026-09-21): a variant with a generator,
-    the row budget, the generator's seed, the cluster-count draw and which loss selects."""
-    if args.variant is None:
-        parser.error(f"--data_source {source} needs --variant: the layouts are drawn from one "
-                     f"env's rules, and there is no dataset to read the variant off "
-                     f"({domain.name} variants: {domain.variant_names()})")
-    variant = domain.resolve(args.variant)
-    if getattr(variant, "layout_generator", None) is None:
-        parser.error(f"--data_source {source}: variant {args.variant!r} of domain {domain.name} "
-                     "declares no layout_generator, so its layouts cannot be generated; use "
-                     "--data_source file")
-    if args.fresh_seed is None:
-        args.fresh_seed = int(args.seed)
-    if args.val_select is None:
-        args.val_select = "generated" if source == "fresh" else "mean"
-    if source == "fresh" and args.val_select != "generated":
-        parser.error(f"--val_select {args.val_select} needs the file's held-out rows, and "
-                     "--data_source fresh reads no file; use --val_select generated")
-    if args.fresh_rows_per_epoch is None and source == "fresh":
-        args.fresh_rows_per_epoch = DEFAULT_FRESH_ROWS_PER_EPOCH
-    if args.fresh_rows_per_epoch is not None and args.fresh_rows_per_epoch < 1:
-        parser.error("--fresh_rows_per_epoch must be at least 1")
-    if args.fresh_val_rows < 1:
-        parser.error("--fresh_val_rows must be at least 1")
-
-
-def fresh_epoch_seed(args) -> int:
-    """The seed of the per-epoch generator stream in :func:`run_task_training`: ``--fresh_seed + 2``
-    (the held-out set is drawn from ``--fresh_seed + 1``), or ``--seed + 2`` for a domain whose task
-    objective offers no ``--fresh_seed`` (Ant-Tag; its file-backed data ignores the stream anyway).
-
-    2026-09-22 (plan 11.3 item 1): this was ``fresh_seed or seed``, which treats an explicit
-    ``--fresh_seed 0`` as "not given" and seeds the epoch stream from ``--seed`` while the held-out set
-    and the checkpoint's record use 0, so the run was not reproducible from its own record.
-    """
-    fresh_seed = getattr(args, "fresh_seed", None)
-    base = fresh_seed if fresh_seed is not None else (getattr(args, "seed", None) or 0)
-    return int(base) + 2
-
-
-def resolve_k_choices(args, default: tuple[int, ...]) -> tuple[int, ...]:
-    """``--k_choices 2,3,5,5`` -> (2, 3, 5, 5); not given -> the collector's own draw for the task.
-    Repeats are meaningful (they weight the draw), so the list is not deduplicated."""
-    text = getattr(args, "k_choices", None)
-    if text is None or not str(text).strip():
-        return tuple(int(k) for k in default)
-    choices = tuple(int(part) for part in str(text).split(",") if part.strip())
-    if not choices:
-        raise ValueError(f"--k_choices {text!r} names no cluster count")
-    return choices
+#: 2026-09-22: moved to fresh_layouts.py (shared with the reconstruction objective); the name stays.
+_resolve_fresh_arguments = resolve_fresh_arguments
 
 
 def check_variant_and_geometry(parser, args, data: TaskData) -> None:

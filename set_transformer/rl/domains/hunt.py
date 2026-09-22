@@ -72,6 +72,7 @@ from set_transformer.rl.domains.base import (
     Collection,
     Domain,
     Evaluation,
+    FreshLayouts,
     Objective,
     PretrainContext,
     PretrainResult,
@@ -1192,6 +1193,22 @@ def _cgf_t_init_max_default(args):
     return None
 
 
+def _fresh_layouts(name: str) -> FreshLayouts | None:
+    """``Domain.fresh_layouts`` (2026-09-22): the variant's generator bound to the LIVE env config,
+    the collector's cluster-count draw and the collector's frame, for the generic reconstruction
+    objective's ``--data_source fresh | mixed`` (``rl/pretrain_objectives/fresh_layouts.py``). None
+    for a variant without a generator. The task objective keeps its own path
+    (:func:`_generated_task_data`), unchanged."""
+    variant = resolve(name)
+    if variant.layout_generator is None:
+        return None
+    cfg = _env_config(name)
+    return FreshLayouts(
+        generator=lambda k_choices, n, rng: variant.layout_generator(cfg, k_choices, n, rng),
+        k_choices=tuple(N_ACTIVE_CHOICES[variant.task]), particle_scale=ARENA_SCALE,
+        particle_centre=0.0, env_id=variant.env_id, constants=cfg.to_dict())
+
+
 HUNT = Domain(
     name="hunt",
     particle_dim=2,
@@ -1232,4 +1249,6 @@ HUNT = Domain(
                             default_objective="task"),
     # Step 2: the record's behaviour policy, labels per snapshot, no rebalancing (batch 9.2).
     collection=HUNT_COLLECTION,
+    # 2026-09-22: rows drawn from a variant's reset rules for the generic reconstruction objective.
+    fresh_layouts=_fresh_layouts,
 )
