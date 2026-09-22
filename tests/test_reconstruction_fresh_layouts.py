@@ -51,6 +51,17 @@ RL_GEOMETRY = {"st": ST_SMALL, "deepset": ["--dim_hidden", "16"], "pointnet": ["
 TINY = ["--fresh_rows_per_epoch", "128", "--fresh_val_rows", "64", "--eval_freq", "2", "--save_freq", "100000"]
 
 
+@pytest.fixture(autouse=True)
+def _wandb_offline(monkeypatch):
+    """Every test here that trains reaches ``Trainer._setup_wandb``, whose ``wandb.init`` is
+    unconditional. Without credentials (no ``~/.netrc``) that call tries to log in and the test
+    fails on the environment, not on the code. The suite's convention is to set this per test
+    (``test_pooled_arm_autoencoder``, ``test_pretrain_command``, ...); autouse covers the whole
+    module so a test added later cannot miss it.
+    """
+    monkeypatch.setenv("WANDB_MODE", "offline")
+
+
 @pytest.fixture(scope="module")
 def tiny_dataset(tmp_path_factory):
     """A tiny most_var dataset through the package command (the pattern of test_hunt_fresh_layouts)."""

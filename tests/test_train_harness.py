@@ -162,8 +162,15 @@ def _drive_shared(monkeypatch, tmp_path, domain, encoder, argv, *, legacy_layout
 def test_domain_record_is_complete_and_names_the_module_objects(name, record, module):
     assert isinstance(record, Domain) and record.name == name
     assert domains.get(name) is record and domains.get(record) is record
+    # 2026-09-22: `fresh_layouts` is the one field that is None BY DESIGN for a domain that declares it
+    # not (only hunt draws layouts from its reset rules; None = the reconstruction objective offers no
+    # --data_source there and its command line is unchanged). Every other field must be filled.
+    optional = {"fresh_layouts"}
     for field in dataclasses.fields(Domain):
+        if field.name in optional:
+            continue
         assert getattr(record, field.name) is not None, field.name
+    assert (record.fresh_layouts is not None) == (name == "hunt"), "only hunt declares fresh layouts"
     assert record.variants is module.VARIANTS
     assert record.resolve is module.resolve and record.episode_cap is module.episode_cap
     assert record.default_variant in record.variants
