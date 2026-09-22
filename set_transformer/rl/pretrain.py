@@ -426,6 +426,14 @@ def main(argv: Sequence[str] | None = None, *, domain: Domain | str | None = Non
         geometry=geometry, command=" ".join([prog or "set_transformer.rl.pretrain", *argv]),
         git=run_records.git_provenance(), threads=run_records.thread_settings(),
     )
+    # 2026-09-21 (fresh layouts): an objective whose rows were GENERATED rather than read from a
+    # file says so here -- the source, the per-epoch budget, the generator's seed, the cluster-count
+    # draw, which held-out loss selected, and the env constants the layouts were drawn from
+    # (`data_path` alone cannot answer "what was this trained on" any more). A file-backed run adds
+    # nothing, so every recorded checkpoint's record keeps exactly the keys it had.
+    data_record = data.provenance() if hasattr(data, "provenance") else {}
+    if data_record.get("data_source", "file") != "file":
+        record["data"] = data_record
     _stamp_checkpoints(result, record)
     run_records.write_pretrain_status(run_dir, completed=True, error=None,
                                       rl_checkpoint=result.rl_checkpoint,

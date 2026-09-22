@@ -118,6 +118,166 @@ class TaskData:
         self.train[key] = train.to(self.device)
         self.val[key] = val.to(self.device)
 
+    # -- the two hooks the generated sources below implement (2026-09-21, fresh layouts) -------
+    def refresh_epoch(self, rng) -> None:
+        """Called once at the top of every epoch. File rows are fixed, so this does nothing; the
+        generated sources overwrite their training rows in place here."""
+
+    def selection_sets(self) -> tuple[tuple[str, dict, object], ...]:
+        """``(name, split, rows)`` per held-out set whose loss picks the best epoch and drives
+        ``ReduceLROnPlateau``; their losses are averaged. ``rows`` is None for the whole split or
+        an index tensor. One entry here: the file's own tail, exactly the rows the loop validated
+        on before this hook existed."""
+        return (("file", self.val, self.val_loss_rows),)
+
+    def metrics_sets(self) -> tuple[tuple[str, dict], ...]:
+        """``(prefix, split)`` per held-out set the end-of-run metrics are reported on; an empty
+        prefix leaves the metric names as they were. One entry here: the file's tail."""
+        return (("", self.val),)
+
+    def batches(self, split: dict, rows, batch_size: int):
+        """Chunks of one held-out set: slices over the whole split, or index tensors of ``rows``."""
+        if rows is None:
+            n = len(split[self.obs_key])
+            return (slice(i, min(i + batch_size, n)) for i in range(0, n, batch_size))
+        return (rows[i:i + batch_size] for i in range(0, len(rows), batch_size))
+
+    def provenance(self) -> dict:
+        """What the run record and the checkpoint say this data object was (``rl/pretrain.py``'s
+        ``pretraining_run`` and ``metrics.json``); the generated sources add their own facts."""
+        return {"data_source": "file", "val_select": "file"}
+
+
+class GeneratedTaskData:
+    """Training rows drawn fresh every epoch from a variant's layout generator, held-out rows drawn
+    ONCE (2026-09-21; ``change_mds/fresh_layout_pretraining_2026-09-21.md`` section 1.2).
+
+    The same interface :func:`run_task_training` reads off :class:`TaskData` -- ``train`` / ``val``
+    dicts of tensors, ``n_train`` / ``n_val``, ``obs``, ``particle_scale``, ``num_particles``,
+    ``dim_particles``, ``metadata`` -- so the loop is the file loop with one call added. The rows
+    are the collector's layout, so every label the domain's loss and metrics read is present.
+    """
+
+    def __init__(self, generator: Callable, cfg, *, variant: str, env_id: str, obs_key: str,
+                 k_choices: tuple[int, ...], rows_per_epoch: int, val_rows: int, seed: int,
+                 particle_scale: float, device: torch.device, label_arrays: tuple[str, ...],
+                 val_select: str = "generated"):
+        self.generator, self.cfg = generator, cfg
+        self.obs_key, self.device = obs_key, device
+        self.particle_scale = float(particle_scale)
+        self.k_choices = tuple(int(k) for k in k_choices)
+        self.rows_per_epoch, self.val_rows, self.seed = int(rows_per_epoch), int(val_rows), int(seed)
+        self.val_select = val_select
+        self.val_sources = None
+        self.val_loss_rows = None
+        # The held-out set is drawn ONCE, from a stream of its own (seed + 1), so it is the same
+        # rows for every epoch of a run and reproducible from the recorded seed alone. The
+        # TRAINING rows are not drawn here: the loop calls refresh_epoch before its first epoch,
+        # and drawing them twice would cost a second pass over 100,000 layouts for nothing.
+        self.val = self._to_device(generator(cfg, self.k_choices, self.val_rows,
+                                             np.random.default_rng(self.seed + 1)))
+        self.train: dict = {}
+        self.n_train, self.n_val = self.rows_per_epoch, self.val_rows
+        self.num_particles = int(self.val["particles"].shape[1])
+        self.dim_particles = int(self.val["particles"].shape[2])
+        self.metadata = {"variant": variant, "env_id": env_id, "particle_scale": self.particle_scale,
+                         "label_arrays": list(label_arrays), **self.provenance()}
+
+    def _to_device(self, arrays: dict) -> dict:
+        return {k: torch.as_tensor(v).to(self.device) for k, v in arrays.items()}
+
+    def refresh_epoch(self, rng) -> None:
+        """A whole new set of layouts for this epoch, in place (the loop's ``randperm`` and every
+        tensor reference are rebuilt per epoch, so replacing the dict is enough)."""
+        self.train = self._to_device(self.generator(self.cfg, self.k_choices, self.rows_per_epoch, rng))
+
+    def val_loss_batches(self, batch_size: int):
+        return self.batches(self.val, None, batch_size)
+
+    def batches(self, split: dict, rows, batch_size: int):
+        if rows is None:
+            n = len(split[self.obs_key])
+            return (slice(i, min(i + batch_size, n)) for i in range(0, n, batch_size))
+        return (rows[i:i + batch_size] for i in range(0, len(rows), batch_size))
+
+    def selection_sets(self) -> tuple[tuple[str, dict, object], ...]:
+        return (("generated", self.val, None),)
+
+    def metrics_sets(self) -> tuple[tuple[str, dict], ...]:
+        return (("", self.val),)
+
+    def obs(self, split: dict, index) -> dict:
+        return {"obs": split[self.obs_key][index], "particles": split["particles"][index],
+                "weights": split["weights"][index]}
+
+    def add(self, key: str, train: torch.Tensor, val: torch.Tensor) -> None:
+        raise NotImplementedError(
+            "a derived per-row array cannot be carried on generated data: the training rows are "
+            "replaced every epoch, so the derived tensor would go stale after epoch 0. Compute it "
+            "inside the objective's loss / metrics instead.")
+
+    def provenance(self) -> dict:
+        return {"data_source": "fresh", "val_select": self.val_select,
+                "fresh_rows_per_epoch": self.rows_per_epoch, "fresh_val_rows": self.val_rows,
+                "fresh_seed": self.seed, "k_choices": list(self.k_choices),
+                "generator_constants": self.cfg.to_dict()}
+
+
+class MixedTaskData(GeneratedTaskData):
+    """A file's rows AND fresh layouts in every epoch (the standalone scripts' "Option A": the
+    file's agent positions are where a policy actually goes, the generated ones are uniform).
+
+    The file's episode-disjoint tail stays held out and is never trained on; the generated
+    held-out set is drawn once as in :class:`GeneratedTaskData`. Rows per epoch = the file's
+    training rows + ``--fresh_rows_per_epoch``.
+    """
+
+    def __init__(self, file_data: TaskData, generator: Callable, cfg, *, variant: str, env_id: str,
+                 k_choices: tuple[int, ...], rows_per_epoch: int, val_rows: int, seed: int,
+                 device: torch.device, label_arrays: tuple[str, ...], val_select: str = "mean"):
+        self.file = file_data
+        super().__init__(generator, cfg, variant=variant, env_id=env_id, obs_key=file_data.obs_key,
+                         k_choices=k_choices, rows_per_epoch=rows_per_epoch, val_rows=val_rows,
+                         seed=seed, particle_scale=file_data.particle_scale, device=device,
+                         label_arrays=label_arrays, val_select=val_select)
+        self.metadata = {**file_data.metadata, **self.metadata}
+        self.val_sources = file_data.val_sources
+        self.dropped_file_arrays = tuple(k for k in file_data.train if k not in self.val)
+        self.n_train = self.rows_per_epoch + file_data.n_train
+
+    def _merge_train(self, generated: dict) -> None:
+        """The epoch's rows: the generated ones followed by the file's training rows. The keys are
+        the intersection, so a file array the generator does not produce (``step``, ``episode``,
+        ``source_round``) is dropped rather than left ragged."""
+        self.train = {k: torch.cat([v, self.file.train[k]])
+                      for k, v in generated.items() if k in self.file.train}
+        self.n_train = self.rows_per_epoch + self.file.n_train
+
+    def refresh_epoch(self, rng) -> None:
+        self._merge_train(self._to_device(
+            self.generator(self.cfg, self.k_choices, self.rows_per_epoch, rng)))
+
+    def selection_sets(self) -> tuple[tuple[str, dict, object], ...]:
+        """``mean`` (the default, and what both standalone scripts did): the average of the file
+        tail's loss and the generated set's. ``file`` / ``generated``: that one alone."""
+        file_set = ("file", self.file.val, self.file.val_loss_rows)
+        generated_set = ("generated", self.val, None)
+        if self.val_select == "file":
+            return (file_set,)
+        if self.val_select == "generated":
+            return (generated_set,)
+        return (file_set, generated_set)
+
+    def metrics_sets(self) -> tuple[tuple[str, dict], ...]:
+        return (("", self.val), ("file_", self.file.val))
+
+    def provenance(self) -> dict:
+        record = {**super().provenance(), "data_source": "mixed"}
+        file_data = getattr(self, "file", None)
+        if file_data is not None:
+            record["file_rows_per_epoch"] = int(file_data.n_train)
+        return record
+
 
 def parse_val_sources(text: str | None) -> tuple[int, ...] | None:
     """``--val_sources 1,2`` -> (1, 2); None / empty -> None (validate on the whole tail). Shared by every
@@ -183,8 +343,16 @@ def save_task_checkpoint(model: TaskEncoderWithHead, path: Path, args, epoch: in
         epoch=epoch, val=val, args=vars(args)), path)
 
 
-def add_task_arguments(parser, *, dataset_help: str) -> None:
-    """The flags every task objective has: the data and the record's training settings."""
+#: ``--data_source`` (2026-09-21, fresh layouts): where the TRAINING rows of one epoch come from.
+DATA_SOURCES = ("file", "fresh", "mixed")
+
+
+def add_task_arguments(parser, *, dataset_help: str, fresh_layouts: bool = False) -> None:
+    """The flags every task objective has: the data and the record's training settings.
+
+    ``fresh_layouts``: the domain's variants carry a ``layout_generator``, so the group below is
+    offered (2026-09-21). A domain that leaves it False keeps exactly the command line it had.
+    """
     g = parser.add_argument_group("task objective: data")
     g.add_argument("--data_path", type=str, default=None,
                    help=f"{dataset_help} Default: the variant's dataset under the output root.")
@@ -196,6 +364,36 @@ def add_task_arguments(parser, *, dataset_help: str) -> None:
                         "computed on the held-out rows from these sources only, as the record did (it validated "
                         "on policy rows). Training rows, the held-out tail and the reported per-source metrics "
                         "are unchanged. Default: the whole tail.")
+    if fresh_layouts:
+        # 2026-09-21 (change_mds/fresh_layout_pretraining_2026-09-21.md section 1.3). `file` is the
+        # default, so every recorded command means exactly what it meant before.
+        f = parser.add_argument_group(
+            "task objective: fresh layouts (rows drawn from the variant's own reset rules instead "
+            "of a collected file; a collected file freezes one layout per episode and the encoder "
+            "memorises them -- most_var 0.371 -> 0.885 identify on fresh rows)")
+        f.add_argument("--data_source", choices=DATA_SOURCES, default="file",
+                       help="Where an epoch's TRAINING rows come from. file (the default): the "
+                            "collected dataset, unchanged. fresh: layouts generated anew every "
+                            "epoch from the variant's env rules (no dataset is read). mixed: the "
+                            "file's training rows AND generated rows in every epoch.")
+        f.add_argument("--fresh_rows_per_epoch", type=int, default=None,
+                       help="Generated rows per epoch. Default: 100,000 under --data_source fresh; "
+                            "the file's own training-row count under mixed (which keeps the "
+                            "epoch-counted LR plateau and early stopping on the scale they were "
+                            "tuned at -- halving rows per epoch once collapsed the LR to 2e-06).")
+        f.add_argument("--fresh_val_rows", type=int, default=20000,
+                       help="A FIXED generated validation set, drawn once from --fresh_seed + 1.")
+        f.add_argument("--fresh_seed", type=int, default=None,
+                       help="The generator's stream, separate from torch's. Default: --seed.")
+        f.add_argument("--k_choices", type=str, default=None,
+                       help="Comma list the number of live clusters is drawn from per generated "
+                            "row, with repeats for weight. Default: the collector's own "
+                            "(pick_target 2,3,4,5,5,5; collect_all 1,2,3,4,5,5,5).")
+        f.add_argument("--val_select", choices=("file", "generated", "mean"), default=None,
+                       help="Which held-out loss halves the learning rate and picks the best "
+                            "epoch. Default: file under --data_source file, generated under "
+                            "fresh, mean (the average of the two, what the standalone scripts "
+                            "did) under mixed.")
     t = parser.add_argument_group("task objective: training (the record's settings)")
     t.add_argument("--num_epochs", type=int, default=120)
     t.add_argument("--patience", type=int, default=15,
@@ -218,13 +416,39 @@ def locate_from_dataset(args) -> dict:
     return {"variant": meta.get("variant"), "env_id": meta.get("env_id")}
 
 
-def resolve_task_arguments(parser, args, domain, encoder, *, collect_hint: str) -> None:
-    """``Objective.resolve_arguments``: a learned encoder, and a dataset that exists (the
-    variant's file under the root when ``--data_path`` is not given)."""
+def data_source_of(args) -> str:
+    """``--data_source``, or ``file`` for a domain that does not offer the flag."""
+    return str(getattr(args, "data_source", "file") or "file")
+
+
+#: ``--fresh_rows_per_epoch`` when a ``fresh`` run leaves it out (a ``mixed`` run takes the file's
+#: own training-row count instead, so its steps per epoch stay on the scale the schedules were
+#: tuned at). Section 1.3 of the plan.
+DEFAULT_FRESH_ROWS_PER_EPOCH = 100_000
+
+
+def resolve_task_arguments(parser, args, domain, encoder, *, collect_hint: str,
+                           fresh_layouts: bool = False) -> None:
+    """``Objective.resolve_arguments``: a learned encoder, and -- unless the rows are generated --
+    a dataset that exists (the variant's file under the root when ``--data_path`` is not given).
+
+    ``fresh_layouts`` (2026-09-21): the domain offers ``--data_source``, so the checks branch on
+    it. Under ``fresh`` no dataset is read at all and ``--variant`` is REQUIRED (there is no file
+    to read one off); under ``mixed`` both the file and the generator apply.
+    """
     if not encoder.learned:
         parser.error(f"the task objective needs a learned encoder (st | cgf | deepset | pointnet); "
                      f"{encoder.name!r} has no parameters to train")
     resolve_sinkhorn_blur(args, domain)          # 2026-09-19: the domain's default when omitted
+    source = data_source_of(args) if fresh_layouts else "file"
+    if source != "file":
+        _resolve_fresh_arguments(parser, args, domain, source)
+    if source == "fresh":
+        if args.data_path:
+            parser.error("--data_source fresh generates every training row from the variant's env "
+                         "rules and reads no dataset; drop --data_path, or pass --data_source mixed "
+                         "to train on the file's rows as well")
+        return
     if args.data_path is None:
         if args.variant is None:
             parser.error("--data_path or --variant is needed: the task objective reads the "
@@ -234,6 +458,45 @@ def resolve_task_arguments(parser, args, domain, encoder, *, collect_hint: str) 
         print(f"--data_path not given; the variant's dataset under the root: {args.data_path}")
     if not os.path.isfile(args.data_path):
         parser.error(f"dataset {args.data_path} does not exist ({collect_hint})")
+
+
+def _resolve_fresh_arguments(parser, args, domain, source: str) -> None:
+    """The generated sources' own checks and defaults (2026-09-21): a variant with a generator,
+    the row budget, the generator's seed, the cluster-count draw and which loss selects."""
+    if args.variant is None:
+        parser.error(f"--data_source {source} needs --variant: the layouts are drawn from one "
+                     f"env's rules, and there is no dataset to read the variant off "
+                     f"({domain.name} variants: {domain.variant_names()})")
+    variant = domain.resolve(args.variant)
+    if getattr(variant, "layout_generator", None) is None:
+        parser.error(f"--data_source {source}: variant {args.variant!r} of domain {domain.name} "
+                     "declares no layout_generator, so its layouts cannot be generated; use "
+                     "--data_source file")
+    if args.fresh_seed is None:
+        args.fresh_seed = int(args.seed)
+    if args.val_select is None:
+        args.val_select = "generated" if source == "fresh" else "mean"
+    if source == "fresh" and args.val_select != "generated":
+        parser.error(f"--val_select {args.val_select} needs the file's held-out rows, and "
+                     "--data_source fresh reads no file; use --val_select generated")
+    if args.fresh_rows_per_epoch is None and source == "fresh":
+        args.fresh_rows_per_epoch = DEFAULT_FRESH_ROWS_PER_EPOCH
+    if args.fresh_rows_per_epoch is not None and args.fresh_rows_per_epoch < 1:
+        parser.error("--fresh_rows_per_epoch must be at least 1")
+    if args.fresh_val_rows < 1:
+        parser.error("--fresh_val_rows must be at least 1")
+
+
+def resolve_k_choices(args, default: tuple[int, ...]) -> tuple[int, ...]:
+    """``--k_choices 2,3,5,5`` -> (2, 3, 5, 5); not given -> the collector's own draw for the task.
+    Repeats are meaningful (they weight the draw), so the list is not deduplicated."""
+    text = getattr(args, "k_choices", None)
+    if text is None or not str(text).strip():
+        return tuple(int(k) for k in default)
+    choices = tuple(int(part) for part in str(text).split(",") if part.strip())
+    if not choices:
+        raise ValueError(f"--k_choices {text!r} names no cluster count")
+    return choices
 
 
 def check_variant_and_geometry(parser, args, data: TaskData) -> None:
@@ -291,6 +554,23 @@ def run_task_training(args, ctx, *, data: TaskData, obs_dim: int, out_dim: int,
     if data.val_sources is not None:
         print(f"[{label}] validation loss (LR schedule + best epoch) on the {n_val_loss:,} held-out rows "
               f"with source_round in {data.val_sources}; metrics still reported on all {data.n_val:,}", flush=True)
+    # 2026-09-21 (fresh layouts): rows and optimiser steps per epoch, said out loud, because both
+    # epoch-counted schedules below (ReduceLROnPlateau patience 5, early stopping --patience) are
+    # sensitive to it -- an ablation that dropped rows/epoch 2.7x collapsed the LR to 2e-06 by
+    # epoch 54 on a loss that was merely slower.
+    provenance = data.provenance() if hasattr(data, "provenance") else {"data_source": "file"}
+    if provenance.get("data_source", "file") != "file":
+        steps = -(-data.n_train // args.batch_size)
+        print(f"[{label}] data_source={provenance['data_source']}: {data.n_train:,} rows/epoch "
+              f"({steps:,} steps at batch {args.batch_size}), generated "
+              f"{provenance.get('fresh_rows_per_epoch', 0):,} of them per epoch from seed "
+              f"{provenance.get('fresh_seed')}, k drawn from {provenance.get('k_choices')}; "
+              f"selection on {', '.join(name for name, _, _ in data.selection_sets())} "
+              f"(--val_select {provenance.get('val_select')})", flush=True)
+        dropped = getattr(data, "dropped_file_arrays", ())
+        if dropped:
+            print(f"[{label}] the generator produces no {list(dropped)}, so those file arrays are "
+                  "dropped from the training batches (the held-out sets keep theirs)", flush=True)
 
     # 2026-09-19 (online alignment): the latent metric-alignment term on the encoder's features, its
     # targets computed per batch from the batch's own clouds (divided by the dataset's scale, as the
@@ -328,20 +608,33 @@ def run_task_training(args, ctx, *, data: TaskData, obs_dim: int, out_dim: int,
                 feats.append(model.features(data.obs(data.val, slice(s, min(s + 2048, data.n_val)))))
         return align.correlation(torch.cat(feats), val_align_pairs, val_align_targets)
 
-    def val_loss():
+    def set_loss(split: dict, rows) -> float:
         model.eval()
         tot, n = 0.0, 0
         with torch.no_grad():
-            for s in data.val_loss_batches(2048):
-                b = {k: v[s] for k, v in data.val.items()}
+            for s in data.batches(split, rows, 2048):
+                b = {k: v[s] for k, v in split.items()}
                 count = (s.stop - s.start) if isinstance(s, slice) else int(len(s))
-                tot += float(loss_fn(model(data.obs(data.val, s)), b)) * count
+                tot += float(loss_fn(model(data.obs(split, s)), b)) * count
                 n += count
         return tot / max(n, 1)
 
+    def val_loss():
+        """The loss that halves the learning rate and picks the best epoch: the average over the
+        data object's selection sets. With a file's rows that is one set -- the held-out tail, or
+        its `--val_sources` rows -- and the arithmetic is the loop's own, unchanged (2026-09-21)."""
+        losses = {name: set_loss(split, rows) for name, split, rows in selection_sets}
+        return float(np.mean(list(losses.values()))), losses
+
+    selection_sets = data.selection_sets()
+
     best, best_epoch, best_state, best_head, bad, hist = float("inf"), None, None, None, 0, []
     t0 = time.time()
+    # 2026-09-21 (fresh layouts): the generator's stream, separate from torch's, so a run's rows
+    # are reproducible from --fresh_seed alone; a file-backed data object ignores it.
+    epoch_rng = np.random.default_rng(int(getattr(args, "fresh_seed", None) or args.seed or 0) + 2)
     for ep in range(args.num_epochs):
+        data.refresh_epoch(epoch_rng)
         model.train()
         perm = torch.randperm(data.n_train, device=device)
         run = 0.0
@@ -368,9 +661,12 @@ def run_task_training(args, ctx, *, data: TaskData, obs_dim: int, out_dim: int,
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
             run += float(loss.detach()) * len(j)
-        v = val_loss()
+        v, per_set = val_loss()
         sched.step(v)
         entry = {"epoch": ep, "train": run / data.n_train, "val": v}
+        if len(per_set) > 1:
+            # `val` is their mean (--val_select mean); each one is kept so the two can be read apart
+            entry.update({f"val_{name}": value for name, value in per_set.items()})
         if align is not None:
             # `train` above includes lambda * align (the Trainer's epoch loss does the same)
             entry.update(align=run_align / data.n_train, align_r=(run_r / n_r if n_r else float("nan")),
@@ -402,6 +698,11 @@ def run_task_training(args, ctx, *, data: TaskData, obs_dim: int, out_dim: int,
             print(f"[{label}] WARNING: best-by-val-loss epoch {best_epoch} has align_lambda="
                   f"{align_record['lambda_at_best_epoch']:.3f} < target {align_lambda}; "
                   "checkpoint_best.pt is NOT fully aligned", flush=True)
+    if provenance.get("data_source", "file") != "file":
+        # 2026-09-21: a generated checkpoint carries what it was generated FROM (source, budget,
+        # seed, k draw, the env constants). Added only when the rows were generated, so a
+        # file-backed checkpoint is byte-for-byte the one this code produced before.
+        checkpoint_config = {**checkpoint_config, "data": provenance}
     save_task_checkpoint(model, checkpoint_dir / "checkpoint_last.pt", args, len(hist) - 1,
                          {"loss": hist[-1]["val"]}, checkpoint_config)
 
@@ -409,25 +710,35 @@ def run_task_training(args, ctx, *, data: TaskData, obs_dim: int, out_dim: int,
     model.head.load_state_dict(best_head)
     model.eval()
 
-    def metrics_over(rows_or_slices) -> dict:
+    def metrics_over(split: dict, rows_or_slices) -> dict:
         chunks = []
         with torch.no_grad():
             for idx in rows_or_slices:
-                b = {k: v[idx] for k, v in data.val.items()}
-                chunks.append(metrics_fn(model(data.obs(data.val, idx)), b))
+                b = {k: v[idx] for k, v in split.items()}
+                chunks.append(metrics_fn(model(data.obs(split, idx)), b))
         return {k: float(np.mean([c[k] for c in chunks])) for k in chunks[0]}
 
-    metrics = metrics_over(slice(i, min(i + 4096, data.n_val)) for i in range(0, data.n_val, 4096))
+    def metrics_of(split: dict) -> dict:
+        n = len(split[data.obs_key])
+        return metrics_over(split, (slice(i, min(i + 4096, n)) for i in range(0, n, 4096)))
+
+    # One entry per held-out set the data object reports on: the file's tail alone under
+    # --data_source file (an empty prefix, so the metric names are the ones every recorded run
+    # printed), the generated set plus the file's under mixed (2026-09-21).
+    metrics = {}
+    for prefix, split in data.metrics_sets():
+        metrics.update({f"{prefix}{k}": v for k, v in metrics_of(split).items()})
     # 10.8a: the same metrics per source of the validation rows (a DAgger file mixes the scripted
     # collection with the states each round's policy visited; the record misread round 1 because
     # its validation set changed composition between rounds)
     by_source = {}
-    if "source_round" in data.val:
-        src = data.val["source_round"].cpu().numpy()
+    source_split = next((split for _, split in data.metrics_sets() if "source_round" in split), None)
+    if source_split is not None:
+        src = source_split["source_round"].cpu().numpy()
         for r in np.unique(src):
             rows = np.flatnonzero(src == r)
-            m = metrics_over(torch.as_tensor(rows[i:i + 4096], device=data.device)
-                             for i in range(0, len(rows), 4096))
+            m = metrics_over(source_split, (torch.as_tensor(rows[i:i + 4096], device=data.device)
+                                            for i in range(0, len(rows), 4096)))
             by_source[str(int(r))] = {"rows": int(len(rows)), **m}
         for r, m in by_source.items():
             print(f"  val source {r}: rows={m['rows']}  " + "  ".join(f"{k}={v:.4f}" for k, v in m.items() if k != "rows"))
@@ -437,7 +748,7 @@ def run_task_training(args, ctx, *, data: TaskData, obs_dim: int, out_dim: int,
         dict(best_val=best, best_epoch=best_epoch, epochs=len(hist), minutes=(time.time() - t0) / 60,
              val_sources=data.val_sources, val_loss_rows=n_val_loss,
              val_metrics=metrics, val_metrics_by_source=by_source, alignment=align_record,
-             history=hist), indent=2))
+             data=provenance, history=hist), indent=2))
     print(f"[{label}] best_val={best:.5f} (epoch {best_epoch})  "
           + "  ".join(f"{k}={v:.4f}" for k, v in metrics.items())
           + f"  ({(time.time() - t0) / 60:.1f} min) -> {checkpoint_dir}", flush=True)

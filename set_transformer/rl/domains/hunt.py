@@ -54,6 +54,7 @@ from __future__ import annotations
 import itertools
 import json
 import os
+from collections.abc import Callable
 from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
@@ -79,14 +80,18 @@ from set_transformer.rl.domains.base import (
 from set_transformer.rl.particle_filters.hunt import EnvEmittedBeliefFilter
 from set_transformer.rl.wrappers.particle_filter import PFDictWithWeightsObservationWrapper
 from set_transformer.rl.pretrain_objectives.task_head import (   # 10.9: the shared task-head loop
+    GeneratedTaskData,      # 2026-09-21: the two generated sources
+    MixedTaskData,
     TaskData as _TaskData,
     TaskEncoderWithHead,   # noqa: F401 - re-exported (tests, entry points)
     add_task_arguments,
     parse_val_sources,      # noqa: F401 - re-exported (tests import it from here)
     build_task_extractor,   # noqa: F401 - re-exported
     check_variant_and_geometry,
+    data_source_of,
     extractor_geometry,   # noqa: F401 - re-exported
     locate_from_dataset,
+    resolve_k_choices,
     resolve_task_arguments,
     run_task_training,
     save_task_checkpoint as _save_task_checkpoint,
@@ -126,6 +131,192 @@ class Variant:
     #: The recorded horizon for this task, used when --total_timesteps is left at the domain
     #: default (3M): Cluster-Hunt ran 1.5M.
     default_total_timesteps: int = 3_000_000
+    #: 2026-09-21 (fresh layouts): ``(cfg, k_choices, n_rows, rng) -> dict`` of the collector's label
+    #: arrays plus ``particles`` / ``weights``, drawn by THIS env class's reset rules with the
+    #: constants read off ``cfg`` (never literals). None: ``--data_source fresh`` is refused for the
+    #: variant. Checked against ``env.reset()`` per variant per k in tests/test_hunt_fresh_layouts.py.
+    layout_generator: Callable | None = None
+
+
+# ---------------------------------------------------------------------------
+# Fresh layout generators (2026-09-21; change_mds/fresh_layout_pretraining_2026-09-21.md section 1.1)
+#
+# The task objective's training rows can be REGENERATED every epoch instead of read from a collected
+# file. The reason is measured: a collected file freezes one layout per episode (only the agent
+# moves and the cloud is redrawn), so most_var's 3,600 layouts were each seen ~100 times and the
+# encoder memorised them; generating fresh ones took its identify accuracy 0.371 -> 0.885 with the
+# same objective, architecture and PPO block. These two functions supersede the standalone
+# src/scripts/{most_var_gap/pretrain_spread,least_mass_gap/pretrain_fresh_lm}.py generators, which
+# hardcoded the constants.
+#
+# Each function mirrors ONE env class's reset() and draws n rows at once. Every constant comes from
+# the live `cfg` (`_env_config(variant)`), so a change to a registration or to a dataclass default
+# reaches the generator without an edit here. The layout a row carries is the collector's own
+# (`_collect_snapshot_extras` below): agent (pos - 10) / 10, particles agent-relative in RAW arena
+# units, weights 1/N, centres (c - pos) / 10 zero-padded to n_clusters slots, alive, counts, sigmas
+# raw, target = centers[target_index].
+# ---------------------------------------------------------------------------
+
+
+def _sample_centres(cfg, k: int, n: int, rng) -> np.ndarray:
+    """``[n, k, 2]`` centres uniform in ``[mean_lo, mean_hi]^2`` with pairwise separation
+    ``>= min_sep`` (the envs' ``_sample_centers`` rejection, in blocks instead of one row at a
+    time; at k < 2 there is no pair to separate)."""
+    out = np.empty((0, k, 2))
+    need = n
+    while need > 0:
+        cand = rng.uniform(cfg.mean_lo, cfg.mean_hi, size=(3 * need + 8, k, 2))
+        if k < 2:
+            keep = cand
+        else:
+            d = np.linalg.norm(cand[:, :, None] - cand[:, None], axis=-1) + 1e9 * np.eye(k)[None]
+            keep = cand[d.min(axis=(1, 2)) >= cfg.min_sep]
+        out = np.concatenate([out, keep])[:n]
+        need = n - len(out)
+    return out
+
+
+def _sample_sigmas_with_margin(cfg, k: int, n: int, rng) -> np.ndarray:
+    """``[n, k]`` widths whose largest exceeds the second largest by ``sigma_margin``
+    (``MinMassHuntEnv._sample_sigmas``, the ``max_var`` rule, in blocks)."""
+    out = np.empty((0, k))
+    need = n
+    while need > 0:
+        cand = rng.uniform(cfg.sigma_lo, cfg.sigma_hi, size=(4 * need + 8, k))
+        if k < 2:
+            keep = cand
+        else:
+            top = np.sort(cand, 1)
+            keep = cand[(top[:, -1] - top[:, -2]) >= cfg.sigma_margin]
+        out = np.concatenate([out, keep])[:n]
+        need = n - len(out)
+    return out
+
+
+def _draw_clouds(cfg, centres: np.ndarray, sigmas: np.ndarray, counts: np.ndarray, rng) -> np.ndarray:
+    """``[n, n_particles, 2]``: ``counts[j]`` draws from ``N(centres[j], sigmas[j])`` per row,
+    clipped to the arena and shuffled (both envs' ``_draw`` / ``_draw_particles``)."""
+    n, _ = counts.shape
+    particles = int(cfg.n_particles)
+    # which cluster each particle belongs to: np.repeat(arange(k), counts) per row, vectorised
+    index = (np.arange(particles)[None, :, None] >= np.cumsum(counts, 1)[:, None, :]).sum(-1)
+    pts = (np.take_along_axis(centres, index[..., None], 1)
+           + np.take_along_axis(sigmas, index, 1)[..., None] * rng.standard_normal((n, particles, 2)))
+    pts = np.clip(pts, 0.0, 2.0 * ARENA_SCALE)
+    return np.take_along_axis(pts, rng.random((n, particles)).argsort(1)[..., None], 1)
+
+
+#: Every array a generated row carries, in the collector's spelling. ``step`` is not among them: a
+#: fresh layout is not a step of an episode, and no task objective reads it.
+GENERATED_ARRAYS = ("agent", "particles", "weights", "centers", "alive", "counts", "sigmas",
+                    "target", "target_index")
+
+
+def _pack(cfg, centres, sigmas, counts, pos, target_index, alive_k: int) -> dict:
+    """The collector's row layout for one block of rows that share a cluster count."""
+    n, k = counts.shape
+    K, N = int(cfg.n_clusters), int(cfg.n_particles)
+    centers = np.zeros((n, K, 2), np.float32)
+    centers[:, :k] = (centres - pos[:, None]) / ARENA_SCALE
+    alive = np.zeros((n, K), np.float32)
+    alive[:, :alive_k] = 1.0
+    counts_out = np.zeros((n, K), np.float32)
+    counts_out[:, :k] = counts
+    sigmas_out = np.zeros((n, K), np.float32)
+    sigmas_out[:, :k] = sigmas
+    return {"agent": ((pos - ARENA_SCALE) / ARENA_SCALE).astype(np.float32),
+            "weights": np.full((n, N), 1.0 / N, np.float32),
+            "centers": centers, "alive": alive, "counts": counts_out, "sigmas": sigmas_out,
+            "target": centers[np.arange(n), target_index],
+            "target_index": target_index.astype(np.int64)}
+
+
+def _concatenate_and_shuffle(blocks: list[dict], rng) -> dict:
+    out = {key: np.concatenate([b[key] for b in blocks]) for key in GENERATED_ARRAYS}
+    order = rng.permutation(len(out["agent"]))
+    return {key: value[order] for key, value in out.items()}
+
+
+def generate_pick_target_layouts(cfg, k_choices, n: int, rng) -> dict:
+    """``MinMassHuntEnv.reset``, vectorised: least_mass (``target_rule`` ``min_mass``) and most_var
+    (``max_var``) in one function, branching where the env branches.
+
+    ``min_mass``: widths uniform, counts by ``_sample_counts`` (a minimum in
+    ``[n_min_lo, n_min_hi]``, every other cluster at least ``mass_margin`` above it, the surplus
+    cut at random points, then a permutation), target = the lightest. ``max_var``: widths by the
+    ``sigma_margin`` rejection, counts as equal as possible with the remainder to RANDOM clusters,
+    target = the widest. ``k`` is clipped to ``[2, n_clusters]``, as the env's own setter clips it.
+    """
+    K, N = int(cfg.n_clusters), int(cfg.n_particles)
+    ks = np.clip(np.asarray(rng.choice(np.asarray(k_choices), size=n)), 2, K)
+    blocks = []
+    for k in sorted({int(v) for v in ks}):
+        m = int((ks == k).sum())
+        centres = _sample_centres(cfg, k, m, rng)
+        if cfg.target_rule == "min_mass":
+            sigmas = rng.uniform(cfg.sigma_lo, cfg.sigma_hi, size=(m, k))
+            n_min = rng.integers(cfg.n_min_lo, cfg.n_min_hi + 1, size=m)
+            base = n_min + int(cfg.mass_margin)
+            surplus = N - n_min - (k - 1) * base
+            if (surplus < 0).any():
+                raise ValueError(
+                    f"the env's count rule cannot be satisfied at k={k}: a minimum of up to "
+                    f"{cfg.n_min_hi} plus mass_margin {cfg.mass_margin} needs more than {N} "
+                    "particles (MinMassHuntEnv._sample_counts would retry and raise)")
+            if k == 2:
+                counts = np.stack([n_min, base + surplus], 1)
+            else:
+                cuts = np.sort(rng.integers(0, surplus[:, None] + 1, size=(m, k - 2)), axis=1)
+                parts = np.diff(np.concatenate(
+                    [np.zeros((m, 1), int), cuts, surplus[:, None]], 1), axis=1)
+                counts = np.concatenate([n_min[:, None], base[:, None] + parts], 1)
+            counts = np.take_along_axis(counts, rng.random((m, k)).argsort(1), 1)   # the env permutes
+            target_index = counts.argmin(1)
+        else:
+            sigmas = _sample_sigmas_with_margin(cfg, k, m, rng)
+            share, remainder = divmod(N, k)
+            counts = np.full((m, k), share, int)
+            if remainder:
+                # _equal_counts: the remainder goes to clusters chosen at random, so mass carries
+                # no information about the target
+                np.put_along_axis(counts, rng.random((m, k)).argsort(1)[:, :remainder], share + 1, 1)
+            target_index = sigmas.argmax(1)
+        pos = rng.uniform(0.0, 2.0 * ARENA_SCALE, size=(m, 2))
+        block = _pack(cfg, centres, sigmas, counts, pos, target_index, alive_k=k)
+        block["particles"] = (_draw_clouds(cfg, centres, sigmas, counts, rng)
+                              - pos[:, None]).astype(np.float32)
+        blocks.append(block)
+    return _concatenate_and_shuffle(blocks, rng)
+
+
+def generate_collect_all_layouts(cfg, k_choices, n: int, rng) -> dict:
+    """``ClusterHuntEnv.reset``, vectorised: ALL ``n_clusters`` centres and widths are drawn (the
+    dead ones too, as the collector labels them), ``alive`` is the FIRST ``k`` slots, and the
+    particles are split as equally as possible over the live clusters with the remainder to the
+    FIRST live ones (``_particle_counts``). The env has no target here, so the row's ``target`` /
+    ``target_index`` follow the collector's convention -- the NEAREST LIVE centre -- and the
+    ``task`` objective's labels exist while ``task_nearest`` recomputes its own as it does on a
+    file. ``k`` is clipped to ``[1, n_clusters]``, as the env's own setter clips it.
+    """
+    K, N = int(cfg.n_clusters), int(cfg.n_particles)
+    ks = np.clip(np.asarray(rng.choice(np.asarray(k_choices), size=n)), 1, K)
+    blocks = []
+    for k in sorted({int(v) for v in ks}):
+        m = int((ks == k).sum())
+        centres = _sample_centres(cfg, K, m, rng)
+        sigmas = rng.uniform(cfg.sigma_lo, cfg.sigma_hi, size=(m, K))
+        counts = np.zeros((m, K), int)
+        share, remainder = divmod(N, k)
+        counts[:, :k] = share
+        counts[:, :remainder] += 1
+        pos = rng.uniform(0.0, 2.0 * ARENA_SCALE, size=(m, 2))
+        distance = np.linalg.norm(centres - pos[:, None], axis=-1)
+        distance[:, k:] = np.inf                                   # a dead slot is not a candidate
+        block = _pack(cfg, centres, sigmas, counts, pos, distance.argmin(1), alive_k=k)
+        block["particles"] = (_draw_clouds(cfg, centres, sigmas, counts, rng)
+                              - pos[:, None]).astype(np.float32)
+        blocks.append(block)
+    return _concatenate_and_shuffle(blocks, rng)
 
 
 VARIANTS: dict[str, Variant] = {
@@ -139,6 +330,7 @@ VARIANTS: dict[str, Variant] = {
         default_n_active_curriculum="0:1,0.4:5,1:5",
         default_hit_radius_curriculum="0:1.6,0.4:0.6,1:0.6",
         default_total_timesteps=1_500_000,
+        layout_generator=generate_collect_all_layouts,
     ),
     "least_mass": Variant(
         env_id="pdomains-least-mass-v0",
@@ -149,6 +341,7 @@ VARIANTS: dict[str, Variant] = {
                "3M steps, Curriculum(2, 5, 0.4) (domain_mds/least_mass.md)."),
         default_n_active_curriculum="0:2,0.4:5,1:5",
         default_total_timesteps=3_000_000,
+        layout_generator=generate_pick_target_layouts,
     ),
     "most_var": Variant(
         env_id="pdomains-most-var-v0",
@@ -159,6 +352,7 @@ VARIANTS: dict[str, Variant] = {
                "least_mass; new in 2026-09 (plan 9c-1), no record yet."),
         default_n_active_curriculum="0:2,0.4:5,1:5",
         default_total_timesteps=3_000_000,
+        layout_generator=generate_pick_target_layouts,
     ),
 }
 
@@ -420,8 +614,13 @@ def _schedules(args):
 
 def _run_config_extras(args) -> dict:
     variant = resolve(args.variant)
+    # 2026-09-21 (plan section 3): `env_kwargs` records only what the REGISTRATION overrides, so a
+    # dataclass default is invisible in a run record (least_mass's timeout_penalty was read as 20
+    # from the dataclass while the registration had not yet set 40). `env_config` is the
+    # constructed config, every field of it. Both are kept: no recorded reader changes.
     return dict(episode_cap=episode_cap(args.variant), task=variant.task,
-                env_kwargs=dict(gym.spec(variant.env_id).kwargs))
+                env_kwargs=dict(gym.spec(variant.env_id).kwargs),
+                env_config=_env_config(args.variant).to_dict())
 
 
 def _make_env(variant: str, *, num_particles: int, particle_filter_class: type, seed: int,
@@ -652,6 +851,9 @@ def _collect_metadata_extras(args, options, particles, weights, steps) -> dict:
                 n_clusters=int(_env_config(args.variant).n_clusters),
                 pursuit_frac=args.pursuit_frac, n_active_choices=list(options["n_active_choices"]),
                 env_kwargs=dict(gym.spec(resolve(args.variant).env_id).kwargs),
+                # 2026-09-21 (plan section 3): the CONSTRUCTED config beside the registration's
+                # overrides, so a dataclass default is on the record too (see _run_config_extras).
+                env_config=_env_config(args.variant).to_dict(),
                 label_arrays=["agent", "centers", "alive", "counts", "sigmas", "target",
                               "target_index", "step"])
 
@@ -786,19 +988,53 @@ def save_task_checkpoint(model: TaskEncoderWithHead, path: Path, args, epoch: in
 
 
 def _task_add_arguments(parser, domain=None) -> None:
-    add_task_arguments(parser, dataset_help="The collected hunt dataset (.npz with the label arrays).")
+    # 2026-09-21: every hunt variant declares a layout_generator, so the fresh-layout group is
+    # offered here (Ant-Tag's task objective, which has none, keeps the command line it had).
+    add_task_arguments(parser, dataset_help="The collected hunt dataset (.npz with the label arrays).",
+                       fresh_layouts=True)
 
 
 _task_locate = locate_from_dataset
 
 
 def _task_resolve_arguments(parser, args, domain, encoder) -> None:
-    resolve_task_arguments(parser, args, domain, encoder, collect_hint=_COLLECT_HINT)
+    resolve_task_arguments(parser, args, domain, encoder, collect_hint=_COLLECT_HINT,
+                           fresh_layouts=True)
+
+
+def _generated_task_data(args, device):
+    """The generated (``fresh``) or file-plus-generated (``mixed``) source for the task objective
+    (2026-09-21). The env constants come from the live cfg, the cluster-count draw from
+    ``--k_choices`` or the collector's own, the row budget from ``--fresh_rows_per_epoch``."""
+    variant = resolve(args.variant)
+    cfg = _env_config(args.variant)
+    k_choices = resolve_k_choices(args, N_ACTIVE_CHOICES[variant.task])
+    common = dict(variant=args.variant, env_id=variant.env_id, k_choices=k_choices,
+                  val_rows=int(args.fresh_val_rows), seed=int(args.fresh_seed),
+                  device=torch.device(device), label_arrays=GENERATED_ARRAYS,
+                  val_select=args.val_select)
+    if data_source_of(args) == "fresh":
+        return GeneratedTaskData(variant.layout_generator, cfg, obs_key="agent",
+                                 rows_per_epoch=int(args.fresh_rows_per_epoch),
+                                 particle_scale=ARENA_SCALE, **common)
+    file_data = TaskData(args.data_path, args.val_frac, torch.device(device),
+                         val_sources=parse_val_sources(getattr(args, "val_sources", None)))
+    # The mixed default keeps steps per epoch at twice the file's, which is what the 0.936 / 0.885
+    # standalone runs had; both epoch-counted schedules are tuned at that scale.
+    rows = args.fresh_rows_per_epoch
+    if rows is None:
+        rows = file_data.n_train
+        print(f"--fresh_rows_per_epoch not given; the file's own {rows:,} training rows")
+    return MixedTaskData(file_data, variant.layout_generator, cfg,
+                         rows_per_epoch=int(rows), **common)
 
 
 def _task_prepare(parser, args, domain, encoder, device):
-    data = TaskData(args.data_path, args.val_frac, torch.device(device),
-                    val_sources=parse_val_sources(getattr(args, "val_sources", None)))
+    if data_source_of(args) != "file":
+        data = _generated_task_data(args, device)
+    else:
+        data = TaskData(args.data_path, args.val_frac, torch.device(device),
+                        val_sources=parse_val_sources(getattr(args, "val_sources", None)))
     check_variant_and_geometry(parser, args, data)
     return data
 
