@@ -14,6 +14,11 @@ shared command line (``rl/train.py``) calls in order:
 * ``callbacks(features_extractor_kwargs, encoder_options)`` -- the encoder's logging
   callbacks (CGF: tilt norms, drift, the running-norm refresh; ST: feature statistics).
 
+A fifth hook, ``obs_history(args) -> int``, is the one thing an encoder may say about the ENV:
+how many consecutive base observations it needs stacked into the ``"obs"`` key. It is 1 for
+every arm but ``framestack``, and at 1 the harness builds no wrapper, so the env is unchanged
+(2026-09-22, ``change_mds/framestack_arm_2026-09-22.md``).
+
 The start mode -- pretrained checkpoint, frozen, encoder learning-rate scale, unfreeze step --
 is ONE flag group for every learned encoder (:func:`add_start_mode_arguments`): the generic
 spellings ``--pretrained_path`` / ``--frozen`` / ``--encoder_lr_scale`` / ``--unfreeze_at``
@@ -56,6 +61,7 @@ from set_transformer.rl.feature_extractors.cgf import (
     non_readout_param_count,
     readout_param_count,
 )
+from set_transformer.rl.feature_extractors.framestack import FrameStackFeaturesExtractor
 from set_transformer.rl.feature_extractors.gaussian import WeightedGaussianFeaturesExtractor
 from set_transformer.rl.feature_extractors.pooled import (
     PointNetFeaturesExtractor,
@@ -116,6 +122,11 @@ class Encoder:
     unfreeze_dest: str | None = None
     #: Historical spellings of the four start-mode flags, in that order.
     start_mode_aliases: tuple[tuple[str, ...], ...] = ((), (), (), ())
+    #: ``obs_history(args) -> int``: how many consecutive base observations this encoder needs
+    #: stacked into the ``"obs"`` key of the Dict observation. 1 (the default, every arm but
+    #: ``framestack``) = the current frame only, and the harness then builds NO wrapper at all
+    #: (2026-09-22, change_mds/framestack_arm_2026-09-22.md).
+    obs_history: Callable[[argparse.Namespace], int] = lambda args: 1
 
     def start_mode(self, args: argparse.Namespace) -> StartMode:
         if not self.learned:
@@ -743,6 +754,26 @@ def _pooled_extractor_kwargs(args: argparse.Namespace) -> dict:
                 output_norm=bool(getattr(args, "output_norm", False)))
 
 
+def _framestack_add_arguments(parser: argparse.ArgumentParser, domain: Domain) -> None:
+    g = parser.add_argument_group("framestack encoder")
+    g.add_argument("--n_stack", type=int, default=5,
+                   help="How many consecutive base observations the policy sees, newest last "
+                        "(1 = the current frame only, no stacking). The belief is ignored: this "
+                        "arm is the no-belief control.")
+
+
+def _framestack_resolve_arguments(parser: argparse.ArgumentParser, args: argparse.Namespace,
+                                  domain: Domain) -> None:
+    if domain.name == "odd_even" and int(args.n_stack) > 1:
+        # Odd-Even's base observation is a 1-D step index, [step_count / episode_cap]
+        # (rl/domains/odd_even.py StepIndexObservationWrapper): k copies of it are k
+        # deterministic, perfectly collinear features and carry zero belief information
+        # (plan section 8 trap 6).
+        parser.error("--n_stack > 1 is meaningless on odd_even: its base observation is the "
+                     "deterministic step index, so the stacked frames are collinear and carry "
+                     "no belief information. Use --n_stack 1.")
+
+
 def _kmoments_add_arguments(parser: argparse.ArgumentParser, domain: Domain) -> None:
     g = parser.add_argument_group("kmoments encoder")
     g.add_argument("--k", dest="k_moments", type=int, default=4,
@@ -799,6 +830,17 @@ ENCODERS: dict[str, Encoder] = {
         add_arguments=_kmoments_add_arguments, resolve_arguments=_no_resolution,
         extractor_kwargs=lambda args: dict(k=args.k_moments, arena_scale=args.arena_scale),
         callbacks=lambda kwargs, options: [],
+    ),
+    # The no-belief control (2026-09-22): the policy input is the last --n_stack base
+    # observations concatenated. The stacking is done by the harness, above the PF wrapper
+    # (rl/wrappers/obs_history.py); this entry only declares the flag and the requirement.
+    "framestack": Encoder(
+        name="framestack", extractor_class=FrameStackFeaturesExtractor, learned=False,
+        add_arguments=_framestack_add_arguments,
+        resolve_arguments=_framestack_resolve_arguments,
+        extractor_kwargs=lambda args: dict(n_stack=args.n_stack),
+        callbacks=lambda kwargs, options: [],
+        obs_history=lambda args: int(args.n_stack),
     ),
 }
 

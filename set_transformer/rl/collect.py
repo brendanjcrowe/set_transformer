@@ -222,6 +222,20 @@ def collect_arrays(domain: Domain, args, options: dict, *, progress: bool = True
     collection = collection_of(domain)
     state = collection.prepare(args, options)
     env = collection.make_env(args, options, state)
+    if getattr(args, "behaviour", "scripted") == "policy":
+        # The agent may have been trained on stacked base observations (the framestack arm);
+        # k is recorded in its zip, so the collection env stacks the same number and the
+        # policy sees the input it was trained on. 1 for every other arm: no wrapper is built
+        # and the env is the one every recorded collection rolled (2026-09-22,
+        # change_mds/framestack_arm_2026-09-22.md).
+        from set_transformer.rl.wrappers.obs_history import (   # noqa: PLC0415
+            ObsHistoryDictWrapper, checkpoint_obs_history,
+        )
+        obs_history = checkpoint_obs_history(args.policy_path)
+        if obs_history > 1:
+            env = ObsHistoryDictWrapper(env, obs_history)
+            print(f"Frame stacking: the agent was trained on {obs_history} stacked base "
+                  f"observations; the collection env stacks the same number.")
     centre = collection.particle_centre(args, options)
     policy_act = make_policy_actor(domain, args) if getattr(args, "behaviour", "scripted") == "policy" else None
 

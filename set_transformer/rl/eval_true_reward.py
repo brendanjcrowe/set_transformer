@@ -65,6 +65,7 @@ from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from set_transformer.rl import domains as _domains
 from set_transformer.rl import run_records
 from set_transformer.rl.domains.base import Domain
+from set_transformer.rl.wrappers.obs_history import checkpoint_obs_history, with_obs_history
 
 
 @dataclass
@@ -314,11 +315,20 @@ def main(argv: Sequence[str] | None = None, *, domain: Domain | str | None = Non
             f"--num_particles {args.num_particles} contradicts the checkpoint, "
             f"which was trained with {trained_particles}. Omit the flag.")
 
+    # 2. The frame count, off the same zip: the framestack arm's env stacks the last k base
+    # observations, and k is recorded in the checkpoint's features_extractor_kwargs, so no
+    # eval-side flag exists and a mismatch is impossible by construction (2026-09-22,
+    # change_mds/framestack_arm_2026-09-22.md). 1 for every other arm: the thunk is unchanged.
+    obs_history = checkpoint_obs_history(args.model_path)
+    if obs_history > 1:
+        print(f"Frame stacking: the checkpoint was trained on {obs_history} stacked base "
+              f"observations; the eval env stacks the same number.")
+
     # 3. The domain's eval env; VecNormalize frozen and without reward normalisation.
-    env = DummyVecEnv([domain.make_env(
+    env = DummyVecEnv([with_obs_history(domain.make_env(
         args.variant, num_particles=args.num_particles,
         particle_filter_class=variant.particle_filter, seed=args.seed, rank=0,
-        monitor_dir=None, training=False, options=evaluation.options(args))])
+        monitor_dir=None, training=False, options=evaluation.options(args)), obs_history)])
     if args.vecnormalize_path and os.path.exists(args.vecnormalize_path):
         env = VecNormalize.load(args.vecnormalize_path, env)
         env.training = False

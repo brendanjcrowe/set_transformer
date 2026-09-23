@@ -59,6 +59,7 @@ from set_transformer.rl.encoder_finetune import (
 )
 from set_transformer.rl.encoders import Encoder
 from set_transformer.rl.pretrained_encoder import policy_extractors, reload_pretrained
+from set_transformer.rl.wrappers.obs_history import checkpoint_obs_history, with_obs_history
 
 ALGORITHMS = {"PPO": PPO, "SAC": SAC}
 
@@ -89,6 +90,8 @@ def train(
     n_envs: int = 4,
     seed: int = 0,
     use_vec_normalize: bool = True,
+    # frame stacking (the framestack arm only; 1 = no wrapper, every other arm unchanged)
+    obs_history: int = 1,
     # the schedules (the domain's, with this run's waypoints) and encoder-side options
     schedules: Sequence[Schedule] = (),
     encoder_options: dict | None = None,
@@ -129,8 +132,10 @@ def train(
     (CGF: ``running_norm_update``). ``ent_coef`` is PPO's entropy bonus (0.0 = SB3's default);
     ``separate_extractors`` gives the value network its own features extractor
     (``share_features_extractor=False``, the recorded hunt configuration) instead of sharing
-    the actor's; both PPO only (batch 9.1, 2026-09-13). ``post_construct(model)`` runs after
-    every built-in post-construction step.
+    the actor's; both PPO only (batch 9.1, 2026-09-13). ``obs_history`` is how many consecutive
+    base observations the ``"obs"`` key carries (``Encoder.obs_history``; 1 = the current frame
+    only and NO wrapper is built, which is every arm but ``framestack``).
+    ``post_construct(model)`` runs after every built-in post-construction step.
     """
     domain = _domains.get(domain)
     enc = _encoders.get(encoder)
@@ -202,8 +207,12 @@ def train(
     # -- envs: training workers, then the eval env at the next rank -------------------------
     common = dict(num_particles=num_particles, particle_filter_class=particle_filter_class,
                   seed=seed, options=env_options)
+    # `with_obs_history` returns the thunk UNCHANGED at obs_history == 1 (every arm but
+    # framestack), so no wrapper object exists and the env is the one of every recorded run.
     env_fns = [
-        domain.make_env(variant, rank=rank, monitor_dir=monitor_dir, training=True, **common)
+        with_obs_history(
+            domain.make_env(variant, rank=rank, monitor_dir=monitor_dir, training=True, **common),
+            obs_history)
         for rank in range(n_envs)
     ]
     vec_env = domain.make_vec_env_from_fns(env_fns, n_envs)
@@ -221,7 +230,9 @@ def train(
     # curriculum currently is. EvalCallback syncs the training VecNormalize statistics into
     # this one before every eval.
     eval_vec_env = DummyVecEnv([
-        domain.make_env(variant, rank=n_envs + 1, monitor_dir=None, training=False, **common)
+        with_obs_history(
+            domain.make_env(variant, rank=n_envs + 1, monitor_dir=None, training=False, **common),
+            obs_history)
     ])
     if use_vec_normalize:
         eval_vec_env = domain.make_vec_normalize(eval_vec_env, training=False, norm_reward=False)
@@ -253,6 +264,14 @@ def train(
                              target_kl=target_kl, ent_coef=ent_coef, seed=seed).items()
             if getattr(model, k) != v
         }
+        # n_stack is NOT a PPO attribute (`getattr(model, "n_stack")` raises on every
+        # checkpoint), so it cannot join the dict above. It travels inside the zip's
+        # policy_kwargs and is compared separately. Every arm but framestack has k == 1 on
+        # both sides: nothing is added and the message is the one of every recorded fork
+        # (2026-09-22, change_mds/framestack_arm_2026-09-22.md, plan section 11A).
+        stored_obs_history = checkpoint_obs_history(resume_from)
+        if stored_obs_history != int(obs_history):
+            mismatched["n_stack"] = (stored_obs_history, int(obs_history))
         if mismatched:
             raise ValueError(f"--resume_from checkpoint disagrees with the CLI on "
                              f"{mismatched} (stored, given); pass the source run's values")
@@ -710,6 +729,7 @@ def _train_from_args(domain, args, encoder, start, net_arch, particle_filter_cla
         n_envs=args.n_envs,
         seed=args.seed,
         use_vec_normalize=not args.no_vec_normalize,
+        obs_history=encoder.obs_history(args),
         schedules=domain.schedules(args),
         encoder_options=encoder.encoder_options(args),
         algorithm=args.algorithm,

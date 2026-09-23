@@ -187,7 +187,8 @@ def test_unknown_domain_is_refused_with_the_list():
 
 
 def test_encoder_table_names_the_package_classes_and_their_checkpoint_kwarg():
-    assert sorted(encoders.ENCODERS) == ["cgf", "deepset", "gaussian", "kmoments", "pointnet", "st"]
+    assert sorted(encoders.ENCODERS) == ["cgf", "deepset", "framestack", "gaussian", "kmoments",
+                                         "pointnet", "st"]
     assert encoders.ENCODERS["cgf"].extractor_class is WeightedCGFFeaturesExtractor
     assert encoders.ENCODERS["st"].extractor_class is SetTransformerFeaturesExtractor
     assert encoders.ENCODERS["deepset"].extractor_class is WeightedDeepSetFeaturesExtractor
