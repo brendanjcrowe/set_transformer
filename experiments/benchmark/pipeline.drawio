@@ -1,124 +1,317 @@
-<mxfile host="app.diagrams.net" type="device">
-  <diagram id="cycle" name="Training cycle">
-    <mxGraphModel dx="1400" dy="900" grid="1" gridSize="10" guides="1" tooltips="1" connect="1"
-                  arrows="1" fold="1" page="1" pageScale="1" pageWidth="1654" pageHeight="1169"
-                  math="0" shadow="0">
-      <root>
-        <mxCell id="0"/>
-        <mxCell id="1" parent="0"/>
-<mxCell id="n1" value="Belief-encoder training cycle" style="text;html=1;fontSize=20;fontStyle=1;align=left;verticalAlign=middle;" vertex="1" parent="1"><mxGeometry x="40" y="20" width="1580" height="40" as="geometry"/></mxCell>
-<mxCell id="n2" value="Environment" style="rounded=0;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#9E9E9E;dashed=1;verticalAlign=top;align=left;fontStyle=1;fontSize=14;spacingLeft=10;spacingTop=6;" vertex="1" parent="1"><mxGeometry x="60" y="150" width="290" height="300" as="geometry"/></mxCell>
-<mxCell id="n3" value="POMDP
-hidden state, partial observations,
-a task the belief is needed for" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;" vertex="1" parent="1"><mxGeometry x="85" y="200" width="240" height="95" as="geometry"/></mxCell>
-<mxCell id="n4" value="the cycle below is env-agnostic:
-nothing in it is specialised to a domain" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontSize=11;" vertex="1" parent="1"><mxGeometry x="85" y="320" width="240" height="90" as="geometry"/></mxCell>
-<mxCell id="n5" value="Particle filter
-the belief as an unordered SET
-of weighted hypotheses" style="ellipse;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;dashed=1;fontSize=11;align=center;" vertex="1" parent="1"><mxGeometry x="410" y="240" width="240" height="130" as="geometry"/></mxCell>
-<mxCell id="n6" value="Belief encoder   φ : particle set → fixed-width code" style="rounded=0;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#9E9E9E;dashed=1;verticalAlign=top;align=left;fontStyle=1;fontSize=14;spacingLeft=10;spacingTop=6;" vertex="1" parent="1"><mxGeometry x="700" y="110" width="540" height="310" as="geometry"/></mxCell>
-<mxCell id="n7" value="Set Transformer
-attention + learned pooling" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=12;fontStyle=1;" vertex="1" parent="1"><mxGeometry x="725" y="165" width="245" height="65" as="geometry"/></mxCell>
-<mxCell id="n8" value="DeepSet
-sum-pool" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=12;fontStyle=1;" vertex="1" parent="1"><mxGeometry x="995" y="165" width="220" height="65" as="geometry"/></mxCell>
-<mxCell id="n9" value="PointNet
-max-pool" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=12;fontStyle=1;" vertex="1" parent="1"><mxGeometry x="725" y="245" width="245" height="65" as="geometry"/></mxCell>
-<mxCell id="n10" value="CGF
-cumulant-generating function
-at learned points" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=12;fontStyle=1;" vertex="1" parent="1"><mxGeometry x="995" y="245" width="220" height="65" as="geometry"/></mxCell>
-<mxCell id="n11" value="analytic baselines, 0 parameters:  mean + covariance  ·  k moments" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontSize=11;" vertex="1" parent="1"><mxGeometry x="725" y="330" width="490" height="55" as="geometry"/></mxCell>
-<mxCell id="n12" value="Pretraining data collection" style="rounded=0;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#9E9E9E;dashed=1;verticalAlign=top;align=left;fontStyle=1;fontSize=14;spacingLeft=10;spacingTop=6;" vertex="1" parent="1"><mxGeometry x="700" y="450" width="540" height="150" as="geometry"/></mxCell>
-<mxCell id="n13" value="roll the same belief pipeline
-the agent will run" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;" vertex="1" parent="1"><mxGeometry x="725" y="495" width="250" height="80" as="geometry"/></mxCell>
-<mxCell id="n14" value="belief snapshots
-[ N × particles × d ]" style="shape=note;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;size=14;fontSize=11;align=center;" vertex="1" parent="1"><mxGeometry x="995" y="495" width="220" height="80" as="geometry"/></mxCell>
-<mxCell id="n15" value="Pairwise belief distance
-(EMD between particle sets)" style="ellipse;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;dashed=1;fontSize=11;align=center;" vertex="1" parent="1"><mxGeometry x="410" y="620" width="240" height="115" as="geometry"/></mxCell>
-<mxCell id="n16" value="Latent metric alignment
-similar beliefs → similar codes" style="ellipse;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;dashed=1;fontSize=11;align=center;" vertex="1" parent="1"><mxGeometry x="700" y="630" width="255" height="115" as="geometry"/></mxCell>
-<mxCell id="n17" value="Pretraining objective
-reconstruct · align · regress the mean" style="ellipse;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;dashed=1;fontSize=11;align=center;" vertex="1" parent="1"><mxGeometry x="1000" y="630" width="245" height="115" as="geometry"/></mxCell>
-<mxCell id="n18" value="Capacity fairness
-matched bottleneck,
-comparable parameter counts" style="ellipse;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;dashed=1;fontSize=11;align=center;" vertex="1" parent="1"><mxGeometry x="1300" y="100" width="240" height="110" as="geometry"/></mxCell>
-<mxCell id="n19" value="Reinforcement learning" style="rounded=0;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#9E9E9E;dashed=1;verticalAlign=top;align=left;fontStyle=1;fontSize=14;spacingLeft=10;spacingTop=6;" vertex="1" parent="1"><mxGeometry x="1310" y="250" width="320" height="300" as="geometry"/></mxCell>
-<mxCell id="n20" value="policy conditioned on
-observation  ++  belief code" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=12;" vertex="1" parent="1"><mxGeometry x="1335" y="300" width="270" height="80" as="geometry"/></mxCell>
-<mxCell id="n21" value="encoder used frozen, fine-tuned,
-or trained from scratch" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=12;" vertex="1" parent="1"><mxGeometry x="1335" y="395" width="270" height="70" as="geometry"/></mxCell>
-<mxCell id="n22" value="train, then evaluate on the task reward" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontSize=11;" vertex="1" parent="1"><mxGeometry x="1335" y="480" width="270" height="50" as="geometry"/></mxCell>
-<mxCell id="n23" value="Comparison" style="rounded=0;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#9E9E9E;dashed=1;verticalAlign=top;align=left;fontStyle=1;fontSize=14;spacingLeft=10;spacingTop=6;" vertex="1" parent="1"><mxGeometry x="1310" y="590" width="320" height="145" as="geometry"/></mxCell>
-<mxCell id="n24" value="does a learned set encoder of the belief
-beat an analytic summary of the same belief?
-learning curves · success · sample efficiency" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;" vertex="1" parent="1"><mxGeometry x="1335" y="635" width="270" height="85" as="geometry"/></mxCell>
-<mxCell id="e25" value="belief" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=11;endArrow=blockThin;endFill=1;strokeWidth=2;" edge="1" parent="1" source="n2" target="n5"><mxGeometry relative="1" as="geometry"/></mxCell>
-<mxCell id="e26" value="collect" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=11;endArrow=blockThin;endFill=1;strokeWidth=2;" edge="1" parent="1" source="n5" target="n12"><mxGeometry relative="1" as="geometry"/></mxCell>
-<mxCell id="e27" value="pretrain" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=11;endArrow=blockThin;endFill=1;strokeWidth=2;" edge="1" parent="1" source="n12" target="n6"><mxGeometry relative="1" as="geometry"/></mxCell>
-<mxCell id="e28" value="features" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=11;endArrow=blockThin;endFill=1;strokeWidth=2;" edge="1" parent="1" source="n6" target="n19"><mxGeometry relative="1" as="geometry"/></mxCell>
-<mxCell id="e29" value="belief at RL time" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=11;endArrow=blockThin;endFill=1;strokeWidth=2;exitX=1;exitY=0.2;exitDx=0;exitDy=0;entryX=0;entryY=0.15;entryDx=0;entryDy=0;" edge="1" parent="1" source="n5" target="n19"><mxGeometry relative="1" as="geometry"/></mxCell>
-<mxCell id="e30" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=11;endArrow=blockThin;endFill=1;strokeWidth=2;" edge="1" parent="1" source="n19" target="n23"><mxGeometry relative="1" as="geometry"/></mxCell>
-<mxCell id="e31" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=10;dashed=1;strokeColor=#d6b656;endArrow=open;endFill=0;" edge="1" parent="1" source="n15" target="n16"><mxGeometry relative="1" as="geometry"/></mxCell>
-<mxCell id="e32" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=10;dashed=1;strokeColor=#d6b656;endArrow=open;endFill=0;" edge="1" parent="1" source="n16" target="n17"><mxGeometry relative="1" as="geometry"/></mxCell>
-<mxCell id="e33" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=10;dashed=1;strokeColor=#d6b656;endArrow=open;endFill=0;exitX=0.5;exitY=0;exitDx=0;exitDy=0;entryX=0.9;entryY=1;entryDx=0;entryDy=0;" edge="1" parent="1" source="n17" target="n6"><mxGeometry relative="1" as="geometry"/></mxCell>
-<mxCell id="e34" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=10;dashed=1;strokeColor=#d6b656;endArrow=open;endFill=0;exitX=0;exitY=0.5;exitDx=0;exitDy=0;entryX=1;entryY=0.05;entryDx=0;entryDy=0;" edge="1" parent="1" source="n18" target="n6"><mxGeometry relative="1" as="geometry"/></mxCell>
-<mxCell id="e35" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=10;dashed=1;strokeColor=#d6b656;endArrow=open;endFill=0;exitX=0;exitY=0.7;exitDx=0;exitDy=0;entryX=1;entryY=0.3;entryDx=0;entryDy=0;" edge="1" parent="1" source="n12" target="n15"><mxGeometry relative="1" as="geometry"/></mxCell>
-      </root>
-    </mxGraphModel>
-  </diagram>
-  <diagram id="methods" name="Method matrix">
-    <mxGraphModel dx="1400" dy="900" grid="1" gridSize="10" guides="1" tooltips="1" connect="1"
-                  arrows="1" fold="1" page="1" pageScale="1" pageWidth="1654" pageHeight="1169"
-                  math="0" shadow="0">
-      <root>
-        <mxCell id="0"/>
-        <mxCell id="1" parent="0"/>
-<mxCell id="n1" value="Methods — 30 cells.  Every LEARNED encoder shares stat_dim = 16 and sits within 15% on parameter count (CGF exempt: ~1.2k by design).  Gaussian and k-moments are analytic at 0 parameters." style="rounded=0;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#9E9E9E;dashed=1;verticalAlign=top;align=left;fontStyle=1;fontSize=13;spacingLeft=8;spacingTop=4;" vertex="1" parent="1"><mxGeometry x="40" y="30" width="1180" height="50" as="geometry"/></mxCell>
-<mxCell id="n2" value="Analytic baselines (no learned particle-side parameters)" style="rounded=0;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#9E9E9E;dashed=1;verticalAlign=top;align=left;fontStyle=1;fontSize=13;spacingLeft=8;spacingTop=4;" vertex="1" parent="1"><mxGeometry x="40" y="100" width="560" height="110" as="geometry"/></mxCell>
-<mxCell id="n3" value="gaussian
-mean + covariance" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontSize=11;" vertex="1" parent="1"><mxGeometry x="60" y="140" width="250" height="55" as="geometry"/></mxCell>
-<mxCell id="n4" value="kmoments
-first k=4 moments" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontSize=11;" vertex="1" parent="1"><mxGeometry x="330" y="140" width="250" height="55" as="geometry"/></mxCell>
-<mxCell id="n5" value="Trained from scratch with the policy" style="rounded=0;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#9E9E9E;dashed=1;verticalAlign=top;align=left;fontStyle=1;fontSize=13;spacingLeft=8;spacingTop=4;" vertex="1" parent="1"><mxGeometry x="640" y="100" width="580" height="110" as="geometry"/></mxCell>
-<mxCell id="n6" value="st_scratch" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;align=center;verticalAlign=middle;fontSize=11;" vertex="1" parent="1"><mxGeometry x="660" y="140" width="125" height="55" as="geometry"/></mxCell>
-<mxCell id="n7" value="deepset" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;align=center;verticalAlign=middle;fontSize=11;" vertex="1" parent="1"><mxGeometry x="800" y="140" width="125" height="55" as="geometry"/></mxCell>
-<mxCell id="n8" value="pointnet" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;align=center;verticalAlign=middle;fontSize=11;" vertex="1" parent="1"><mxGeometry x="940" y="140" width="125" height="55" as="geometry"/></mxCell>
-<mxCell id="n9" value="cgf" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;align=center;verticalAlign=middle;fontSize=11;" vertex="1" parent="1"><mxGeometry x="1080" y="140" width="125" height="55" as="geometry"/></mxCell>
-<mxCell id="n10" value="Pretrained: {ST, DeepSet, PointNet, CGF} × {plain, align, mean} × {frozen, finetune} = 24 cells" style="rounded=0;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#9E9E9E;dashed=1;verticalAlign=top;align=left;fontStyle=1;fontSize=13;spacingLeft=8;spacingTop=4;" vertex="1" parent="1"><mxGeometry x="40" y="240" width="1180" height="330" as="geometry"/></mxCell>
-<mxCell id="n11" value="ST" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;" vertex="1" parent="1"><mxGeometry x="200" y="285" width="230" height="35" as="geometry"/></mxCell>
-<mxCell id="n12" value="DeepSet" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;" vertex="1" parent="1"><mxGeometry x="450" y="285" width="230" height="35" as="geometry"/></mxCell>
-<mxCell id="n13" value="PointNet" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;" vertex="1" parent="1"><mxGeometry x="700" y="285" width="230" height="35" as="geometry"/></mxCell>
-<mxCell id="n14" value="CGF" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;" vertex="1" parent="1"><mxGeometry x="950" y="285" width="230" height="35" as="geometry"/></mxCell>
-<mxCell id="n15" value="reconstruction" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontSize=11;" vertex="1" parent="1"><mxGeometry x="55" y="335" width="135" height="60" as="geometry"/></mxCell>
-<mxCell id="n16" value="st_frozen
-st_finetune" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;align=center;verticalAlign=middle;fontSize=11;" vertex="1" parent="1"><mxGeometry x="200" y="335" width="230" height="60" as="geometry"/></mxCell>
-<mxCell id="n17" value="ds_frozen
-ds_finetune" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;align=center;verticalAlign=middle;fontSize=11;" vertex="1" parent="1"><mxGeometry x="450" y="335" width="230" height="60" as="geometry"/></mxCell>
-<mxCell id="n18" value="pn_frozen
-pn_finetune" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;align=center;verticalAlign=middle;fontSize=11;" vertex="1" parent="1"><mxGeometry x="700" y="335" width="230" height="60" as="geometry"/></mxCell>
-<mxCell id="n19" value="cgf_frozen
-cgf_finetune" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;align=center;verticalAlign=middle;fontSize=11;" vertex="1" parent="1"><mxGeometry x="950" y="335" width="230" height="60" as="geometry"/></mxCell>
-<mxCell id="n20" value="+ alignment" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontSize=11;" vertex="1" parent="1"><mxGeometry x="55" y="410" width="135" height="60" as="geometry"/></mxCell>
-<mxCell id="n21" value="st_align_frozen
-st_align_finetune" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;align=center;verticalAlign=middle;fontSize=11;" vertex="1" parent="1"><mxGeometry x="200" y="410" width="230" height="60" as="geometry"/></mxCell>
-<mxCell id="n22" value="ds_align_frozen
-ds_align_finetune" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;align=center;verticalAlign=middle;fontSize=11;" vertex="1" parent="1"><mxGeometry x="450" y="410" width="230" height="60" as="geometry"/></mxCell>
-<mxCell id="n23" value="pn_align_frozen
-pn_align_finetune" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;align=center;verticalAlign=middle;fontSize=11;" vertex="1" parent="1"><mxGeometry x="700" y="410" width="230" height="60" as="geometry"/></mxCell>
-<mxCell id="n24" value="cgf_align_frozen
-cgf_align_finetune" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;align=center;verticalAlign=middle;fontSize=11;" vertex="1" parent="1"><mxGeometry x="950" y="410" width="230" height="60" as="geometry"/></mxCell>
-<mxCell id="n25" value="mean regression" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontSize=11;" vertex="1" parent="1"><mxGeometry x="55" y="485" width="135" height="60" as="geometry"/></mxCell>
-<mxCell id="n26" value="st_mean_frozen
-st_mean_finetune" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;align=center;verticalAlign=middle;fontSize=11;" vertex="1" parent="1"><mxGeometry x="200" y="485" width="230" height="60" as="geometry"/></mxCell>
-<mxCell id="n27" value="ds_mean_frozen
-ds_mean_finetune" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;align=center;verticalAlign=middle;fontSize=11;" vertex="1" parent="1"><mxGeometry x="450" y="485" width="230" height="60" as="geometry"/></mxCell>
-<mxCell id="n28" value="pn_mean_frozen
-pn_mean_finetune" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;align=center;verticalAlign=middle;fontSize=11;" vertex="1" parent="1"><mxGeometry x="700" y="485" width="230" height="60" as="geometry"/></mxCell>
-<mxCell id="n29" value="cgf_mean_frozen
-cgf_mean_finetune" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;align=center;verticalAlign=middle;fontSize=11;" vertex="1" parent="1"><mxGeometry x="950" y="485" width="230" height="60" as="geometry"/></mxCell>
-<mxCell id="n30" value="frozen = encoder weights fixed, only the shared head trains.
-finetune = encoder trains end-to-end with the policy.
-A cell with no checkpoint for its (env, encoder, arm) is left BLANK in the results matrix — it is not an error." style="rounded=0;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#9E9E9E;dashed=1;verticalAlign=top;align=left;fontStyle=1;fontSize=13;spacingLeft=8;spacingTop=4;" vertex="1" parent="1"><mxGeometry x="40" y="600" width="1180" height="80" as="geometry"/></mxCell>
-      </root>
-    </mxGraphModel>
-  </diagram>
+<mxfile host="65bd71144e">
+    <diagram id="fig1" name="Figure 1">
+        <mxGraphModel dx="1660" dy="1130" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="960" pageHeight="660" math="0" shadow="0">
+            <root>
+                <mxCell id="0"/>
+                <mxCell id="1" parent="0"/>
+                <mxCell id="f1" value="Offline — belief-encoder pretraining" style="rounded=0;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#9E9E9E;dashed=1;verticalAlign=top;align=left;fontStyle=1;fontSize=15;spacingLeft=10;spacingTop=6;" parent="1" vertex="1">
+                    <mxGeometry x="30" y="30" width="900" height="175" as="geometry"/>
+                </mxCell>
+                <mxCell id="f2" value="environment rollouts&lt;br&gt;&lt;i&gt;h&lt;sub&gt;t&lt;/sub&gt;&lt;/i&gt;" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=14;" parent="1" vertex="1">
+                    <mxGeometry x="55" y="85" width="150" height="70" as="geometry"/>
+                </mxCell>
+                <mxCell id="f3" value="belief snapshots&lt;br&gt;{ β̂&lt;sup&gt;(k)&lt;/sup&gt; }" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=14;" parent="1" vertex="1">
+                    <mxGeometry x="245" y="85" width="150" height="70" as="geometry"/>
+                </mxCell>
+                <mxCell id="f4" value="pretraining objective&lt;br&gt;&lt;br&gt;reconstruction&lt;br&gt;metric alignment&lt;br&gt;task regression" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=14;" parent="1" vertex="1">
+                    <mxGeometry x="435" y="68" width="190" height="120" as="geometry"/>
+                </mxCell>
+                <mxCell id="f5" value="pretrained encoder&lt;br&gt;φ&lt;sup&gt;∗&lt;/sup&gt;" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=15;" parent="1" vertex="1">
+                    <mxGeometry x="675" y="85" width="150" height="70" as="geometry"/>
+                </mxCell>
+                <mxCell id="fe6" value="filter" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=13;endArrow=blockThin;endFill=1;strokeWidth=2;labelBackgroundColor=#FFFFFF;" parent="1" source="f2" target="f3" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="fe7" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=13;endArrow=blockThin;endFill=1;strokeWidth=2;labelBackgroundColor=#FFFFFF;" parent="1" source="f3" target="f4" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="fe8" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=13;endArrow=blockThin;endFill=1;strokeWidth=2;labelBackgroundColor=#FFFFFF;" parent="1" source="f4" target="f5" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="f9" value="Online — reinforcement learning" style="rounded=0;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#9E9E9E;dashed=1;verticalAlign=top;align=left;fontStyle=1;fontSize=15;spacingLeft=10;spacingTop=6;" parent="1" vertex="1">
+                    <mxGeometry x="30" y="240" width="900" height="300" as="geometry"/>
+                </mxCell>
+                <mxCell id="f10" value="POMDP&lt;br&gt;environment" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=15;" parent="1" vertex="1">
+                    <mxGeometry x="55" y="300" width="130" height="75" as="geometry"/>
+                </mxCell>
+                <mxCell id="f11" value="particle filter" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=14;" parent="1" vertex="1">
+                    <mxGeometry x="225" y="300" width="130" height="75" as="geometry"/>
+                </mxCell>
+                <mxCell id="f12" value="agent — identical for every method" style="rounded=1;arcSize=6;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#555555;verticalAlign=top;align=left;fontStyle=1;fontSize=14;spacingLeft=10;spacingTop=6;" parent="1" vertex="1">
+                    <mxGeometry x="400" y="285" width="510" height="175" as="geometry"/>
+                </mxCell>
+                <mxCell id="f13" value="&lt;i&gt;x&lt;sub&gt;t&lt;/sub&gt;&lt;/i&gt; → obs-MLP [64, 64]" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=14;" parent="1" vertex="1">
+                    <mxGeometry x="420" y="325" width="220" height="45" as="geometry"/>
+                </mxCell>
+                <mxCell id="f14" value="φ&lt;br&gt;&lt;font style=&quot;font-size:12px&quot;&gt;encoder slot&lt;/font&gt;" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;dashed=1;strokeWidth=3;fontSize=17;fontStyle=1;" parent="1" vertex="1">
+                    <mxGeometry x="420" y="390" width="220" height="50" as="geometry"/>
+                </mxCell>
+                <mxCell id="f15" value="concat&lt;br&gt;→ 128" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=14;" parent="1" vertex="1">
+                    <mxGeometry x="670" y="340" width="90" height="80" as="geometry"/>
+                </mxCell>
+                <mxCell id="f16" value="policy π&lt;br&gt;value &lt;i&gt;V&lt;/i&gt;" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=14;" parent="1" vertex="1">
+                    <mxGeometry x="790" y="340" width="100" height="80" as="geometry"/>
+                </mxCell>
+                <mxCell id="fe17" value="&lt;i&gt;o&lt;sub&gt;t&lt;/sub&gt;&lt;/i&gt;, &lt;i&gt;a&lt;sub&gt;t&lt;/sub&gt;&lt;/i&gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=13;endArrow=blockThin;endFill=1;strokeWidth=2;labelBackgroundColor=#FFFFFF;" parent="1" source="f10" target="f11" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="fe18" value="&lt;i&gt;x&lt;sub&gt;t&lt;/sub&gt;&lt;/i&gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=13;endArrow=blockThin;endFill=1;strokeWidth=2;labelBackgroundColor=#FFFFFF;exitX=0.5;exitY=0;exitDx=0;exitDy=0;entryX=0;entryY=0.4;entryDx=0;entryDy=0;" parent="1" source="f10" target="f13" edge="1">
+                    <mxGeometry relative="1" as="geometry">
+                        <Array as="points">
+                            <mxPoint x="120" y="272"/>
+                            <mxPoint x="390" y="272"/>
+                        </Array>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="fe19" value="&lt;i&gt;P&lt;sub&gt;t&lt;/sub&gt;&lt;/i&gt; = β̂&lt;sub&gt;t&lt;/sub&gt; particles" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=13;endArrow=blockThin;endFill=1;strokeWidth=2;labelBackgroundColor=#FFFFFF;exitX=1;exitY=0.6;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" parent="1" source="f11" target="f14" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="fe20" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=13;endArrow=blockThin;endFill=1;strokeWidth=2;labelBackgroundColor=#FFFFFF;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.25;entryDx=0;entryDy=0;" parent="1" source="f13" target="f15" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="fe21" value="16" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=13;endArrow=blockThin;endFill=1;strokeWidth=2;labelBackgroundColor=#FFFFFF;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.75;entryDx=0;entryDy=0;" parent="1" source="f14" target="f15" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="fe22" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=13;endArrow=blockThin;endFill=1;strokeWidth=2;labelBackgroundColor=#FFFFFF;" parent="1" source="f15" target="f16" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="fe23" value="&lt;i&gt;a&lt;sub&gt;t&lt;/sub&gt;&lt;/i&gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=13;endArrow=blockThin;endFill=1;strokeWidth=2;labelBackgroundColor=#FFFFFF;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=1;entryDx=0;entryDy=0;" parent="1" source="f16" target="f10" edge="1">
+                    <mxGeometry relative="1" as="geometry">
+                        <Array as="points">
+                            <mxPoint x="840" y="500"/>
+                            <mxPoint x="120" y="500"/>
+                        </Array>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="fe24" value="frozen / fine-tuned" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=13;dashed=1;endArrow=blockThin;endFill=1;strokeColor=#d79b00;strokeWidth=2;labelBackgroundColor=#FFFFFF;exitX=0.5;exitY=1;exitDx=0;exitDy=0;" parent="1" source="f5" edge="1">
+                    <mxGeometry relative="1" as="geometry">
+                        <Array as="points">
+                            <mxPoint x="750" y="430"/>
+                            <mxPoint x="640" y="430"/>
+                        </Array>
+                        <mxPoint x="630" y="430" as="targetPoint"/>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="f25" value="plugs into the φ slot:  &lt;b&gt;analytic&lt;/b&gt; (0 parameters): mean + covariance · k-moments   &lt;b&gt;learned&lt;/b&gt; (16-d code, matched parameter count): Set Transformer · DeepSet · PointNet · CGF   &lt;i&gt;or trained from scratch, with no pretrained φ&lt;sup&gt;∗&lt;/sup&gt;&lt;/i&gt;" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#BBBBBB;fontSize=13;" parent="1" vertex="1">
+                    <mxGeometry x="30" y="560" width="900" height="75" as="geometry"/>
+                </mxCell>
+            </root>
+        </mxGraphModel>
+    </diagram>
+    <diagram id="cycle" name="Training cycle">
+        <mxGraphModel dx="1660" dy="1130" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1654" pageHeight="1169" math="0" shadow="0">
+            <root>
+                <mxCell id="0"/>
+                <mxCell id="1" parent="0"/>
+                <mxCell id="n1" value="Belief-encoder training cycle" style="text;html=1;fontSize=20;fontStyle=1;align=left;verticalAlign=middle;" parent="1" vertex="1">
+                    <mxGeometry x="40" y="20" width="1580" height="40" as="geometry"/>
+                </mxCell>
+                <mxCell id="20" value="&lt;i&gt;T, Z, b₀&lt;/i&gt; + oₜ, aₜ" style="edgeStyle=none;html=1;entryX=0;entryY=0.5;entryDx=0;entryDy=0;labelBackgroundColor=#FFFFFF;fontSize=11;" parent="1" source="n3" target="n5" edge="1">
+                    <mxGeometry relative="1" as="geometry">
+                        <mxPoint x="360" y="180" as="targetPoint"/>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="27" style="edgeStyle=none;html=1;entryX=0;entryY=0.707;entryDx=0;entryDy=0;exitX=1;exitY=0.75;exitDx=0;exitDy=0;entryPerimeter=0;" edge="1" parent="1" source="n3" target="n6">
+                    <mxGeometry relative="1" as="geometry">
+                        <Array as="points">
+                            <mxPoint x="320" y="280"/>
+                            <mxPoint x="500" y="280"/>
+                        </Array>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="28" value="Text" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];" vertex="1" connectable="0" parent="27">
+                    <mxGeometry x="0.375" y="2" relative="1" as="geometry">
+                        <mxPoint as="offset"/>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="n3" value="POMDP Environment&lt;br&gt;&lt;br&gt;&lt;i&gt;(S, A, O, T, Z, R, γ, b₀)&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;" parent="1" vertex="1">
+                    <mxGeometry x="80" y="80" width="240" height="160" as="geometry"/>
+                </mxCell>
+                <mxCell id="n5" value="Particle filter the belief as an unordered SET of weighted hypotheses" style="rounded=1;arcSize=20;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;dashed=1;fontSize=11;align=center;" parent="1" vertex="1">
+                    <mxGeometry x="440" y="80" width="240" height="160" as="geometry"/>
+                </mxCell>
+                <mxCell id="n6" value="" style="rounded=0;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#9E9E9E;dashed=1;verticalAlign=top;align=left;fontStyle=1;fontSize=14;spacingLeft=10;spacingTop=6;" parent="1" vertex="1">
+                    <mxGeometry x="880" y="80" width="520" height="280" as="geometry"/>
+                </mxCell>
+                <mxCell id="n7" value="Set Transformer" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=12;fontStyle=1;" parent="1" vertex="1">
+                    <mxGeometry x="920" y="120" width="200" height="80" as="geometry"/>
+                </mxCell>
+                <mxCell id="n8" value="DeepSet sum-pool" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=12;fontStyle=1;" parent="1" vertex="1">
+                    <mxGeometry x="1160" y="120" width="200" height="80" as="geometry"/>
+                </mxCell>
+                <mxCell id="n9" value="PointNet&amp;nbsp;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=12;fontStyle=1;" parent="1" vertex="1">
+                    <mxGeometry x="920" y="240" width="200" height="80" as="geometry"/>
+                </mxCell>
+                <mxCell id="n10" value="CGF" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=12;fontStyle=1;" parent="1" vertex="1">
+                    <mxGeometry x="1160" y="240" width="200" height="80" as="geometry"/>
+                </mxCell>
+                <mxCell id="16" value="belief pairs" style="edgeStyle=none;html=1;entryX=0.5;entryY=0;entryDx=0;entryDy=0;labelBackgroundColor=#FFFFFF;fontSize=11;exitX=0.218;exitY=1;exitDx=0;exitDy=0;exitPerimeter=0;" parent="1" source="n12" target="n15" edge="1">
+                    <mxGeometry relative="1" as="geometry">
+                        <Array as="points"/>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="n12" value="Pretraining data collection" style="rounded=0;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#9E9E9E;dashed=1;verticalAlign=top;align=left;fontStyle=1;fontSize=14;spacingLeft=10;spacingTop=6;" parent="1" vertex="1">
+                    <mxGeometry x="80" y="360" width="560" height="160" as="geometry"/>
+                </mxCell>
+                <mxCell id="n13" value="roll the same belief pipeline the agent will run" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;" parent="1" vertex="1">
+                    <mxGeometry x="120" y="400" width="200" height="80" as="geometry"/>
+                </mxCell>
+                <mxCell id="25" style="edgeStyle=none;html=1;entryX=0;entryY=1;entryDx=0;entryDy=0;" edge="1" parent="1" source="n14" target="n6">
+                    <mxGeometry relative="1" as="geometry">
+                        <Array as="points">
+                            <mxPoint x="880" y="440"/>
+                        </Array>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="26" value="Pretraining Data" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];" vertex="1" connectable="0" parent="25">
+                    <mxGeometry x="-0.0778" y="-3" relative="1" as="geometry">
+                        <mxPoint as="offset"/>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="n14" value="belief snapshots [ N × particles × d ]" style="shape=note;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;size=14;fontSize=11;align=center;" parent="1" vertex="1">
+                    <mxGeometry x="400" y="400" width="200" height="80" as="geometry"/>
+                </mxCell>
+                <mxCell id="n15" value="Pairwise belief distance (EMD between particle sets)" style="rounded=1;arcSize=20;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;dashed=1;fontSize=11;align=center;" parent="1" vertex="1">
+                    <mxGeometry x="80" y="560" width="240" height="120" as="geometry"/>
+                </mxCell>
+                <mxCell id="n16" value="Latent metric alignment similar beliefs → similar codes" style="rounded=1;arcSize=20;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;dashed=1;fontSize=11;align=center;" parent="1" vertex="1">
+                    <mxGeometry x="400" y="560" width="240" height="120" as="geometry"/>
+                </mxCell>
+                <mxCell id="n17" value="Pretraining objective reconstruct · align · regress the mean" style="rounded=1;arcSize=20;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;dashed=1;fontSize=11;align=center;" parent="1" vertex="1">
+                    <mxGeometry x="720" y="560" width="240" height="120" as="geometry"/>
+                </mxCell>
+                <mxCell id="n19" value="Reinforcement learning" style="rounded=0;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#9E9E9E;dashed=1;verticalAlign=top;align=left;fontStyle=1;fontSize=14;spacingLeft=10;spacingTop=6;" parent="1" vertex="1">
+                    <mxGeometry x="1080" y="440" width="320" height="280" as="geometry"/>
+                </mxCell>
+                <mxCell id="n20" value="policy conditioned on observation  ++  belief code" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=12;" parent="1" vertex="1">
+                    <mxGeometry x="1120" y="480" width="240" height="80" as="geometry"/>
+                </mxCell>
+                <mxCell id="n21" value="encoder used frozen, fine-tuned, or trained from scratch" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=12;" parent="1" vertex="1">
+                    <mxGeometry x="1120" y="600" width="240" height="80" as="geometry"/>
+                </mxCell>
+                <mxCell id="e28" value="features" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=11;endArrow=blockThin;endFill=1;strokeWidth=2;" parent="1" source="n6" target="n19" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e31" value="target distances" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=10;dashed=1;strokeColor=#d6b656;endArrow=open;endFill=0;labelBackgroundColor=#FFFFFF;fontSize=10;" parent="1" source="n15" target="n16" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e32" value="alignment term" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=10;dashed=1;strokeColor=#d6b656;endArrow=open;endFill=0;labelBackgroundColor=#FFFFFF;fontSize=10;" parent="1" source="n16" target="n17" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e33" value="Alignment Signal" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=10;dashed=1;strokeColor=#d6b656;endArrow=open;endFill=0;exitX=0.846;exitY=0.017;exitDx=0;exitDy=0;labelBackgroundColor=#FFFFFF;fontSize=10;exitPerimeter=0;" parent="1" source="n17" edge="1">
+                    <mxGeometry relative="1" as="geometry">
+                        <mxPoint x="920" y="360" as="targetPoint"/>
+                        <Array as="points">
+                            <mxPoint x="923" y="560"/>
+                            <mxPoint x="920" y="560"/>
+                        </Array>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="17" value="β̂&lt;sub&gt;t&lt;/sub&gt; = {(&lt;i&gt;y&lt;/i&gt;&lt;sup&gt;i&lt;/sup&gt;, &lt;i&gt;w&lt;/i&gt;&lt;sup&gt;i&lt;/sup&gt;)}&lt;sub&gt;i=1…N&lt;/sub&gt;" style="edgeStyle=none;html=1;entryX=0.75;entryY=0;entryDx=0;entryDy=0;labelBackgroundColor=#FFFFFF;fontSize=11;exitX=0.25;exitY=1;exitDx=0;exitDy=0;" parent="1" source="n5" target="n12" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="18" value="&lt;i&gt;h&lt;sub&gt;t&lt;/sub&gt;&lt;/i&gt; = (o&lt;sub&gt;0&lt;/sub&gt;, a&lt;sub&gt;0&lt;/sub&gt;, …, o&lt;sub&gt;t&lt;/sub&gt;)" style="edgeStyle=none;html=1;entryX=0.214;entryY=0.027;entryDx=0;entryDy=0;entryPerimeter=0;labelBackgroundColor=#FFFFFF;fontSize=11;" parent="1" source="n3" target="n12" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+            </root>
+        </mxGraphModel>
+    </diagram>
+    <diagram id="methods" name="Method matrix">
+        <mxGraphModel dx="1400" dy="900" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1654" pageHeight="1169" math="0" shadow="0">
+            <root>
+                <mxCell id="0"/>
+                <mxCell id="1" parent="0"/>
+                <mxCell id="n1" value="Methods — 30 cells.  Every LEARNED encoder shares stat_dim = 16 and sits within 15% on parameter count (CGF exempt: ~1.2k by design).  Gaussian and k-moments are analytic at 0 parameters." style="rounded=0;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#9E9E9E;dashed=1;verticalAlign=top;align=left;fontStyle=1;fontSize=13;spacingLeft=8;spacingTop=4;" vertex="1" parent="1">
+                    <mxGeometry x="40" y="30" width="1180" height="50" as="geometry"/>
+                </mxCell>
+                <mxCell id="n2" value="Analytic baselines (no learned particle-side parameters)" style="rounded=0;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#9E9E9E;dashed=1;verticalAlign=top;align=left;fontStyle=1;fontSize=13;spacingLeft=8;spacingTop=4;" vertex="1" parent="1">
+                    <mxGeometry x="40" y="100" width="560" height="110" as="geometry"/>
+                </mxCell>
+                <mxCell id="n3" value="gaussian mean + covariance" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontSize=11;" vertex="1" parent="1">
+                    <mxGeometry x="60" y="140" width="250" height="55" as="geometry"/>
+                </mxCell>
+                <mxCell id="n4" value="kmoments first k=4 moments" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontSize=11;" vertex="1" parent="1">
+                    <mxGeometry x="330" y="140" width="250" height="55" as="geometry"/>
+                </mxCell>
+                <mxCell id="n5" value="Trained from scratch with the policy" style="rounded=0;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#9E9E9E;dashed=1;verticalAlign=top;align=left;fontStyle=1;fontSize=13;spacingLeft=8;spacingTop=4;" vertex="1" parent="1">
+                    <mxGeometry x="640" y="100" width="580" height="110" as="geometry"/>
+                </mxCell>
+                <mxCell id="n6" value="st_scratch" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;align=center;verticalAlign=middle;fontSize=11;" vertex="1" parent="1">
+                    <mxGeometry x="660" y="140" width="125" height="55" as="geometry"/>
+                </mxCell>
+                <mxCell id="n7" value="deepset" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;align=center;verticalAlign=middle;fontSize=11;" vertex="1" parent="1">
+                    <mxGeometry x="800" y="140" width="125" height="55" as="geometry"/>
+                </mxCell>
+                <mxCell id="n8" value="pointnet" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;align=center;verticalAlign=middle;fontSize=11;" vertex="1" parent="1">
+                    <mxGeometry x="940" y="140" width="125" height="55" as="geometry"/>
+                </mxCell>
+                <mxCell id="n9" value="cgf" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;align=center;verticalAlign=middle;fontSize=11;" vertex="1" parent="1">
+                    <mxGeometry x="1080" y="140" width="125" height="55" as="geometry"/>
+                </mxCell>
+                <mxCell id="n10" value="Pretrained: {ST, DeepSet, PointNet, CGF} × {plain, align, mean} × {frozen, finetune} = 24 cells" style="rounded=0;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#9E9E9E;dashed=1;verticalAlign=top;align=left;fontStyle=1;fontSize=13;spacingLeft=8;spacingTop=4;" vertex="1" parent="1">
+                    <mxGeometry x="40" y="240" width="1180" height="330" as="geometry"/>
+                </mxCell>
+                <mxCell id="n11" value="ST" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;" vertex="1" parent="1">
+                    <mxGeometry x="200" y="285" width="230" height="35" as="geometry"/>
+                </mxCell>
+                <mxCell id="n12" value="DeepSet" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;" vertex="1" parent="1">
+                    <mxGeometry x="450" y="285" width="230" height="35" as="geometry"/>
+                </mxCell>
+                <mxCell id="n13" value="PointNet" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;" vertex="1" parent="1">
+                    <mxGeometry x="700" y="285" width="230" height="35" as="geometry"/>
+                </mxCell>
+                <mxCell id="n14" value="CGF" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;" vertex="1" parent="1">
+                    <mxGeometry x="950" y="285" width="230" height="35" as="geometry"/>
+                </mxCell>
+                <mxCell id="n15" value="reconstruction" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontSize=11;" vertex="1" parent="1">
+                    <mxGeometry x="55" y="335" width="135" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="n16" value="st_frozen st_finetune" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;align=center;verticalAlign=middle;fontSize=11;" vertex="1" parent="1">
+                    <mxGeometry x="200" y="335" width="230" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="n17" value="ds_frozen ds_finetune" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;align=center;verticalAlign=middle;fontSize=11;" vertex="1" parent="1">
+                    <mxGeometry x="450" y="335" width="230" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="n18" value="pn_frozen pn_finetune" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;align=center;verticalAlign=middle;fontSize=11;" vertex="1" parent="1">
+                    <mxGeometry x="700" y="335" width="230" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="n19" value="cgf_frozen cgf_finetune" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;align=center;verticalAlign=middle;fontSize=11;" vertex="1" parent="1">
+                    <mxGeometry x="950" y="335" width="230" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="n20" value="+ alignment" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontSize=11;" vertex="1" parent="1">
+                    <mxGeometry x="55" y="410" width="135" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="n21" value="st_align_frozen st_align_finetune" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;align=center;verticalAlign=middle;fontSize=11;" vertex="1" parent="1">
+                    <mxGeometry x="200" y="410" width="230" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="n22" value="ds_align_frozen ds_align_finetune" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;align=center;verticalAlign=middle;fontSize=11;" vertex="1" parent="1">
+                    <mxGeometry x="450" y="410" width="230" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="n23" value="pn_align_frozen pn_align_finetune" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;align=center;verticalAlign=middle;fontSize=11;" vertex="1" parent="1">
+                    <mxGeometry x="700" y="410" width="230" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="n24" value="cgf_align_frozen cgf_align_finetune" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;align=center;verticalAlign=middle;fontSize=11;" vertex="1" parent="1">
+                    <mxGeometry x="950" y="410" width="230" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="n25" value="mean regression" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontSize=11;" vertex="1" parent="1">
+                    <mxGeometry x="55" y="485" width="135" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="n26" value="st_mean_frozen st_mean_finetune" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;align=center;verticalAlign=middle;fontSize=11;" vertex="1" parent="1">
+                    <mxGeometry x="200" y="485" width="230" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="n27" value="ds_mean_frozen ds_mean_finetune" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;align=center;verticalAlign=middle;fontSize=11;" vertex="1" parent="1">
+                    <mxGeometry x="450" y="485" width="230" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="n28" value="pn_mean_frozen pn_mean_finetune" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;align=center;verticalAlign=middle;fontSize=11;" vertex="1" parent="1">
+                    <mxGeometry x="700" y="485" width="230" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="n29" value="cgf_mean_frozen cgf_mean_finetune" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;align=center;verticalAlign=middle;fontSize=11;" vertex="1" parent="1">
+                    <mxGeometry x="950" y="485" width="230" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="n30" value="frozen = encoder weights fixed, only the shared head trains. finetune = encoder trains end-to-end with the policy. A cell with no checkpoint for its (env, encoder, arm) is left BLANK in the results matrix — it is not an error." style="rounded=0;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#9E9E9E;dashed=1;verticalAlign=top;align=left;fontStyle=1;fontSize=13;spacingLeft=8;spacingTop=4;" vertex="1" parent="1">
+                    <mxGeometry x="40" y="600" width="1180" height="80" as="geometry"/>
+                </mxCell>
+            </root>
+        </mxGraphModel>
+    </diagram>
 </mxfile>
