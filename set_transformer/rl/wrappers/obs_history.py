@@ -215,6 +215,40 @@ def frame_width_mismatch(checkpoint_width: int | None, env_width: int, n_stack: 
             f"wide ({k} frame(s) of {env_width / k:g}).")
 
 
+def checkpoint_obs_keys(model_path: str | None) -> tuple[str, ...] | None:
+    """The keys of the saved policy's Dict observation space (sorted), or None when the zip
+    cannot be read or its space is not a Dict. Best effort, like :func:`checkpoint_obs_width`
+    (2026-09-24: Ant-Tag ``--policy_obs dens`` adds the key ``static``)."""
+    if not model_path:
+        return None
+    try:
+        space = _load_zip_data(model_path)["observation_space"]
+        return tuple(sorted(space.spaces))
+    except Exception:  # noqa: BLE001 - a best-effort default, never fatal
+        return None
+
+
+def obs_keys_mismatch(checkpoint_keys, env_keys) -> tuple[str | None, tuple, tuple]:
+    """``(message, missing, extra)``. ``message`` is None when the checkpoint's keys are
+    unknown or equal the env's (every valid evaluation); else the first half of the error.
+    ``missing`` = keys the checkpoint reads that the env does not emit, ``extra`` = keys the
+    env emits that the checkpoint was not trained on. Generic: it names no domain flag; the
+    caller appends the domain's hint (``Evaluation.obs_keys_hint``)."""
+    if checkpoint_keys is None or env_keys is None:
+        return None, (), ()
+    ckpt, env = set(checkpoint_keys), set(env_keys)
+    if ckpt == env:
+        return None, (), ()
+    missing, extra = tuple(sorted(ckpt - env)), tuple(sorted(env - ckpt))
+    parts = []
+    if missing:
+        parts.append(f"it reads {list(missing)}, which this env does not emit")
+    if extra:
+        parts.append(f"this env emits {list(extra)}, which it was not trained on")
+    return (f"the checkpoint's observation keys {sorted(ckpt)} contradict this env's "
+            f"{sorted(env)}: " + "; ".join(parts) + "."), missing, extra
+
+
 def checkpoint_obs_history(model_path: str | None) -> int:
     """How many frames the saved policy's env stacked, read off the zip; 1 when it cannot be
     read (every recorded checkpoint, which declares no ``n_stack``).

@@ -44,6 +44,9 @@ Env factory
                                 (training only) -> Monitor -> _CurriculumRouter. Every arm and
                                 the eval build the env through it, so the belief the encoders
                                 see is the same everywhere.
+                                ``policy_obs="dens"`` (2026-09-24) adds DenMapObservationWrapper
+                                between Monitor and the router: a ``static`` key with the
+                                episode's two active dens; ``base`` (default) builds no wrapper.
   get_ant_tag_arena_scale       cage half-width off a live env (the encoders' particle scale;
                                 same derivation as the registry's ``arena_scale``)
   get_env_visible_radius        the real visibility radius off a live env (eval env)
@@ -768,6 +771,113 @@ class _CurriculumRouter(ScheduleRouter):
 
 
 # ---------------------------------------------------------------------------
+# --policy_obs dens (2026-09-24): the episode's two active dens as a "static" key
+# ---------------------------------------------------------------------------
+
+#: What the policy's Dict observation holds on this domain (``--policy_obs``, 2026-09-24).
+#: ``base`` (the default, every recorded run): ``obs``, ``particles``, ``weights``, and NO
+#: wrapper is built. ``dens`` (counterweighted-den variants only): the same, plus the key
+#: :data:`STATIC_KEY` from :class:`DenMapObservationWrapper`.
+POLICY_OBS_CHOICES = ("base", "dens")
+
+#: The Dict key ``--policy_obs dens`` adds. The ``framestack`` extractor reads it when the
+#: observation space has it; every other extractor ignores it.
+STATIC_KEY = "static"
+
+
+def _check_policy_obs(policy_obs: str) -> str:
+    if policy_obs not in POLICY_OBS_CHOICES:
+        raise ValueError(f"unknown policy_obs {policy_obs!r}; choose one of {POLICY_OBS_CHOICES}")
+    return policy_obs
+
+
+def variant_has_dens(variant: str | None = None, env_id: str | None = None) -> bool:
+    """True when the variant's env (or ``env_id``) is a counterweighted-den env, i.e. its
+    registered entry point is :class:`pdomains.ant_tag.CounterweightedDenAntTagEnv` or a
+    subclass. Read off the gym registration, so no MuJoCo env is built."""
+    import importlib   # noqa: PLC0415
+    from pdomains.ant_tag import CounterweightedDenAntTagEnv   # noqa: PLC0415
+    env_id = env_id or resolve(variant).env_id
+    entry = gym.spec(env_id).entry_point
+    if isinstance(entry, str):
+        module, _, attr = entry.partition(":")
+        entry = getattr(importlib.import_module(module), attr)
+    return isinstance(entry, type) and issubclass(entry, CounterweightedDenAntTagEnv)
+
+
+class DenMapObservationWrapper(gym.ObservationWrapper):
+    """Add the episode's two ACTIVE dens to the Dict observation as the key ``"static"``
+    (``--policy_obs dens``, 2026-09-24; ``change_mds/framestack_cdens_static_2026-09-24.md``).
+
+    ``static`` is a ``Box(-1, 1, (6,), float32)`` that holds the same six numbers at every step
+    of an episode, read off the unwrapped env AFTER its ``reset()``::
+
+        [heavy_x / s, heavy_y / s, w_heavy, light_x / s, light_y / s, 1 - w_heavy]
+
+    with ``s`` = the run's ``arena_scale`` (the cage half-width, 7.0 on the counterweighted
+    dens). Heavy first: den 1 is the active heavy den (``cden_heavy_pos``), den 2 the active
+    light den (``cden_light_pos``); ``w_heavy`` = ``cden_w_heavy`` = f / (h + f). This is the
+    particle filter's t = 0 belief (the two active dens and their prior masses), handed to
+    the policy as model knowledge. It does NOT hold which den is occupied
+    (``info["cden_occupied"]`` is hidden state) and it does NOT hold the spook state (the
+    filter reads ``cden_spooked`` live through the mapper; the policy does not).
+
+    Placement: inside :func:`make_ant_tag_cgf_env`, directly below ``_CurriculumRouter``, so
+    above ``PFDictWithWeightsObservationWrapper``. The filter, its interaction mapper (which
+    indexes the 31-vector positionally) and the target mask never see this key; ``obs``,
+    ``particles`` and ``weights`` pass through as the same objects. The router stays the
+    outermost Ant-Tag wrapper, and its setters reach the inner wrappers through ``.env``.
+
+    Public attributes are forwarded down the chain (gymnasium 1.2.3's ``Wrapper`` has no
+    ``__getattr__``), with the guard of ``ObsHistoryDictWrapper``: private names and ``env``
+    are not forwarded, so copying and unpickling cannot recurse.
+    """
+
+    def __init__(self, env: gym.Env, arena_scale: float):
+        super().__init__(env)
+        if not hasattr(env.unwrapped, "cden_heavy_pos"):
+            raise ValueError(
+                f"--policy_obs dens needs a counterweighted-den env; "
+                f"{type(env.unwrapped).__name__} has no dens (cden_heavy_pos)")
+        self.arena_scale = float(arena_scale)
+        if not self.arena_scale > 0:
+            raise ValueError(f"arena_scale must be positive, got {arena_scale!r}")
+        self._static: np.ndarray | None = None
+        self.observation_space = gym.spaces.Dict({
+            **env.observation_space.spaces,
+            STATIC_KEY: gym.spaces.Box(low=-1.0, high=1.0, shape=(6,), dtype=np.float32),
+        })
+
+    def _read_static(self) -> np.ndarray:
+        u = self.env.unwrapped
+        heavy = np.asarray(u.cden_heavy_pos, dtype=np.float64) / self.arena_scale
+        light = np.asarray(u.cden_light_pos, dtype=np.float64) / self.arena_scale
+        w = float(u.cden_w_heavy)
+        if not (np.all(np.abs(heavy) <= 1.0) and np.all(np.abs(light) <= 1.0)):
+            raise ValueError(
+                f"the dens scaled by arena_scale={self.arena_scale:g} leave the Box [-1, 1]: "
+                f"heavy {heavy.tolist()}, light {light.tolist()}. Pass the cage half-width "
+                "(the registry's default_arena_scale).")
+        return np.array([heavy[0], heavy[1], w, light[0], light[1], 1.0 - w], dtype=np.float32)
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        # The env draws the mirror bit inside reset(), so the dens are read after it.
+        self._static = self._read_static()
+        return self.observation(obs), info
+
+    def observation(self, obs: dict) -> dict:
+        if self._static is None:
+            raise RuntimeError("DenMapObservationWrapper: step() before reset()")
+        return {**obs, STATIC_KEY: self._static.copy()}
+
+    def __getattr__(self, name: str):
+        if name.startswith("_") or name == "env":
+            raise AttributeError(name)
+        return getattr(self.env, name)
+
+
+# ---------------------------------------------------------------------------
 # PF interaction mapper for AntTag
 # ---------------------------------------------------------------------------
 
@@ -1007,6 +1117,8 @@ def make_ant_tag_cgf_env(
     env_id: str = "pdomains-ant-tag-v0",
     particle_filter_class: type = AntTagParticleFilter,
     target_speed_scale: float | None = None,
+    policy_obs: str = "base",
+    arena_scale: float | None = None,
 ):
     """Return a callable that creates a weighted-CGF AntTag env.
 
@@ -1032,7 +1144,16 @@ def make_ant_tag_cgf_env(
     than a silently ignored no-op. The PF is told the live value each step
     by ant_tag_pf_interaction_mapper, so belief propagation always matches
     whatever the env is actually doing.
+
+    policy_obs="base" (default, every recorded run) builds exactly the chain above, with no
+    extra wrapper. policy_obs="dens" (2026-09-24, counterweighted-den envs only) adds
+    DenMapObservationWrapper directly below _CurriculumRouter: the Dict observation gains the
+    key "static" (the episode's two active dens / arena_scale and their prior masses).
+    arena_scale is then required (the run's resolved --arena_scale); it is unused under base.
     """
+    policy_obs = _check_policy_obs(policy_obs)
+    if policy_obs == "dens" and arena_scale is None:
+        raise ValueError("policy_obs='dens' needs arena_scale (the cage half-width)")
 
     def _init():
         env_make_kwargs = {"rendering": False}
@@ -1090,6 +1211,8 @@ def make_ant_tag_cgf_env(
             env = Monitor(env, os.path.join(monitor_dir, str(rank)))
         else:
             env = Monitor(env)
+        if policy_obs == "dens":
+            env = DenMapObservationWrapper(env, arena_scale=arena_scale)
         env = _CurriculumRouter(env)
         return env
 
@@ -1571,6 +1694,7 @@ def _collect_add_arguments(parser) -> None:
         "--diffuse_threshold", type=float, default=4.0,
         help="Belief spread above this counts as diffuse. ENV UNITS.",
     )
+    _add_policy_obs_argument(parser, "collect")
 
 
 def _collect_resolve_arguments(parser, args, domain) -> dict:
@@ -1596,6 +1720,7 @@ def _collect_resolve_arguments(parser, args, domain) -> dict:
             print(f"Auto-detected VecNormalize stats: {candidate}")
 
     print(f"Env: {resolved_env_id}, particle filter: {resolved_pf.__name__}")
+    _refuse_policy_obs_without_dens(parser, args.policy_obs, args.variant, env_id=resolved_env_id)
     facts = _env_facts(resolved_env_id)
     if not 0.0 <= args.waypoint_fraction <= 1.0:
         parser.error(f"--waypoint_fraction {args.waypoint_fraction} is not in [0, 1]")
@@ -1614,7 +1739,12 @@ def _collect_resolve_arguments(parser, args, domain) -> dict:
         print(f"Waypoint episodes: {args.waypoint_fraction:.0%}, min dist {args.waypoint_min_dist:g}, target "
               f"clearance {args.waypoint_target_clearance:g}, reach {args.waypoint_reach:g}, patience "
               f"{args.waypoint_patience}, radius {args.waypoint_radius}")
-    return {"env_id": resolved_env_id, "particle_filter_class": resolved_pf, "env_facts": facts}
+    options = {"env_id": resolved_env_id, "particle_filter_class": resolved_pf, "env_facts": facts}
+    # --policy_obs dens (2026-09-24): only under dens do the two keys join the options.
+    if args.policy_obs == "dens":
+        options.update(policy_obs="dens",
+                       arena_scale=float(get_ant_tag_arena_scale(resolved_env_id)))
+    return options
 
 
 def _env_facts(env_id: str) -> dict:
@@ -1670,6 +1800,7 @@ def _collect_make_env(args, options, state):
         env_id=options["env_id"],
         particle_filter_class=options["particle_filter_class"],
         target_speed_scale=args.target_speed_scale,
+        **{k: options[k] for k in ("policy_obs", "arena_scale") if k in options},
     )()
     env.set_evasion_scale(args.evasion_scale)
     return env
@@ -1998,8 +2129,37 @@ ANT_TAG_TASK_OBJECTIVE = Objective(
 
 
 
+def _add_policy_obs_argument(parser, door: str) -> None:
+    """``--policy_obs``, the same flag at the three doors that build the belief env (train,
+    eval, collect; 2026-09-24). Default ``base``: the recorded env, with no extra wrapper."""
+    parser.add_argument(
+        "--policy_obs", type=str, default="base", choices=POLICY_OBS_CHOICES,
+        help="What the policy's Dict observation holds. base (default, every recorded run): "
+             "obs, particles, weights. dens (counterweighted-den variants only): also the key "
+             "'static' = the episode's two active dens (heavy first) / arena_scale and their "
+             "prior masses, constant over the episode; never the occupied den or the spook "
+             "state. Only the framestack extractor reads it. "
+             + {"train": "Recorded in run_config.json.",
+                "eval": "Must be the value the checkpoint was trained with; a zip whose "
+                        "observation keys contradict the env is refused. The eval scales the "
+                        "dens by the variant's default arena_scale: a run trained with another "
+                        "--arena_scale (run_config.json records it) cannot be evaluated here.",
+                "collect": "With --behaviour policy it must be the value the agent was "
+                           "trained with."}[door])
+
+
+def _refuse_policy_obs_without_dens(parser, policy_obs: str, variant: str,
+                                    env_id: str | None = None) -> None:
+    """``--policy_obs dens`` on an env without dens is a usage error, not a silent no-op."""
+    if policy_obs == "dens" and not variant_has_dens(variant, env_id=env_id):
+        parser.error(f"--policy_obs dens needs a counterweighted-den variant (cdens, cdens_hard, "
+                     f"cdens_terminal, cdens_nospook); the env of --variant {variant} "
+                     f"({env_id or resolve(variant).env_id}) has no dens.")
+
+
 def _add_arguments(parser) -> None:
-    """The flags that belong to the Ant-Tag problem (help texts from 4_train_rl_cgf.py)."""
+    """The flags that belong to the Ant-Tag problem (help texts from 4_train_rl_cgf.py), and
+    ``--policy_obs`` (2026-09-24)."""
     parser.add_argument(
         "--distance_coeff", type=float, default=None,
         help="Constant PF-mean-distance shaping coefficient (default 1.0). "
@@ -2043,6 +2203,7 @@ def _add_arguments(parser) -> None:
              "the env default (0.0 = constant speed; the target flees more often "
              "when cornered but never faster). 1.0 restores the old up-to-2x "
              "behavior. Applied to both the training and eval envs.")
+    _add_policy_obs_argument(parser, "train")
 
 
 def _resolve_arguments(parser, args) -> dict:
@@ -2061,7 +2222,8 @@ def _resolve_arguments(parser, args) -> dict:
     args.evasion_curriculum = resolve_schedule(
         args.variant, args.evasion_curriculum, "default_evasion_curriculum", None)
     curriculum_schedule = parse_curriculum(args.curriculum)
-    return dict(
+    _refuse_policy_obs_without_dens(parser, args.policy_obs, args.variant)
+    options = dict(
         distance_coeff=args.distance_coeff,
         entropy_coeff=args.entropy_coeff,
         tag_bonus_coeff=0.0,
@@ -2071,6 +2233,12 @@ def _resolve_arguments(parser, args) -> dict:
         obs_mask_indices=[-2, -1] if args.mask_target_obs else None,
         target_speed_scale=args.target_speed_scale,
     )
+    # --policy_obs dens (2026-09-24): the two keys join the options ONLY under dens, so the
+    # options of every base run are the dict they always were. arena_scale is the run's
+    # resolved --arena_scale (train.py fills it from default_arena_scale before this runs).
+    if args.policy_obs == "dens":
+        options.update(policy_obs="dens", arena_scale=float(args.arena_scale))
+    return options
 
 
 def _schedules(args):
@@ -2114,12 +2282,40 @@ def _eval_add_arguments(parser) -> None:
     parser.add_argument("--no_mask", action="store_true",
                         help="Do not zero obs[-2:] (the target position) for the agent. "
                              "Must match how the checkpoint was trained (masked by default).")
+    _add_policy_obs_argument(parser, "eval")
 
 
 def _eval_options(args) -> dict:
     """The env-factory options of the eval env: only the target mask (the shaping
-    coefficients are irrelevant with shaping off, and the visibility radius is the env's)."""
-    return dict(obs_mask_indices=None if args.no_mask else [-2, -1])
+    coefficients are irrelevant with shaping off, and the visibility radius is the env's).
+
+    Under ``--policy_obs dens`` (2026-09-24) also the policy input and the arena scale. The
+    eval has no ``--arena_scale``: the dens are scaled by the variant's
+    ``default_arena_scale`` (the cage half-width). A training run with an overridden
+    ``--arena_scale`` must be evaluated at that same value; its ``run_config.json`` records
+    ``arena_scale``, and this door does not support another value."""
+    options = dict(obs_mask_indices=None if args.no_mask else [-2, -1])
+    if getattr(args, "policy_obs", "base") == "dens":
+        if not variant_has_dens(args.variant):
+            raise ValueError(f"--policy_obs dens needs a counterweighted-den variant; the env of "
+                             f"--variant {args.variant} has no dens.")
+        options.update(policy_obs="dens",
+                       arena_scale=float(get_ant_tag_arena_scale(resolve(args.variant).env_id)))
+    return options
+
+
+def _eval_obs_keys_hint(args, missing, extra) -> str:
+    """The Ant-Tag sentence for the eval / collect doors' observation-key refusal: the key
+    ``static`` exists only under ``--policy_obs dens`` (2026-09-24)."""
+    if STATIC_KEY in missing:
+        return (f"On ant_tag the key '{STATIC_KEY}' exists only under --policy_obs dens; this "
+                f"run used --policy_obs {getattr(args, 'policy_obs', 'base')}. Pass --policy_obs "
+                "dens (the run's run_config.json records policy_obs).")
+    if STATIC_KEY in extra:
+        return (f"On ant_tag the key '{STATIC_KEY}' exists only under --policy_obs dens, and the "
+                "checkpoint was trained without it. Drop --policy_obs dens (the run's "
+                "run_config.json records policy_obs).")
+    return ""
 
 
 def _cgf_t_init_max_default(args):
@@ -2177,7 +2373,9 @@ ANT_TAG = Domain(
     },
     # The generic protocol: success = is_success from info, else ended before the cap.
     evaluation=Evaluation(add_arguments=_eval_add_arguments, options=_eval_options,
-                          default_n_episodes=50),
+                          default_n_episodes=50,
+                          # --policy_obs dens (2026-09-24): name the flag on a key mismatch.
+                          obs_keys_hint=_eval_obs_keys_hint),
     # Step 2 of the pipeline: the pursuit / random trajectory mix with the locomotion policy,
     # rebalanced by weighted spread (batch 7.4).
     collection=ANT_TAG_COLLECTION,

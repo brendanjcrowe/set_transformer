@@ -69,6 +69,12 @@ class Evaluation:
     #: the eval env's, naming the domain flag that decides a frame's width (Odd-Even:
     #: ``--policy_obs``; 2026-09-23). Empty by default: the generic message stands alone.
     frame_width_hint: Callable = lambda args, checkpoint_frame_width, env_frame_width: ""
+    #: ``obs_keys_hint(args, missing, extra) -> str``: one sentence appended to the error the
+    #: eval and collect doors raise when the checkpoint's observation KEYS contradict the env's
+    #: (``missing``: keys the checkpoint reads and the env does not emit; ``extra``: the
+    #: reverse), naming the domain flag that adds a key (Ant-Tag: ``--policy_obs dens`` adds
+    #: ``static``; 2026-09-24). Empty by default: the generic message stands alone.
+    obs_keys_hint: Callable = lambda args, missing, extra: ""
 
 
 @dataclass(frozen=True)

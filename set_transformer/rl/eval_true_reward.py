@@ -67,8 +67,10 @@ from set_transformer.rl import run_records
 from set_transformer.rl.domains.base import Domain
 from set_transformer.rl.wrappers.obs_history import (
     checkpoint_obs_history_spec,
+    checkpoint_obs_keys,
     checkpoint_obs_width,
     frame_width_mismatch,
+    obs_keys_mismatch,
     with_obs_history,
 )
 
@@ -340,6 +342,17 @@ def main(argv: Sequence[str] | None = None, *, domain: Domain | str | None = Non
     # frame holds (Odd-Even --policy_obs, 2026-09-23). Refuse a contradiction clearly here,
     # before VecNormalize.load / PPO.load refuse it with a shape error. Silent when the widths
     # agree (every valid evaluation) or when the zip cannot be read.
+    # The KEYS first (2026-09-24): a domain flag can add a key (Ant-Tag --policy_obs dens adds
+    # "static"), which leaves the obs width alone, so SB3 would refuse it with a bare "Observation
+    # spaces do not match". Silent when the keys agree or the zip cannot be read.
+    env_keys = getattr(env.observation_space, "spaces", None)
+    keys_message, missing, extra = obs_keys_mismatch(
+        checkpoint_obs_keys(args.model_path) if env_keys is not None else None,
+        tuple(env_keys) if env_keys is not None else None)
+    if keys_message:
+        env.close()
+        hint = evaluation.obs_keys_hint(args, missing, extra)
+        parser.error(f"--model_path {args.model_path}: {keys_message}" + (f" {hint}" if hint else ""))
     obs_space = getattr(env.observation_space, "spaces", {}).get("obs")
     env_width = int(obs_space.shape[0]) if obs_space is not None else None
     checkpoint_width = checkpoint_obs_width(args.model_path) if env_width is not None else None

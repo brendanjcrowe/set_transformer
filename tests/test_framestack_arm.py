@@ -264,8 +264,9 @@ def test_the_extractor_refuses_a_width_that_is_not_a_multiple_of_n_stack():
 def test_the_extractor_passes_the_stacked_obs_through_as_a_fresh_tensor():
     extractor = FrameStackFeaturesExtractor(_space(10), n_stack=5)
     assert extractor.features_dim == 10
+    # static_dim (2026-09-24): 0 without a "static" key (test_framestack_ant_tag_dens.py).
     assert extractor._geometry == dict(encoder="framestack", n_stack=5, frame_dim=2,
-                                       padding="reset_frame")
+                                       padding="reset_frame", static_dim=0)
     obs = {"obs": torch.arange(20, dtype=torch.float32).reshape(2, 10),
            "particles": torch.zeros(2, N, 2), "weights": torch.zeros(2, N)}
     out = extractor(obs)

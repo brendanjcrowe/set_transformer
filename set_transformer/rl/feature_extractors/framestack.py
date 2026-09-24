@@ -18,6 +18,10 @@ from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 
 from set_transformer.rl.wrappers.obs_history import PADDINGS
 
+#: The Dict key Ant-Tag's ``--policy_obs dens`` adds (``rl/domains/ant_tag.py::STATIC_KEY``;
+#: spelled here so the extractor does not import a domain module).
+STATIC_KEY = "static"
+
 
 class FrameStackFeaturesExtractor(BaseFeaturesExtractor):
     """Pass the (already stacked) base observation through; ignore the belief.
@@ -30,6 +34,12 @@ class FrameStackFeaturesExtractor(BaseFeaturesExtractor):
     the env filled the history slots at reset (``reset_frame`` or ``zeros``) is a property of
     the checkpoint, so it travels in the zip beside ``n_stack``; it does not change what this
     extractor computes.
+
+    ``static`` (2026-09-24): when the observation space has the key ``"static"`` (Ant-Tag
+    ``--policy_obs dens``: the episode's two active dens and their prior masses, constant
+    over the episode), the features are ``[obs, static]`` and ``features_dim`` grows by its
+    width. The key is never stacked (the history wrapper rewrites ``obs`` only). Without the
+    key the extractor is unchanged; ``_geometry["static_dim"]`` is 0.
     """
 
     def __init__(self, observation_space: gym.spaces.Dict, n_stack: int = 1,
@@ -42,13 +52,19 @@ class FrameStackFeaturesExtractor(BaseFeaturesExtractor):
                 f"was trained against a differently stacked env.")
         if padding not in PADDINGS:
             raise ValueError(f"unknown stack padding {padding!r}; choose one of {PADDINGS}")
-        super().__init__(observation_space, features_dim=width)
+        spaces = getattr(observation_space, "spaces", {})
+        static_dim = int(spaces[STATIC_KEY].shape[0]) if STATIC_KEY in spaces else 0
+        super().__init__(observation_space, features_dim=width + static_dim)
         self.n_stack = n_stack
         self.padding = str(padding)
+        self.static_dim = static_dim
         self._geometry = dict(encoder="framestack", n_stack=self.n_stack,
-                              frame_dim=width // n_stack, padding=self.padding)
+                              frame_dim=width // n_stack, padding=self.padding,
+                              static_dim=self.static_dim)
 
     def forward(self, obs_dict: dict[str, torch.Tensor]) -> torch.Tensor:
         # A fresh tensor, like every other arm's torch.cat: returning obs_dict["obs"] would
         # hand the policy a view into the rollout buffer's batch.
+        if self.static_dim:
+            return torch.cat([obs_dict["obs"].clone(), obs_dict[STATIC_KEY]], dim=-1)
         return obs_dict["obs"].clone()

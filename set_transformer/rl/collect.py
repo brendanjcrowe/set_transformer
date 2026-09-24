@@ -230,14 +230,26 @@ def collect_arrays(domain: Domain, args, options: dict, *, progress: bool = True
         # collection rolled (2026-09-22, change_mds/framestack_arm_2026-09-22.md; padding
         # 2026-09-23).
         from set_transformer.rl.wrappers.obs_history import (   # noqa: PLC0415
-            ObsHistoryDictWrapper, checkpoint_obs_history_spec, checkpoint_obs_width,
-            frame_width_mismatch,
+            ObsHistoryDictWrapper, checkpoint_obs_history_spec, checkpoint_obs_keys,
+            checkpoint_obs_width, frame_width_mismatch, obs_keys_mismatch,
         )
         obs_history, padding = checkpoint_obs_history_spec(args.policy_path)
         if obs_history > 1:
             env = ObsHistoryDictWrapper(env, obs_history, padding)
             print(f"Frame stacking: the agent was trained on {obs_history} stacked base "
                   f"observations (padding: {padding}); the collection env stacks the same number.")
+        # A domain flag can add a key (Ant-Tag --policy_obs dens adds "static", 2026-09-24):
+        # refuse a contradiction with the agent's keys before a row is rolled. Silent when the
+        # keys agree or the zip cannot be read.
+        env_keys = getattr(env.observation_space, "spaces", None)
+        if env_keys is not None:
+            keys_message, missing, extra = obs_keys_mismatch(
+                checkpoint_obs_keys(args.policy_path), tuple(env_keys))
+            if keys_message:
+                env.close()
+                hint = domain.evaluation.obs_keys_hint(args, missing, extra)
+                raise ValueError(f"--policy_path {args.policy_path}: {keys_message}"
+                                 + (f" {hint}" if hint else ""))
         # A domain flag can change what one frame holds (Odd-Even --policy_obs, 2026-09-23):
         # refuse a contradiction with the agent before a row is rolled. Silent when the widths
         # agree or the zip cannot be read.
