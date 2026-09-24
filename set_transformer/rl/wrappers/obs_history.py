@@ -13,16 +13,34 @@ observation before SB3 sees it, which is what :class:`ObsHistoryDictWrapper` doe
 
 Three pieces, used by the four doors that build an env (plan section 6): the wrapper itself,
 :func:`with_obs_history` for the three doors that own a thunk (training workers, the
-in-training eval env, the standalone eval env) and :func:`checkpoint_obs_history`, which reads
-``k`` back off a saved zip so eval and collect never need a flag.
+in-training eval env, the standalone eval env) and :func:`checkpoint_obs_history_spec`, which
+reads ``k`` AND the padding back off a saved zip so eval and collect never need a flag
+(:func:`checkpoint_obs_history` is the older ``k``-only reader, kept for its callers).
+
+Padding (2026-09-23, ``change_mds/framestack_oddeven_raw_obs_2026-09-23.md``): at reset the
+``k - 1`` history slots hold either copies of the reset frame (``"reset_frame"``, the default
+and the only behaviour before that date) or zero frames (``"zeros"``). The choice is a
+CHECKPOINT setting, like ``k``: the extractor records it in the zip's
+``features_extractor_kwargs`` and every door reads it back from there.
 """
 
 from __future__ import annotations
 
 from collections import deque
+from typing import NamedTuple
 
 import gymnasium as gym
 import numpy as np
+
+#: The two ways to fill the history slots at reset. ``reset_frame`` is the default everywhere.
+PADDINGS = ("reset_frame", "zeros")
+
+
+def _check_padding(padding: str) -> str:
+    padding = str(padding)
+    if padding not in PADDINGS:
+        raise ValueError(f"unknown stack padding {padding!r}; choose one of {PADDINGS}")
+    return padding
 
 
 class ObsHistoryDictWrapper(gym.ObservationWrapper):
@@ -51,11 +69,17 @@ class ObsHistoryDictWrapper(gym.ObservationWrapper):
     ``n_stack == 1`` is the exact identity -- the space and every emitted array are unchanged --
     but the harness does not build the object at all in that case (:func:`with_obs_history`),
     which is what makes every other arm bit-identical.
+
+    ``padding`` says what the ``n_stack - 1`` history slots hold at reset: ``"reset_frame"``
+    (default) repeats the reset frame; ``"zeros"`` puts zero frames of the ``obs`` Box's dtype
+    there, so the policy can tell "no frame yet" from "a frame equal to the reset one" (the
+    Odd-Even raw-observation default, where a repeated first observation reads as evidence).
     """
 
-    def __init__(self, env: gym.Env, n_stack: int):
+    def __init__(self, env: gym.Env, n_stack: int, padding: str = "reset_frame"):
         super().__init__(env)
         self.n_stack = int(n_stack)
+        self.padding = _check_padding(padding)
         base = env.observation_space["obs"]
         self._frames: deque = deque(maxlen=self.n_stack)
         self.observation_space = gym.spaces.Dict({
@@ -69,11 +93,18 @@ class ObsHistoryDictWrapper(gym.ObservationWrapper):
 
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
-        # A new episode starts with no history: pad with the reset frame, so the observation
-        # is always n_stack * D wide and never carries the previous episode's frames.
+        # A new episode starts with no history: pad with the reset frame (or with zero frames,
+        # padding="zeros"), so the observation is always n_stack * D wide and never carries the
+        # previous episode's frames.
         self._frames.clear()
-        for _ in range(self.n_stack - 1):
-            self._frames.append(np.asarray(obs["obs"]))
+        if self.padding == "zeros":
+            base = self.env.observation_space["obs"]
+            pad = np.zeros(base.shape, dtype=base.dtype)
+            for _ in range(self.n_stack - 1):
+                self._frames.append(pad)
+        else:
+            for _ in range(self.n_stack - 1):
+                self._frames.append(np.asarray(obs["obs"]))
         return self.observation(obs), info
 
     def observation(self, obs: dict) -> dict:
@@ -104,28 +135,84 @@ class ObsHistoryDictWrapper(gym.ObservationWrapper):
         return getattr(self.env, name)
 
 
-def with_obs_history(thunk, n_stack: int):
+def with_obs_history(thunk, n_stack: int, padding: str = "reset_frame"):
     """Wrap an env thunk so the env it builds stacks the last ``n_stack`` base observations.
 
     ``n_stack <= 1`` returns the thunk UNCHANGED -- the same object, not an equivalent one --
-    so no wrapper exists and nothing about an existing arm's env, observation space or pickled
-    thunk moves. The returned callable is a module-level class instance (not a closure) so
-    cloudpickle round-trips it for ``SubprocVecEnv``.
+    whatever ``padding`` says, so no wrapper exists and nothing about an existing arm's env,
+    observation space or pickled thunk moves. The returned callable is a module-level class
+    instance (not a closure) so cloudpickle round-trips it for ``SubprocVecEnv``.
     """
     if int(n_stack) <= 1:
         return thunk
-    return _ObsHistoryThunk(thunk, int(n_stack))
+    return _ObsHistoryThunk(thunk, int(n_stack), _check_padding(padding))
 
 
 class _ObsHistoryThunk:
     """``with_obs_history``'s picklable callable: build the env, then stack above it."""
 
-    def __init__(self, thunk, n_stack: int):
+    def __init__(self, thunk, n_stack: int, padding: str = "reset_frame"):
         self.thunk = thunk
         self.n_stack = int(n_stack)
+        self.padding = padding
 
     def __call__(self):
-        return ObsHistoryDictWrapper(self.thunk(), self.n_stack)
+        return ObsHistoryDictWrapper(self.thunk(), self.n_stack, self.padding)
+
+
+class ObsHistorySpec(NamedTuple):
+    """What a saved policy's env stacked: ``n_stack`` frames, padded with ``padding`` at reset.
+    The defaults are what every checkpoint that records neither value was trained on."""
+
+    n_stack: int = 1
+    padding: str = "reset_frame"
+
+
+def _load_zip_data(model_path: str) -> dict:
+    from stable_baselines3.common.save_util import load_from_zip_file
+    data, _params, _other = load_from_zip_file(
+        model_path, load_data=True, device="cpu", print_system_info=False)
+    return data
+
+
+def checkpoint_obs_history_spec(model_path: str | None) -> ObsHistorySpec:
+    """``(n_stack, padding)`` of the saved policy's env, read off the zip's
+    ``policy_kwargs["features_extractor_kwargs"]``; each value defaults on its own when the zip
+    does not record it (every checkpoint but a framestack one records neither; a framestack
+    zip from 2026-09-22 records ``n_stack`` only, and was trained with ``reset_frame``).
+    ``ObsHistorySpec()`` = ``(1, "reset_frame")`` when the zip cannot be read at all -- the
+    same best-effort, fail-safe shape as :func:`checkpoint_obs_history`."""
+    if not model_path:
+        return ObsHistorySpec()
+    try:
+        kwargs = _load_zip_data(model_path)["policy_kwargs"].get("features_extractor_kwargs") or {}
+        return ObsHistorySpec(n_stack=int(kwargs.get("n_stack", 1)),
+                              padding=str(kwargs.get("padding", "reset_frame")))
+    except Exception:  # noqa: BLE001 - a best-effort default, never fatal
+        return ObsHistorySpec()
+
+
+def checkpoint_obs_width(model_path: str | None) -> int | None:
+    """Width of the ``obs`` key in the saved policy's observation space (all ``n_stack``
+    frames), or None when it cannot be read. Best effort, like the two readers beside it; the
+    doors use it only to turn a width mismatch into a clear error before SB3's own check."""
+    if not model_path:
+        return None
+    try:
+        return int(_load_zip_data(model_path)["observation_space"]["obs"].shape[0])
+    except Exception:  # noqa: BLE001 - a best-effort default, never fatal
+        return None
+
+
+def frame_width_mismatch(checkpoint_width: int | None, env_width: int, n_stack: int) -> str | None:
+    """None when the checkpoint's ``obs`` width is unknown or equals the env's; else the first
+    half of the error message, in frames (``frame_dim = width / n_stack``)."""
+    if checkpoint_width is None or int(checkpoint_width) == int(env_width):
+        return None
+    k = max(int(n_stack), 1)
+    return (f"the checkpoint's policy reads an obs key {checkpoint_width} wide "
+            f"({k} frame(s) of {checkpoint_width / k:g}), but this env emits one {env_width} "
+            f"wide ({k} frame(s) of {env_width / k:g}).")
 
 
 def checkpoint_obs_history(model_path: str | None) -> int:

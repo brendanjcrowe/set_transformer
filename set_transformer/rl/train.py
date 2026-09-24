@@ -59,7 +59,7 @@ from set_transformer.rl.encoder_finetune import (
 )
 from set_transformer.rl.encoders import Encoder
 from set_transformer.rl.pretrained_encoder import policy_extractors, reload_pretrained
-from set_transformer.rl.wrappers.obs_history import checkpoint_obs_history, with_obs_history
+from set_transformer.rl.wrappers.obs_history import checkpoint_obs_history_spec, with_obs_history
 
 ALGORITHMS = {"PPO": PPO, "SAC": SAC}
 
@@ -92,6 +92,7 @@ def train(
     use_vec_normalize: bool = True,
     # frame stacking (the framestack arm only; 1 = no wrapper, every other arm unchanged)
     obs_history: int = 1,
+    obs_history_padding: str = "reset_frame",
     # the schedules (the domain's, with this run's waypoints) and encoder-side options
     schedules: Sequence[Schedule] = (),
     encoder_options: dict | None = None,
@@ -134,7 +135,9 @@ def train(
     (``share_features_extractor=False``, the recorded hunt configuration) instead of sharing
     the actor's; both PPO only (batch 9.1, 2026-09-13). ``obs_history`` is how many consecutive
     base observations the ``"obs"`` key carries (``Encoder.obs_history``; 1 = the current frame
-    only and NO wrapper is built, which is every arm but ``framestack``).
+    only and NO wrapper is built, which is every arm but ``framestack``);
+    ``obs_history_padding`` is what fills the history slots at reset
+    (``Encoder.obs_history_padding``: ``reset_frame`` or ``zeros``; unused at 1).
     ``post_construct(model)`` runs after every built-in post-construction step.
     """
     domain = _domains.get(domain)
@@ -212,7 +215,7 @@ def train(
     env_fns = [
         with_obs_history(
             domain.make_env(variant, rank=rank, monitor_dir=monitor_dir, training=True, **common),
-            obs_history)
+            obs_history, obs_history_padding)
         for rank in range(n_envs)
     ]
     vec_env = domain.make_vec_env_from_fns(env_fns, n_envs)
@@ -232,7 +235,7 @@ def train(
     eval_vec_env = DummyVecEnv([
         with_obs_history(
             domain.make_env(variant, rank=n_envs + 1, monitor_dir=None, training=False, **common),
-            obs_history)
+            obs_history, obs_history_padding)
     ])
     if use_vec_normalize:
         eval_vec_env = domain.make_vec_normalize(eval_vec_env, training=False, norm_reward=False)
@@ -268,10 +271,14 @@ def train(
         # checkpoint), so it cannot join the dict above. It travels inside the zip's
         # policy_kwargs and is compared separately. Every arm but framestack has k == 1 on
         # both sides: nothing is added and the message is the one of every recorded fork
-        # (2026-09-22, change_mds/framestack_arm_2026-09-22.md, plan section 11A).
-        stored_obs_history = checkpoint_obs_history(resume_from)
-        if stored_obs_history != int(obs_history):
-            mismatched["n_stack"] = (stored_obs_history, int(obs_history))
+        # (2026-09-22, change_mds/framestack_arm_2026-09-22.md, plan section 11A). The padding
+        # (2026-09-23) travels beside it and is compared the same way; every arm but
+        # framestack is "reset_frame" on both sides.
+        stored = checkpoint_obs_history_spec(resume_from)
+        if stored.n_stack != int(obs_history):
+            mismatched["n_stack"] = (stored.n_stack, int(obs_history))
+        if stored.padding != str(obs_history_padding):
+            mismatched["padding"] = (stored.padding, str(obs_history_padding))
         if mismatched:
             raise ValueError(f"--resume_from checkpoint disagrees with the CLI on "
                              f"{mismatched} (stored, given); pass the source run's values")
@@ -730,6 +737,7 @@ def _train_from_args(domain, args, encoder, start, net_arch, particle_filter_cla
         seed=args.seed,
         use_vec_normalize=not args.no_vec_normalize,
         obs_history=encoder.obs_history(args),
+        obs_history_padding=encoder.obs_history_padding(args),
         schedules=domain.schedules(args),
         encoder_options=encoder.encoder_options(args),
         algorithm=args.algorithm,

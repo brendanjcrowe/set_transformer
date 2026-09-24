@@ -86,6 +86,17 @@ Both directions are pinned by tests in tests/test_odd_even_pipeline.py --
 handed the answer) and `test_filter_still_receives_the_real_observation`
 (the filter is not starved). Either failure is silent at runtime.
 
+THE OPT-IN RAW INPUT (2026-09-23, change_mds/framestack_oddeven_raw_obs_2026-09-23.md).
+`--policy_obs raw` (a domain flag; default `step_index`, the choice above,
+byte for byte) makes `obs_dict["obs"]` = `[step / cap, o_1 / n, ..., o_m / n]`
+(m = obs_per_step). It exists for the `framestack` arm, the no-belief
+control: stacked over the whole episode, those frames ARE the observation
+history, so the control can in principle do what a belief does. The reason
+the raw observation was rejected above still holds for the belief arms --
+under `raw` they are handed the parity too -- so it is a separate condition,
+never a silent change. The filter path is the same under both choices: it
+reads `info["observations"]`.
+
 PARTICLE SCALING. Particles are the raw integer states 1..n. The extractors
 divide by `arena_scale`, so the state range maps onto about [-1, 1] via
 
@@ -392,6 +403,17 @@ def odd_even_pf_interaction_mapper(base_env_obs, base_env_info,
     return {"predict_args": {}, "update_args": {"obs_from_env": observations}}
 
 
+#: What `obs_dict["obs"]` holds on this domain (`--policy_obs`, 2026-09-23). The first entry is
+#: the default and the only behaviour before that date.
+POLICY_OBS_CHOICES = ("step_index", "raw")
+
+
+def _check_policy_obs(policy_obs: str) -> str:
+    if policy_obs not in POLICY_OBS_CHOICES:
+        raise ValueError(f"unknown policy_obs {policy_obs!r}; choose one of {POLICY_OBS_CHOICES}")
+    return policy_obs
+
+
 class StepIndexObservationWrapper(gym.ObservationWrapper):
     """Replace the env's observation with the normalized step index.
 
@@ -403,18 +425,40 @@ class StepIndexObservationWrapper(gym.ObservationWrapper):
     Normalized by the episode cap so the value is in [0, 1] whatever the
     variant's horizon, which keeps the two n=50 variants (caps 50 and 200)
     on one input scale.
+
+    `policy_obs="raw"` (opt-in, 2026-09-23; the default `"step_index"` is
+    the behaviour above, unchanged) keeps the step's own observations beside
+    the step index: `[step / cap, o_1 / n, ..., o_m / n]`, float32, with
+    m = obs_per_step (the env's observation width) and n = n_dist_size, so
+    every entry is in [0, 1] (the observations are integers in [1, n]). The
+    wrapper stays at the same place in the chain, so the filter path is
+    unchanged: it still reads `info["observations"]`.
     """
 
-    def __init__(self, env: gym.Env, episode_cap: int):
+    def __init__(self, env: gym.Env, episode_cap: int, policy_obs: str = "step_index",
+                 n_dist_size: int | None = None):
         super().__init__(env)
         if episode_cap <= 0:
             raise ValueError(f"episode_cap must be positive, got {episode_cap}")
         self.episode_cap = int(episode_cap)
-        self.observation_space = gym.spaces.Box(
-            low=0.0, high=1.0, shape=(1,), dtype=np.float32)
+        self.policy_obs = _check_policy_obs(policy_obs)
+        if self.policy_obs == "step_index":
+            self.observation_space = gym.spaces.Box(
+                low=0.0, high=1.0, shape=(1,), dtype=np.float32)
+        else:
+            self.n_dist_size = int(n_dist_size if n_dist_size is not None
+                                   else env.unwrapped.n_dist_size)
+            self.obs_per_step = int(np.prod(env.observation_space.shape))
+            self.observation_space = gym.spaces.Box(
+                low=0.0, high=1.0, shape=(1 + self.obs_per_step,), dtype=np.float32)
         self._step_count = 0
 
     def observation(self, observation):
+        if self.policy_obs == "raw":
+            # The step's observations, scaled by n into (0, 1], after the step index.
+            raw = np.asarray(observation, dtype=np.float64).ravel() / self.n_dist_size
+            return np.concatenate(
+                [[self._step_count / self.episode_cap], raw]).astype(np.float32)
         # The raw `observation` is DISCARDED here on purpose. It is still
         # available to the filter through info["observations"].
         return np.array([self._step_count / self.episode_cap],
@@ -558,6 +602,7 @@ def make_odd_even_belief_env(
     n_dist_size: int | None = None,
     episode_cap: int | None = None,
     particle_filter_kwargs: dict | None = None,
+    policy_obs: str = "step_index",
 ):
     """Return a callable that builds one Odd-Even belief env.
 
@@ -574,7 +619,11 @@ def make_odd_even_belief_env(
         env_id / particle_filter_class / n_dist_size / episode_cap: Overrides
             for the registry, for a test or a one-off. Each one is a chance
             for the env and the filter to disagree, so prefer `variant`.
+        policy_obs: What `obs_dict["obs"]` holds -- `"step_index"` (default,
+            `[step / cap]`) or `"raw"` (`[step / cap, o_1 / n, ..., o_m / n]`;
+            2026-09-23). The filter reads `info["observations"]` either way.
     """
+    policy_obs = _check_policy_obs(policy_obs)
     resolved = variants.resolve(variant)
     env_id = env_id or resolved.env_id
     particle_filter_class = (particle_filter_class
@@ -618,7 +667,11 @@ def make_odd_even_belief_env(
                 f"built with {n_dist_size}. The filter's likelihood table "
                 "would be for a different POMDP and belief propagation would "
                 "diverge from the env silently.")
-        env = StepIndexObservationWrapper(env, episode_cap=episode_cap)
+        if policy_obs == "step_index":
+            env = StepIndexObservationWrapper(env, episode_cap=episode_cap)
+        else:
+            env = StepIndexObservationWrapper(env, episode_cap=episode_cap,
+                                              policy_obs=policy_obs, n_dist_size=n_dist_size)
         env = OddEvenPFDictWrapper(
             env=env,
             particle_filter_class=particle_filter_class,
@@ -1164,7 +1217,34 @@ def print_metrics_block(name: str, metrics: dict, collapse_step: int) -> None:
           f"pooled {reward['pooled_sem']:.3f})")
 
 
+def _add_policy_obs_argument(parser, door: str) -> None:
+    """`--policy_obs`, the same flag at the three doors that build the belief env (train, eval,
+    collect; 2026-09-23). Default `step_index`: the recorded behaviour."""
+    parser.add_argument(
+        "--policy_obs", type=str, default="step_index", choices=POLICY_OBS_CHOICES,
+        help="What the policy's obs key holds. step_index (default, every recorded run): "
+             "[step / cap] only; the observations reach the particle filter alone. raw: "
+             "[step / cap, o_1 / n, ..., o_m / n], the step's own observations too (for the "
+             "framestack no-belief control; it also hands the belief arms the parity). "
+             + {"train": "Recorded in run_config.json.",
+                "eval": "Must be the value the checkpoint was trained with; a contradiction "
+                        "with the zip's frame width is refused.",
+                "collect": "With --behaviour policy it must be the value the agent was "
+                           "trained with."}[door])
+
+
+def _eval_frame_width_hint(args, checkpoint_frame_width, env_frame_width) -> str:
+    """The Odd-Even sentence for the eval door's frame-width refusal: a step_index frame is 1
+    wide, a raw frame 1 + obs_per_step."""
+    guess = ("step_index" if checkpoint_frame_width == 1 else "raw")
+    return (f"On odd_even a frame is 1 wide under --policy_obs step_index and 1 + obs_per_step "
+            f"wide under --policy_obs raw; this eval ran with --policy_obs {args.policy_obs}. "
+            f"The checkpoint's frames ({checkpoint_frame_width:g} wide) match --policy_obs "
+            f"{guess}: pass that (the run's run_config.json records it).")
+
+
 def _eval_add_arguments(parser) -> None:
+    _add_policy_obs_argument(parser, "eval")
     parser.add_argument(
         "--collapse_step", type=int, default=COLLAPSE_STEP,
         help=f"Transient/steady boundary (default {COLLAPSE_STEP}, the measured n=50 "
@@ -2348,6 +2428,7 @@ def _collect_add_arguments(parser) -> None:
     parser.add_argument("--early_frac", type=float, default=0.40)
     parser.add_argument("--mid_frac", type=float, default=0.35)
     parser.add_argument("--late_frac", type=float, default=0.25)
+    _add_policy_obs_argument(parser, "collect")
 
 
 def _collect_resolve_arguments(parser, args, domain) -> dict:
@@ -2362,7 +2443,8 @@ def _collect_resolve_arguments(parser, args, domain) -> dict:
     print(f"Variant: {args.variant} | env: {resolved.env_id} | "
           f"filter: {particle_filter_class.__name__} | "
           f"n={resolved.n_dist_size} | cap={variants.episode_cap(args.variant)}")
-    return {"env_id": resolved.env_id, "particle_filter_class": particle_filter_class}
+    return {"env_id": resolved.env_id, "particle_filter_class": particle_filter_class,
+            "policy_obs": getattr(args, "policy_obs", "step_index")}
 
 
 def _collect_prepare(args, options) -> dict:
@@ -2377,6 +2459,7 @@ def _collect_make_env(args, options, state):
         seed=args.seed,
         variant=args.variant,
         particle_filter_class=options["particle_filter_class"],
+        policy_obs=options.get("policy_obs", "step_index"),
     )()
 
 
@@ -2524,22 +2607,31 @@ ODD_EVEN_COLLECTION = Collection(
 
 
 def _add_arguments(parser) -> None:
-    """The one flag that belongs to the Odd-Even problem (help text from 4_train_rl_cgf.py)."""
+    """The flags that belong to the Odd-Even problem (help text from 4_train_rl_cgf.py), and
+    `--policy_obs` (2026-09-23)."""
     parser.add_argument(
         "--particle_filter", type=str, default=None,
         choices=sorted(PARTICLE_FILTERS),
         help="Override the variant's filter. The bootstrap filter is a "
              "deliberate arm (a lossier belief on the same env).")
+    _add_policy_obs_argument(parser, "train")
+
+
+def _resolve_arguments(parser, args) -> dict:
+    """The env options `_make_env` reads: the policy input (2026-09-23)."""
+    return {"policy_obs": args.policy_obs}
 
 
 def _make_env(variant: str, *, num_particles: int, particle_filter_class: type, seed: int,
               rank: int, monitor_dir: str | None, training: bool, options: dict):
     """One worker's env through `make_odd_even_belief_env`. The eval env is the training env
     at another rank without a monitor directory, as `4_train_rl_cgf.build_envs` built it;
-    `training` and `options` are unused here (no shaping, no curriculum)."""
+    `training` is unused here (no shaping, no curriculum); `options` carries `policy_obs`
+    (2026-09-23; absent = `step_index`, the recorded env)."""
     return make_odd_even_belief_env(
         num_particles=num_particles, rank=rank, seed=seed, monitor_dir=monitor_dir,
-        variant=variant, particle_filter_class=particle_filter_class)
+        variant=variant, particle_filter_class=particle_filter_class,
+        policy_obs=(options or {}).get("policy_obs", "step_index"))
 
 
 def _cgf_t_init_max_default(args):
@@ -2564,7 +2656,7 @@ ODD_EVEN = Domain(
     make_vec_normalize=make_vec_normalize,
     particle_filter=lambda args: resolve_particle_filter(args.variant, args.particle_filter),
     add_arguments=_add_arguments,
-    resolve_arguments=lambda parser, args: {},
+    resolve_arguments=_resolve_arguments,
     schedules=lambda args: (),
     run_config_extras=lambda args: dict(n_dist_size=resolve(args.variant).n_dist_size,
                                         episode_cap=episode_cap(args.variant)),
@@ -2581,6 +2673,10 @@ ODD_EVEN = Domain(
                     t_init_max_default=_cgf_t_init_max_default),
         # The small ClusterHunt-sized encoder adopted 2026-09-05 (~109k parameters).
         "st": dict(num_inds=16, dim_hidden=64, num_post_sab=2),
+        # Zero frames in the history slots at reset (2026-09-23): under --policy_obs raw a
+        # repeated reset frame would read as repeated EVIDENCE (the same observation drawn k
+        # times), and a zero frame is unmistakable (every real frame has o / n > 0).
+        "framestack": dict(stack_padding="zeros"),
     },
     # The ST arm gets the collapse sentinel on top of the shared feature logging, in that
     # order (the sentinel records under its own keys so it cannot overwrite the shared ones).
@@ -2591,7 +2687,10 @@ ODD_EVEN = Domain(
     evaluation=Evaluation(add_arguments=_eval_add_arguments, default_n_episodes=400,
                           reseed_per_episode=True, references=_eval_references,
                           references_only=lambda args: bool(args.baselines_only),
-                          report=_eval_report),
+                          report=_eval_report,
+                          # --policy_obs (2026-09-23): the eval env is built like the run's.
+                          options=lambda args: {"policy_obs": args.policy_obs},
+                          frame_width_hint=_eval_frame_width_hint),
     # Supervised pretraining on the exact posterior (3_pretrain_st_belief.py's three
     # objectives, batch 7.3); the generic reconstruction objective needs no declaration.
     # `belief_kl` is what `rl/pretrain.py --domain odd_even` runs when --objective is omitted.

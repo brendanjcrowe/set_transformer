@@ -11,7 +11,12 @@ Pins the three pieces of ``change_mds/framestack_arm_2026-09-22.md`` (design:
   and ``Encoder.obs_history`` is 1 for every OTHER encoder;
 * the doors -- a short real run on hunt/cluster_hunt trains through a 5-stacked env, and a
   standalone eval of that checkpoint WITH NO ``--n_stack`` on the command line rebuilds the
-  same 5-stacked env from the zip.
+  same 5-stacked env from the zip;
+* the padding (2026-09-23, ``change_mds/framestack_oddeven_raw_obs_2026-09-23.md``) --
+  ``zeros`` fills the history slots with zero frames, k = 1 stays the identity whatever the
+  padding, and the value round-trips through the zip reader with ``reset_frame`` as the
+  default for a zip that does not record it. The Odd-Even raw-observation half is in
+  ``tests/test_framestack_odd_even.py``.
 """
 from __future__ import annotations
 
@@ -44,7 +49,11 @@ from set_transformer.rl.feature_extractors.framestack import (  # noqa: E402
 )
 from set_transformer.rl.wrappers.obs_history import (  # noqa: E402
     ObsHistoryDictWrapper,
+    ObsHistorySpec,
     checkpoint_obs_history,
+    checkpoint_obs_history_spec,
+    checkpoint_obs_width,
+    frame_width_mismatch,
     with_obs_history,
 )
 
@@ -208,18 +217,21 @@ def test_framestack_is_analytic_and_carries_n_stack_into_the_extractor_kwargs():
     enc = encoders.get("framestack")
     assert enc.learned is False and enc.pretrained_dest is None
     assert enc.extractor_class is FrameStackFeaturesExtractor
-    args = argparse.Namespace(n_stack=5)
-    assert enc.extractor_kwargs(args) == {"n_stack": 5}
+    args = argparse.Namespace(n_stack=5, stack_padding="reset_frame")
+    assert enc.extractor_kwargs(args) == {"n_stack": 5, "padding": "reset_frame"}
     assert enc.obs_history(args) == 5
+    assert enc.obs_history_padding(args) == "reset_frame"
+    assert enc.obs_history_padding(argparse.Namespace(n_stack=5, stack_padding="zeros")) == "zeros"
     assert enc.callbacks({}, {}) == []
 
 
 def test_obs_history_is_one_for_every_other_encoder():
-    args = argparse.Namespace(n_stack=5)
+    args = argparse.Namespace(n_stack=5, stack_padding="zeros")
     for name, enc in encoders.ENCODERS.items():
         if name == "framestack":
             continue
         assert enc.obs_history(args) == 1, name
+        assert enc.obs_history_padding(args) == "reset_frame", name
 
 
 def test_n_stack_above_one_is_refused_on_odd_even(monkeypatch, tmp_path):
@@ -252,7 +264,8 @@ def test_the_extractor_refuses_a_width_that_is_not_a_multiple_of_n_stack():
 def test_the_extractor_passes_the_stacked_obs_through_as_a_fresh_tensor():
     extractor = FrameStackFeaturesExtractor(_space(10), n_stack=5)
     assert extractor.features_dim == 10
-    assert extractor._geometry == dict(encoder="framestack", n_stack=5, frame_dim=2)
+    assert extractor._geometry == dict(encoder="framestack", n_stack=5, frame_dim=2,
+                                       padding="reset_frame")
     obs = {"obs": torch.arange(20, dtype=torch.float32).reshape(2, 10),
            "particles": torch.zeros(2, N, 2), "weights": torch.zeros(2, N)}
     out = extractor(obs)
@@ -314,3 +327,128 @@ def test_attribute_forwarding_does_not_recurse_before_env_is_set():
         _ = w.env
     assert not hasattr(w, "some_public_name")
     assert not hasattr(w, "_some_private_name")
+
+
+# --------------------------------------------------------------------------
+# 7. Padding (2026-09-23): zeros, the identity at k = 1, the zip round trip
+# --------------------------------------------------------------------------
+
+def test_zero_padding_fills_the_history_with_zero_frames_then_slides():
+    class _FromOne(_FakeDictEnv):
+        """Frames 1, 2, 3, ... so a zero frame cannot be confused with the reset frame."""
+
+        def _obs(self):
+            out = super()._obs()
+            out["obs"] = out["obs"] + 1.0
+            return out
+
+    env = ObsHistoryDictWrapper(_FromOne(), 4, padding="zeros")
+    assert env.padding == "zeros"
+    obs, _ = env.reset()
+    assert obs["obs"].dtype == np.float32 and obs["obs"].shape == (4 * D,)
+    assert np.array_equal(obs["obs"], np.repeat(np.array([0, 0, 0, 1], dtype=np.float32), D))
+    for expected in ([0, 0, 1, 2], [0, 1, 2, 3], [1, 2, 3, 4], [2, 3, 4, 5]):
+        obs, *_ = env.step(0)
+        assert np.array_equal(obs["obs"], np.repeat(np.array(expected, dtype=np.float32), D))
+    # The next episode starts from zero frames again.
+    obs, _ = env.reset()
+    assert np.array_equal(obs["obs"], np.repeat(np.array([0, 0, 0, 1], dtype=np.float32), D))
+    # The same env with the default padding repeats the reset frame instead.
+    obs, _ = ObsHistoryDictWrapper(_FromOne(), 4).reset()
+    assert np.array_equal(obs["obs"], np.ones(4 * D, dtype=np.float32))
+
+
+def test_the_zero_frame_takes_the_obs_boxs_dtype():
+    class _F64(_FakeDictEnv):
+        def __init__(self):
+            super().__init__()
+            self.observation_space = gym.spaces.Dict({
+                **self.observation_space.spaces,
+                "obs": gym.spaces.Box(low=-1.0, high=1.0, shape=(D,), dtype=np.float64)})
+
+        def _obs(self):
+            out = super()._obs()
+            out["obs"] = out["obs"].astype(np.float64) + 1.0
+            return out
+
+    env = ObsHistoryDictWrapper(_F64(), 3, padding="zeros")
+    obs, _ = env.reset()
+    assert obs["obs"].dtype == np.float64
+    assert all(f.dtype == np.float64 for f in env._frames)
+
+
+@pytest.mark.parametrize("k", [1, 0, -3])
+def test_with_obs_history_is_the_identity_at_k_one_whatever_the_padding(k):
+    thunk = _FakeDictEnv
+    assert with_obs_history(thunk, k, "zeros") is thunk
+    assert with_obs_history(thunk, k, "reset_frame") is thunk
+
+
+def test_k_equal_one_with_zero_padding_is_still_the_identity():
+    plain = _FakeDictEnv()
+    env = ObsHistoryDictWrapper(_FakeDictEnv(), 1, padding="zeros")
+    assert env.observation_space["obs"] == plain.observation_space["obs"]
+    a, _ = plain.reset()
+    b, _ = env.reset()
+    assert np.array_equal(a["obs"], b["obs"])
+    for _ in range(3):
+        a, *_ = plain.step(0)
+        b, *_ = env.step(0)
+        assert np.array_equal(a["obs"], b["obs"])
+
+
+def test_an_unknown_padding_is_refused_everywhere():
+    with pytest.raises(ValueError, match="unknown stack padding"):
+        ObsHistoryDictWrapper(_FakeDictEnv(), 3, padding="mean")
+    with pytest.raises(ValueError, match="unknown stack padding"):
+        with_obs_history(_FakeDictEnv, 3, "mean")
+    with pytest.raises(ValueError, match="unknown stack padding"):
+        FrameStackFeaturesExtractor(_space(10), n_stack=5, padding="mean")
+
+
+def test_the_padding_thunk_round_trips_through_cloudpickle():
+    revived = cloudpickle.loads(cloudpickle.dumps(with_obs_history(_FakeDictEnv, 4, "zeros")))
+    env = revived()
+    assert isinstance(env, ObsHistoryDictWrapper) and (env.n_stack, env.padding) == (4, "zeros")
+
+
+def _save_zip(path, n_stack, extractor_kwargs):
+    from stable_baselines3 import PPO
+    from stable_baselines3.common.vec_env import DummyVecEnv
+    venv = DummyVecEnv([lambda: ObsHistoryDictWrapper(_FakeDictEnv(), n_stack)])
+    policy_kwargs = {"features_extractor_class": FrameStackFeaturesExtractor}
+    if extractor_kwargs is not None:
+        policy_kwargs["features_extractor_kwargs"] = extractor_kwargs
+    PPO("MultiInputPolicy", venv, n_steps=64, batch_size=64, device="cpu",
+        policy_kwargs=policy_kwargs).save(str(path))
+    return str(path)
+
+
+def test_the_spec_reader_returns_both_values_and_defaults_each_on_its_own(tmp_path):
+    assert ObsHistorySpec() == (1, "reset_frame")
+    assert checkpoint_obs_history_spec(None) == (1, "reset_frame")
+    assert checkpoint_obs_history_spec(str(tmp_path / "missing.zip")) == (1, "reset_frame")
+    junk = tmp_path / "junk.zip"
+    junk.write_bytes(b"not a zip")
+    assert checkpoint_obs_history_spec(str(junk)) == (1, "reset_frame")
+    assert checkpoint_obs_width(str(junk)) is None
+
+    # A 2026-09-22 framestack zip: n_stack recorded, padding not -> reset_frame.
+    old = _save_zip(tmp_path / "old.zip", 5, {"n_stack": 5})
+    assert checkpoint_obs_history_spec(old) == (5, "reset_frame")
+    assert checkpoint_obs_history(old) == 5
+    assert checkpoint_obs_width(old) == 5 * D
+    # A zip that records both.
+    new = _save_zip(tmp_path / "new.zip", 5, {"n_stack": 5, "padding": "zeros"})
+    spec = checkpoint_obs_history_spec(new)
+    assert spec == (5, "zeros") and spec.n_stack == 5 and spec.padding == "zeros"
+    # No extractor kwargs at all (the shape of an arm without constructor arguments).
+    bare = _save_zip(tmp_path / "bare.zip", 1, None)
+    assert checkpoint_obs_history_spec(bare) == (1, "reset_frame")
+
+
+def test_frame_width_mismatch_is_silent_when_the_widths_agree_or_are_unknown():
+    assert frame_width_mismatch(None, 30, 30) is None
+    assert frame_width_mismatch(60, 60, 30) is None
+    msg = frame_width_mismatch(60, 30, 30)
+    assert "60 wide (30 frame(s) of 2)" in msg and "30 wide (30 frame(s) of 1)" in msg

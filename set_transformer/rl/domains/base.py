@@ -64,6 +64,11 @@ class Evaluation:
     #: ``episodes`` is the list of :class:`~set_transformer.rl.eval_true_reward.Episode`
     #: records (per-step rewards and infos). ``None`` selects the script's success-rate report.
     report: Callable | None = None
+    #: ``frame_width_hint(args, checkpoint_frame_width, env_frame_width) -> str``: one sentence
+    #: appended to the error the script raises when the checkpoint's ``obs`` width contradicts
+    #: the eval env's, naming the domain flag that decides a frame's width (Odd-Even:
+    #: ``--policy_obs``; 2026-09-23). Empty by default: the generic message stands alone.
+    frame_width_hint: Callable = lambda args, checkpoint_frame_width, env_frame_width: ""
 
 
 @dataclass(frozen=True)

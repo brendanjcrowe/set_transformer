@@ -224,18 +224,32 @@ def collect_arrays(domain: Domain, args, options: dict, *, progress: bool = True
     env = collection.make_env(args, options, state)
     if getattr(args, "behaviour", "scripted") == "policy":
         # The agent may have been trained on stacked base observations (the framestack arm);
-        # k is recorded in its zip, so the collection env stacks the same number and the
-        # policy sees the input it was trained on. 1 for every other arm: no wrapper is built
-        # and the env is the one every recorded collection rolled (2026-09-22,
-        # change_mds/framestack_arm_2026-09-22.md).
+        # k and the padding are recorded in its zip, so the collection env stacks the same
+        # number the same way and the policy sees the input it was trained on. (1, reset_frame)
+        # for every other arm: no wrapper is built and the env is the one every recorded
+        # collection rolled (2026-09-22, change_mds/framestack_arm_2026-09-22.md; padding
+        # 2026-09-23).
         from set_transformer.rl.wrappers.obs_history import (   # noqa: PLC0415
-            ObsHistoryDictWrapper, checkpoint_obs_history,
+            ObsHistoryDictWrapper, checkpoint_obs_history_spec, checkpoint_obs_width,
+            frame_width_mismatch,
         )
-        obs_history = checkpoint_obs_history(args.policy_path)
+        obs_history, padding = checkpoint_obs_history_spec(args.policy_path)
         if obs_history > 1:
-            env = ObsHistoryDictWrapper(env, obs_history)
+            env = ObsHistoryDictWrapper(env, obs_history, padding)
             print(f"Frame stacking: the agent was trained on {obs_history} stacked base "
-                  f"observations; the collection env stacks the same number.")
+                  f"observations (padding: {padding}); the collection env stacks the same number.")
+        # A domain flag can change what one frame holds (Odd-Even --policy_obs, 2026-09-23):
+        # refuse a contradiction with the agent before a row is rolled. Silent when the widths
+        # agree or the zip cannot be read.
+        obs_space = getattr(env.observation_space, "spaces", {}).get("obs")
+        if obs_space is not None:
+            mismatch = frame_width_mismatch(checkpoint_obs_width(args.policy_path),
+                                            int(obs_space.shape[0]), obs_history)
+            if mismatch:
+                env.close()
+                raise ValueError(f"--policy_path {args.policy_path}: {mismatch} Pass the domain "
+                                 "flags the agent was trained with (Odd-Even: --policy_obs, "
+                                 "recorded in its run_config.json).")
     centre = collection.particle_centre(args, options)
     policy_act = make_policy_actor(domain, args) if getattr(args, "behaviour", "scripted") == "policy" else None
 

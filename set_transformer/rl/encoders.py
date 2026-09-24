@@ -18,6 +18,9 @@ A fifth hook, ``obs_history(args) -> int``, is the one thing an encoder may say 
 how many consecutive base observations it needs stacked into the ``"obs"`` key. It is 1 for
 every arm but ``framestack``, and at 1 the harness builds no wrapper, so the env is unchanged
 (2026-09-22, ``change_mds/framestack_arm_2026-09-22.md``).
+Its sibling ``obs_history_padding(args) -> str`` says how the history slots are filled at
+reset (``reset_frame``, the default of every arm, or ``zeros``; 2026-09-23,
+``change_mds/framestack_oddeven_raw_obs_2026-09-23.md``). Only ``framestack`` sets it.
 
 The start mode -- pretrained checkpoint, frozen, encoder learning-rate scale, unfreeze step --
 is ONE flag group for every learned encoder (:func:`add_start_mode_arguments`): the generic
@@ -127,6 +130,10 @@ class Encoder:
     #: ``framestack``) = the current frame only, and the harness then builds NO wrapper at all
     #: (2026-09-22, change_mds/framestack_arm_2026-09-22.md).
     obs_history: Callable[[argparse.Namespace], int] = lambda args: 1
+    #: ``obs_history_padding(args) -> str``: what fills the ``obs_history - 1`` history slots at
+    #: reset -- ``"reset_frame"`` (the default, every arm but ``framestack``) or ``"zeros"``.
+    #: Irrelevant at ``obs_history == 1``: no wrapper is built (2026-09-23).
+    obs_history_padding: Callable[[argparse.Namespace], str] = lambda args: "reset_frame"
 
     def start_mode(self, args: argparse.Namespace) -> StartMode:
         if not self.learned:
@@ -755,23 +762,34 @@ def _pooled_extractor_kwargs(args: argparse.Namespace) -> dict:
 
 
 def _framestack_add_arguments(parser: argparse.ArgumentParser, domain: Domain) -> None:
+    d = domain.encoder_defaults.get("framestack", {})
+    padding_default = d.get("stack_padding", "reset_frame")
     g = parser.add_argument_group("framestack encoder")
     g.add_argument("--n_stack", type=int, default=5,
                    help="How many consecutive base observations the policy sees, newest last "
                         "(1 = the current frame only, no stacking). The belief is ignored: this "
                         "arm is the no-belief control.")
+    g.add_argument("--stack_padding", type=str, default=padding_default,
+                   choices=("reset_frame", "zeros"),
+                   help="What fills the n_stack - 1 history slots at reset: copies of the reset "
+                        "frame, or zero frames. Recorded in the checkpoint beside n_stack, so eval "
+                        f"and collect read it off the zip. Default on this domain: {padding_default}.")
 
 
 def _framestack_resolve_arguments(parser: argparse.ArgumentParser, args: argparse.Namespace,
                                   domain: Domain) -> None:
-    if domain.name == "odd_even" and int(args.n_stack) > 1:
-        # Odd-Even's base observation is a 1-D step index, [step_count / episode_cap]
+    if (domain.name == "odd_even" and int(args.n_stack) > 1
+            and getattr(args, "policy_obs", "step_index") == "step_index"):
+        # Odd-Even's DEFAULT base observation is a 1-D step index, [step_count / episode_cap]
         # (rl/domains/odd_even.py StepIndexObservationWrapper): k copies of it are k
         # deterministic, perfectly collinear features and carry zero belief information
-        # (plan section 8 trap 6).
-        parser.error("--n_stack > 1 is meaningless on odd_even: its base observation is the "
-                     "deterministic step index, so the stacked frames are collinear and carry "
-                     "no belief information. Use --n_stack 1.")
+        # (plan section 8 trap 6). Under --policy_obs raw (2026-09-23) each frame also carries
+        # the step's own observations, so the stack is the observation history and the arm
+        # is meaningful.
+        parser.error("--n_stack > 1 is meaningless on odd_even with --policy_obs step_index: "
+                     "that base observation is the deterministic step index, so the stacked "
+                     "frames are collinear and carry no belief information. Use --policy_obs "
+                     "raw (each frame then carries the step's observations), or --n_stack 1.")
 
 
 def _kmoments_add_arguments(parser: argparse.ArgumentParser, domain: Domain) -> None:
@@ -838,9 +856,10 @@ ENCODERS: dict[str, Encoder] = {
         name="framestack", extractor_class=FrameStackFeaturesExtractor, learned=False,
         add_arguments=_framestack_add_arguments,
         resolve_arguments=_framestack_resolve_arguments,
-        extractor_kwargs=lambda args: dict(n_stack=args.n_stack),
+        extractor_kwargs=lambda args: dict(n_stack=args.n_stack, padding=args.stack_padding),
         callbacks=lambda kwargs, options: [],
         obs_history=lambda args: int(args.n_stack),
+        obs_history_padding=lambda args: str(args.stack_padding),
     ),
 }
 

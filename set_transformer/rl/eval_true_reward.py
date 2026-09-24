@@ -65,7 +65,12 @@ from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from set_transformer.rl import domains as _domains
 from set_transformer.rl import run_records
 from set_transformer.rl.domains.base import Domain
-from set_transformer.rl.wrappers.obs_history import checkpoint_obs_history, with_obs_history
+from set_transformer.rl.wrappers.obs_history import (
+    checkpoint_obs_history_spec,
+    checkpoint_obs_width,
+    frame_width_mismatch,
+    with_obs_history,
+)
 
 
 @dataclass
@@ -315,20 +320,37 @@ def main(argv: Sequence[str] | None = None, *, domain: Domain | str | None = Non
             f"--num_particles {args.num_particles} contradicts the checkpoint, "
             f"which was trained with {trained_particles}. Omit the flag.")
 
-    # 2. The frame count, off the same zip: the framestack arm's env stacks the last k base
-    # observations, and k is recorded in the checkpoint's features_extractor_kwargs, so no
-    # eval-side flag exists and a mismatch is impossible by construction (2026-09-22,
-    # change_mds/framestack_arm_2026-09-22.md). 1 for every other arm: the thunk is unchanged.
-    obs_history = checkpoint_obs_history(args.model_path)
+    # 2. The frame count and the padding, off the same zip: the framestack arm's env stacks the
+    # last k base observations, and k and the padding are recorded in the checkpoint's
+    # features_extractor_kwargs, so no eval-side flag exists and a mismatch is impossible by
+    # construction (2026-09-22, change_mds/framestack_arm_2026-09-22.md; padding 2026-09-23).
+    # (1, "reset_frame") for every other arm: the thunk is unchanged.
+    obs_history, padding = checkpoint_obs_history_spec(args.model_path)
     if obs_history > 1:
         print(f"Frame stacking: the checkpoint was trained on {obs_history} stacked base "
-              f"observations; the eval env stacks the same number.")
+              f"observations (padding: {padding}); the eval env stacks the same number.")
 
     # 3. The domain's eval env; VecNormalize frozen and without reward normalisation.
     env = DummyVecEnv([with_obs_history(domain.make_env(
         args.variant, num_particles=args.num_particles,
         particle_filter_class=variant.particle_filter, seed=args.seed, rank=0,
-        monitor_dir=None, training=False, options=evaluation.options(args)), obs_history)])
+        monitor_dir=None, training=False, options=evaluation.options(args)),
+        obs_history, padding)])
+    # The per-frame width is NOT on the zip's side alone: a domain flag can change what one
+    # frame holds (Odd-Even --policy_obs, 2026-09-23). Refuse a contradiction clearly here,
+    # before VecNormalize.load / PPO.load refuse it with a shape error. Silent when the widths
+    # agree (every valid evaluation) or when the zip cannot be read.
+    obs_space = getattr(env.observation_space, "spaces", {}).get("obs")
+    env_width = int(obs_space.shape[0]) if obs_space is not None else None
+    checkpoint_width = checkpoint_obs_width(args.model_path) if env_width is not None else None
+    mismatch = frame_width_mismatch(checkpoint_width, env_width, obs_history)
+    if mismatch:
+        env.close()
+        k = max(obs_history, 1)
+        hint = evaluation.frame_width_hint(args, checkpoint_width / k, env_width / k)
+        parser.error(f"--model_path {args.model_path}: {mismatch}" + (f" {hint}" if hint else ""))
+    if obs_history > 1 and env_width is not None:
+        print(f"  obs width {env_width} = {obs_history} frames x {env_width // obs_history}")
     if args.vecnormalize_path and os.path.exists(args.vecnormalize_path):
         env = VecNormalize.load(args.vecnormalize_path, env)
         env.training = False
