@@ -47,10 +47,18 @@ The numbers this module produces are a NEW table under the record's protocol, no
 reproduction of ``domain_mds/{cluster_hunt,least_mass}.md``: the extractors are the harness
 ones, the ST reads a (constant) weight channel, and the trainer is the shared PPO loop.
 ``src/hunt_tasks/`` stays untouched as the record (decision 9c-6).
+
+**Policy input** (2026-09-24, ``change_mds/framestack_hunt_pings_2026-09-24.md``): the domain flag
+``--policy_obs agent|pings``. ``agent`` (the default, every recorded run) is the chain above.
+``pings`` is for the ``framestack`` arm only: :class:`HuntPingObsWrapper` takes the place of
+:class:`HuntAgentObsWrapper` and puts this step's anonymous beacon pings beside the agent position
+in ``obs``, so the no-belief control gets raw per-step observations of the same hidden layout.
+The env and the belief keys do not change.
 """
 
 from __future__ import annotations
 
+import argparse
 import itertools
 import json
 import os
@@ -462,6 +470,144 @@ class HuntScheduleWrapper(gym.Wrapper):
 
 
 # ---------------------------------------------------------------------------
+# --policy_obs pings (2026-09-24): raw per-step observations for the framestack arm
+#
+# The envs emit a fresh 100-particle cloud from the hidden layout at every step, and the belief arms
+# read it. The framestack arm needs raw per-step OBSERVATIONS of a POMDP whose belief that cloud is,
+# fitted onto the SAME env, with no change to the env or to the belief arms. The story is rescue
+# beacons: each cluster is a person with a radio beacon, and at each step a beacon may send an
+# ANONYMOUS ping, a GPS fix of its position (the true centre plus a GPS error N(0, sigma_j^2) per
+# axis, sigma_j the cluster width). The cloud is what a filter converges to after long listening
+# (sort the pings into groups by likelihood, count them, estimate each group's spread); the
+# framestack arm starts each episode with an empty memory and keeps k frames. The pings carry no
+# IDs, because the cloud carries none.
+# ---------------------------------------------------------------------------
+
+#: What the policy's ``obs`` key holds on this domain (``--policy_obs``, 2026-09-24). ``agent``
+#: (the default, every recorded run): the 2-D agent position, through :class:`HuntAgentObsWrapper`.
+#: ``pings`` (the ``framestack`` arm only): the agent position and this step's anonymous pings,
+#: through :class:`HuntPingObsWrapper`.
+POLICY_OBS_CHOICES = ("agent", "pings")
+
+#: The second word of the ping generator's seed ``[seed, PING_SEED_TAG]`` ("ping" in ASCII), so
+#: the ping stream is never the stream of the env's own ``_rng``, which is seeded by ``seed`` alone.
+PING_SEED_TAG = 0x70696E67
+
+
+def _check_policy_obs(policy_obs: str) -> str:
+    if policy_obs not in POLICY_OBS_CHOICES:
+        raise ValueError(f"unknown policy_obs {policy_obs!r}; choose one of {POLICY_OBS_CHOICES}")
+    return policy_obs
+
+
+def ping_frame_width(n_clusters: int) -> int:
+    """The width of one ``pings`` frame: the agent position, then ``(bit, dx, dy)`` per slot."""
+    return 2 + 3 * int(n_clusters)
+
+
+def _ping_generator(seed: int) -> np.random.Generator:
+    return np.random.default_rng([int(seed), PING_SEED_TAG])
+
+
+def _ping_model(unwrapped) -> str:
+    """Which beacons ping, by env class: ``every_live`` (``ClusterHuntEnv``) or ``by_mass``
+    (``MinMassHuntEnv``: least_mass and most_var)."""
+    from pdomains.hunt import ClusterHuntEnv, MinMassHuntEnv   # noqa: PLC0415
+    if isinstance(unwrapped, ClusterHuntEnv):
+        return "every_live"
+    if isinstance(unwrapped, MinMassHuntEnv):
+        return "by_mass"
+    raise TypeError(f"--policy_obs pings needs a pdomains.hunt env; got {type(unwrapped).__name__}")
+
+
+class HuntPingObsWrapper(gym.ObservationWrapper):
+    """Dict ``{"agent", "particles"}`` -> the agent position and THIS step's anonymous pings
+    (``--policy_obs pings``, 2026-09-24; ``change_mds/framestack_hunt_pings_2026-09-24.md``).
+
+    The frame is a ``Box(-2, 2, (2 + 3 * n_clusters,), float32)``, 17 wide at the registered five
+    clusters::
+
+        [agent_x, agent_y,  bit_1, dx_1, dy_1,  ...,  bit_K, dx_K, dy_K]
+
+    ``agent`` is the env's own ``(pos - 10) / 10``, the array :class:`HuntAgentObsWrapper` emits.
+    A slot that holds a ping is ``(1, (clip(fix, 0, 20) - pos) / 10)`` with ``pos`` the agent
+    position at THIS step: agent-relative, the frame the belief arms' particles are in (the
+    pass-through filter subtracts ``pos``, the extractors divide by ``arena_scale`` 10). The fix is
+    clipped to the arena first, as the env clips its particles. An empty slot is ``(0, 0, 0)``; the
+    bit is what tells it from a ping that lands on the agent. The slots of a step's pings are a
+    fresh random draw at every step, so no slot index carries a beacon's identity.
+
+    The ping model reads only the state the env already holds:
+
+    * ``ClusterHuntEnv`` (``every_live``): every LIVE cluster pings at every step (everyone is to
+      be rescued); a collected cluster never pings again;
+    * ``MinMassHuntEnv`` (``by_mass``): cluster ``j < k`` pings with probability
+      ``counts[j] / max(counts)``. On least_mass the lightest cluster (the buried person) pings
+      least often. On most_var the counts are equal at k = 5, so every beacon pings at every step,
+      and the widest cluster (the buried person's scattered fixes) is the target.
+
+    A fix is ``centres[j] + sigmas[j] * N(0, I_2)``. The wrapper hands on none of the centres,
+    widths, counts, alive flags or the target.
+
+    Timing: :meth:`observation` runs on the post-step state (and on the post-reset state), so a
+    cluster collected in this step does not ping, as the env redraws its cloud without it.
+
+    Seeding: the wrapper draws from its OWN generator, never from the env's ``_rng``, its
+    ``np_random`` or the global numpy stream, so the env's layouts and clouds are the same under
+    ``agent`` and ``pings``. The generator is seeded from ``[seed, PING_SEED_TAG]`` at construction
+    (the factory's ``seed + rank``) and again at every ``reset(seed=s)`` with ``s`` not None, so the
+    eval's per-episode reseed gives the same pings for the same episode. Draw order per frame
+    (``tests/test_framestack_hunt_pings.py`` re-derives every frame from it): ``by_mass`` only,
+    ``random(k)`` against the rates; then ``standard_normal((m, 2))`` for the m beacons that ping,
+    in cluster order; then ``permutation(n_clusters)``, whose first m entries are their slots.
+
+    Placement: the place of :class:`HuntAgentObsWrapper`, below the PF wrapper, which hands this
+    Box on as ``"obs"``; the pass-through filter still reads the unwrapped env. An env built with
+    ``include_oracle`` is refused, as there.
+    """
+
+    def __init__(self, env: gym.Env, seed: int = 0):
+        super().__init__(env)
+        space = env.observation_space
+        if not isinstance(space, gym.spaces.Dict) or "agent" not in space.spaces:
+            raise TypeError(f"expected a Dict observation space with an 'agent' key, got {space}")
+        if "oracle" in space.spaces:
+            raise ValueError("the env was built with include_oracle=True; the privileged "
+                             "oracle key must not reach the policy through the base obs")
+        unwrapped = env.unwrapped
+        self.ping_model = _ping_model(unwrapped)
+        self.n_clusters = int(unwrapped.cfg.n_clusters)
+        self.observation_space = gym.spaces.Box(
+            low=-2.0, high=2.0, shape=(ping_frame_width(self.n_clusters),), dtype=np.float32)
+        self._ping_rng = _ping_generator(seed)
+
+    def reset(self, *, seed=None, options=None):
+        if seed is not None:
+            self._ping_rng = _ping_generator(seed)
+        return super().reset(seed=seed, options=options)
+
+    def _beacons(self, unwrapped) -> np.ndarray:
+        """The clusters that ping at this step, in cluster order."""
+        if self.ping_model == "every_live":
+            return np.flatnonzero(unwrapped.alive)
+        counts = np.asarray(unwrapped.counts, dtype=np.float64)[: int(unwrapped.k)]
+        return np.flatnonzero(self._ping_rng.random(len(counts)) < counts / counts.max())
+
+    def observation(self, observation):
+        u = self.env.unwrapped
+        beacons = self._beacons(u)
+        fixes = (u.centers[beacons]
+                 + u.sigmas[beacons, None] * self._ping_rng.standard_normal((len(beacons), 2)))
+        fixes = np.clip(fixes, 0.0, 2.0 * ARENA_SCALE)
+        slots = self._ping_rng.permutation(self.n_clusters)[: len(beacons)]
+        pings = np.zeros((self.n_clusters, 3), dtype=np.float64)
+        pings[slots, 0] = 1.0
+        pings[slots, 1:] = (fixes - u.pos) / ARENA_SCALE
+        return np.concatenate([np.asarray(observation["agent"], dtype=np.float64),
+                               pings.ravel()]).astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
 # Schedules
 # ---------------------------------------------------------------------------
 
@@ -506,6 +652,7 @@ def make_hunt_belief_env(
     env_id: str | None = None,
     particle_filter_class: type | None = None,
     schedule_values: dict[str, float] | None = None,
+    policy_obs: str = "agent",
 ):
     """Return a callable that builds one hunt belief env.
 
@@ -514,11 +661,17 @@ def make_hunt_belief_env(
     pass-through filter reading the unwrapped env -> :class:`HuntScheduleWrapper` -> Monitor ->
     :class:`ScheduleRouter` over the two setters. ``schedule_values`` (``setter -> value``) are
     applied once after construction: the eval env is built with the schedules' final values.
+
+    policy_obs="agent" (default, every recorded run) builds exactly the chain above.
+    policy_obs="pings" (2026-09-24, the framestack arm only) puts :class:`HuntPingObsWrapper`,
+    seeded with ``seed + rank``, in the place of :class:`HuntAgentObsWrapper`: ``obs`` is then the
+    agent position and this step's anonymous pings. Nothing else in the chain changes.
     """
     resolved = resolve(variant)
     env_id = env_id or resolved.env_id
     particle_filter_class = particle_filter_class or resolved.particle_filter
     schedule_values = dict(schedule_values or {})
+    policy_obs = _check_policy_obs(policy_obs)
 
     def _init():
         # Registered HERE too, not only at module import: this closure is cloudpickled by
@@ -534,7 +687,10 @@ def make_hunt_belief_env(
                 f"{env_id} emits {env_n} particles but the run asks for num_particles="
                 f"{num_particles}. The belief is the env's own cloud, so the two must agree; "
                 f"pass --num_particles {env_n} or leave it to the domain default.")
-        env = HuntAgentObsWrapper(env)
+        if policy_obs == "pings":
+            env = HuntPingObsWrapper(env, seed=seed + rank)
+        else:
+            env = HuntAgentObsWrapper(env)
         env = PFDictWithWeightsObservationWrapper(
             env=env,
             particle_filter_class=particle_filter_class,
@@ -576,7 +732,64 @@ def _make_vec_normalize(vec_env, training: bool, norm_reward: bool):
 # ---------------------------------------------------------------------------
 
 
+def _add_policy_obs_argument(parser, door: str) -> None:
+    """``--policy_obs``, the same flag at the three doors that build the belief env (train, eval,
+    collect; 2026-09-24). Declared with ``default=argparse.SUPPRESS``: a command without the flag
+    has no ``policy_obs`` in its namespace, so every default hunt ``run_config.json`` and dataset
+    ``metadata["args"]`` (both are ``vars(args)``) stays the record it was. :func:`_policy_obs`
+    reads the value, ``agent`` when absent."""
+    parser.add_argument(
+        "--policy_obs", type=str, default=argparse.SUPPRESS, choices=POLICY_OBS_CHOICES,
+        help="What the policy's obs key holds. agent (default, every recorded run): the agent "
+             "position. pings (the framestack arm only): the agent position and this step's "
+             "anonymous beacon pings, n_clusters slots of (bit, dx, dy), agent-relative / 10 "
+             "(17 numbers at five clusters), drawn from the hidden layout; never a beacon's "
+             "identity, the centres, the counts or the target. "
+             + {"train": "Needs --encoder framestack, --stack_padding zeros and "
+                         "--no_vec_normalize. Recorded in run_config.json under pings only.",
+                "eval": "Must be the value the checkpoint was trained with; a contradiction "
+                        "with the zip's frame width is refused.",
+                "collect": "pings is refused here: the collector labels every row with the 2-D "
+                           "agent position, and a pings agent cannot drive --behaviour policy."}[door])
+
+
+def _policy_obs(args) -> str:
+    """The ``--policy_obs`` of a parsed command line: ``agent`` when the flag was not given."""
+    return getattr(args, "policy_obs", "agent")
+
+
+def _resolve_policy_obs(parser, args) -> dict:
+    """The env options of ``--policy_obs`` (2026-09-24): ``{}`` under ``agent``, the options every
+    hunt run had, and ``{"policy_obs": "pings"}`` under ``pings``, after three refusals. An
+    explicit ``--policy_obs agent`` is removed from the namespace, so it leaves the same run
+    record as no flag."""
+    if _policy_obs(args) == "agent":
+        vars(args).pop("policy_obs", None)
+        return {}
+    # The encoder is named in the namespace only under `python -m set_transformer.rl.train`
+    # (`--encoder`); `train.main(domain=..., encoder=...)` does not put it there. Only the
+    # framestack group declares --stack_padding (rl/encoders.py), so that names it on both.
+    encoder = getattr(args, "encoder", None)
+    if encoder not in (None, "framestack") or not hasattr(args, "stack_padding"):
+        parser.error(f"--policy_obs pings is the framestack arm's input, and "
+                     f"{'--encoder ' + encoder if encoder else 'this encoder'} reads the belief. "
+                     "Use --encoder framestack, or drop --policy_obs pings.")
+    if args.stack_padding != "zeros":
+        # A copy of the reset frame in each history slot reads as the same pings received k
+        # times; a zero frame (no agent offset, no ping) is unmistakable.
+        parser.error(f"--policy_obs pings needs --stack_padding zeros (got {args.stack_padding}): "
+                     "copies of the reset frame would read as the same pings received again.")
+    if not getattr(args, "no_vec_normalize", False):
+        # VecNormalize shifts every obs entry by a running mean, so an empty slot and a zero
+        # history frame would no longer be zeros; the fixed hunt recipes run raw.
+        parser.error("--policy_obs pings needs --no_vec_normalize: VecNormalize would move the "
+                     "empty slots and the zero history frames off zero (the fixed hunt recipes "
+                     "pass --no_vec_normalize).")
+    return {"policy_obs": "pings"}
+
+
 def _add_arguments(parser) -> None:
+    """The flags that belong to the hunt problem, and ``--policy_obs`` (2026-09-24)."""
     parser.add_argument(
         "--n_active_curriculum", type=str, default=None,
         help="Schedule 'frac:n,...' for the number of live clusters, rounded to the nearest "
@@ -587,11 +800,13 @@ def _add_arguments(parser) -> None:
         help="Schedule 'frac:radius,...' for the hit radius. Default: the variant's "
              "(cluster_hunt '0:1.6,0.4:0.6,1:0.6'; none on least_mass / most_var, whose "
              "registered radius 0.6 stands). 'none' disables it.")
+    _add_policy_obs_argument(parser, "train")
 
 
 def _resolve_arguments(parser, args) -> dict:
     """CLI > variant for the two schedule strings; the variant's recorded horizon when
-    --total_timesteps was left at the domain default. Returns the (empty) env options."""
+    --total_timesteps was left at the domain default. Returns the env options: empty, except
+    ``policy_obs`` under ``--policy_obs pings`` (2026-09-24)."""
     variant = resolve(args.variant)
     if args.n_active_curriculum is None:
         args.n_active_curriculum = variant.default_n_active_curriculum
@@ -606,11 +821,25 @@ def _resolve_arguments(parser, args) -> dict:
         print(f"--total_timesteps left at the domain default; using the {args.variant} "
               f"record's {args.total_timesteps:,}")
     make_schedules(args.n_active_curriculum, args.hit_radius_curriculum)   # parse now
-    return {}
+    return _resolve_policy_obs(parser, args)
 
 
 def _schedules(args):
     return make_schedules(args.n_active_curriculum, args.hit_radius_curriculum)
+
+
+def ping_frame_record(name: str) -> dict:
+    """What one ``pings`` frame holds on this variant, for the run record (2026-09-24)."""
+    env = gym.make(resolve(name).env_id)
+    try:
+        u = env.unwrapped
+        n_clusters = int(u.cfg.n_clusters)
+        return dict(width=ping_frame_width(n_clusters), n_clusters=n_clusters,
+                    layout="agent (2), then n_clusters x (bit, dx, dy); dx, dy = (clip(fix, 0, 20) "
+                           "- pos) / 10; empty slot (0, 0, 0); slot order random per step",
+                    ping_model=_ping_model(u), seed_tag=PING_SEED_TAG)
+    finally:
+        env.close()
 
 
 def _run_config_extras(args) -> dict:
@@ -619,19 +848,27 @@ def _run_config_extras(args) -> dict:
     # dataclass default is invisible in a run record (least_mass's timeout_penalty was read as 20
     # from the dataclass while the registration had not yet set 40). `env_config` is the
     # constructed config, every field of it. Both are kept: no recorded reader changes.
-    return dict(episode_cap=episode_cap(args.variant), task=variant.task,
-                env_kwargs=dict(gym.spec(variant.env_id).kwargs),
-                env_config=_env_config(args.variant).to_dict())
+    extras = dict(episode_cap=episode_cap(args.variant), task=variant.task,
+                  env_kwargs=dict(gym.spec(variant.env_id).kwargs),
+                  env_config=_env_config(args.variant).to_dict())
+    # 2026-09-24: under --policy_obs pings only (the flag itself is in the record through
+    # vars(args)); a default record gains no key.
+    if _policy_obs(args) == "pings":
+        extras["ping_frame"] = ping_frame_record(args.variant)
+    return extras
 
 
 def _make_env(variant: str, *, num_particles: int, particle_filter_class: type, seed: int,
               rank: int, monitor_dir: str | None, training: bool, options: dict):
     """One worker's env. The eval env (``training=False``) is set to the variant's schedules'
-    FINAL values (every cluster active, the registered hit radius): the recorded protocol."""
+    FINAL values (every cluster active, the registered hit radius): the recorded protocol.
+    ``options`` carries ``policy_obs`` under ``--policy_obs pings`` only (2026-09-24; absent =
+    ``agent``, the recorded env)."""
     values = None if training else final_values(variant_schedules(variant))
     return make_hunt_belief_env(
         num_particles=num_particles, rank=rank, seed=seed, monitor_dir=monitor_dir,
-        variant=variant, particle_filter_class=particle_filter_class, schedule_values=values)
+        variant=variant, particle_filter_class=particle_filter_class, schedule_values=values,
+        policy_obs=(options or {}).get("policy_obs", "agent"))
 
 
 # ---------------------------------------------------------------------------
@@ -691,6 +928,31 @@ def _eval_report(episodes, references, args, variant, cap) -> dict:
     return summary
 
 
+def _eval_add_arguments(parser) -> None:
+    _add_policy_obs_argument(parser, "eval")
+
+
+def _eval_options(args) -> dict:
+    """The eval env's options: ``{}``, the recorded eval env, except ``policy_obs`` under
+    ``--policy_obs pings`` (2026-09-24)."""
+    return {"policy_obs": "pings"} if _policy_obs(args) == "pings" else {}
+
+
+def _eval_frame_width_hint(args, checkpoint_frame_width, env_frame_width) -> str:
+    """The hunt sentence for the eval door's frame-width refusal: an ``agent`` frame is 2 wide,
+    a ``pings`` frame 2 + 3 * n_clusters (17 at five clusters)."""
+    head = (f"On hunt a frame is 2 wide under --policy_obs agent and 2 + 3 * n_clusters wide under "
+            f"--policy_obs pings; this eval ran with --policy_obs {_policy_obs(args)}. ")
+    widths = {2: "agent", ping_frame_width(_env_config(args.variant).n_clusters): "pings"}
+    guess = widths.get(int(round(checkpoint_frame_width)))
+    if guess is None:
+        # Neither hunt frame: a flag cannot fix it (a zip of another domain or variant).
+        return head + (f"The checkpoint's frames ({checkpoint_frame_width:g} wide) match neither, so "
+                       "the zip is probably from another domain or variant.")
+    return head + (f"The checkpoint's frames ({checkpoint_frame_width:g} wide) match --policy_obs "
+                   f"{guess}: pass that (the run's run_config.json records policy_obs when it is pings).")
+
+
 # ---------------------------------------------------------------------------
 # Dataset collection (batch 9.2, 2026-09-13). The shared loop is rl/collect.py; what is here is
 # what only the hunt tasks know, moved from src/hunt_tasks/pretrain/collect.py of the parent repo:
@@ -737,9 +999,35 @@ def _collect_add_arguments(parser) -> None:
                         help="Comma list the number of live clusters is drawn from per episode. "
                              "Default: the record's (cluster_hunt 1,2,3,4,5,5,5; least_mass / "
                              "most_var 2,3,4,5,5,5).")
+    _add_policy_obs_argument(parser, "collect")
+
+
+def _refuse_pings_at_collect(parser, args) -> None:
+    """``--policy_obs pings`` has no place in a hunt collection (2026-09-24): every row's ``agent``
+    label is ``obs["obs"]`` (:func:`_collect_snapshot_extras`), which assumes the 2-D agent
+    position, and no objective reads the pings. A pings agent under ``--behaviour policy`` is
+    refused too, with this reason (its frame width is read off the zip, best effort; the
+    shared door's width check would refuse it later with a message about Odd-Even)."""
+    reason = ("the hunt collector labels every row with agent = obs['obs'], the 2-D agent "
+              "position, and the pings are the framestack arm's policy input only")
+    if _policy_obs(args) == "pings":
+        parser.error(f"--policy_obs pings cannot collect a hunt dataset: {reason}.")
+    vars(args).pop("policy_obs", None)          # an explicit `agent` leaves the default record
+    if getattr(args, "behaviour", "scripted") == "policy" and getattr(args, "policy_path", None):
+        from set_transformer.rl.wrappers.obs_history import (   # noqa: PLC0415
+            checkpoint_obs_history_spec, checkpoint_obs_width,
+        )
+        width = checkpoint_obs_width(args.policy_path)
+        n_stack = checkpoint_obs_history_spec(args.policy_path).n_stack
+        if width is not None and width // max(n_stack, 1) == ping_frame_width(
+                _env_config(args.variant).n_clusters):
+            parser.error(f"--policy_path {args.policy_path} was trained with --policy_obs pings "
+                         f"({n_stack} frame(s) of {width // max(n_stack, 1)}); such an agent "
+                         f"cannot drive a hunt collection: {reason}.")
 
 
 def _collect_resolve_arguments(parser, args, domain) -> dict:
+    _refuse_pings_at_collect(parser, args)
     variant = resolve(args.variant)
     if args.timesteps is None:
         args.timesteps = episode_cap(args.variant)
@@ -1241,7 +1529,10 @@ HUNT = Domain(
         # The small ST (16 inducing points, hidden 64, two post-PMA SABs; ~109k parameters).
         "st": dict(num_inds=16, dim_hidden=64, num_post_sab=2),
     },
-    evaluation=Evaluation(default_n_episodes=300, reseed_per_episode=True, report=_eval_report),
+    evaluation=Evaluation(default_n_episodes=300, reseed_per_episode=True, report=_eval_report,
+                          # --policy_obs (2026-09-24): the eval env is built like the run's.
+                          add_arguments=_eval_add_arguments, options=_eval_options,
+                          frame_width_hint=_eval_frame_width_hint),
     # The record's supervised objective; `rl/pretrain.py --domain hunt` runs it when --objective
     # is omitted. The generic reconstruction (Chamfer + --ignore_weights = the record's control)
     # needs no declaration.
