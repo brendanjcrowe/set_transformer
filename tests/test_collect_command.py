@@ -139,6 +139,35 @@ def test_ant_tag_collection_with_an_explicit_output_file(tmp_path, monkeypatch):
     assert meta["particle_filter_class"] == "SmartAntTagParticleFilter" and meta["args"]["num_episodes"] == 1
 
 
+def test_ant_tag_collection_is_reproducible_at_a_fixed_seed(tmp_path, monkeypatch):
+    """PITFALLS.md 13.42 (2026-11-05): with no locomotion policy every episode acts with
+    ``env.action_space.sample()``, whose generator gymnasium seeds from entropy unless told
+    otherwise, so two collections at the same ``--seed`` used to differ from row 0. The shared
+    loop now seeds the action space from ``--seed`` right after ``make_env``."""
+    monkeypatch.setattr(run_records, "git_provenance", lambda: {})
+    def _collect(name):
+        out = tmp_path / f"{name}.npz"
+        collect.main(["--domain", "ant_tag", "--variant", "smart", "--num_trajectories", "2", "--timesteps", "15",
+                      "--num_particles", "20", "--seed", "7", "--pursuit_fraction", "0",
+                      "--fully_observed_fraction", "0", "--no_rebalance", "--output_file", str(out)])
+        with np.load(out, allow_pickle=True) as z:
+            return {k: z[k] for k in ("particles", "weights", "ant", "target", "step")}
+    a, b = _collect("first"), _collect("second")
+    for key in a:
+        assert np.array_equal(a[key], b[key]), f"{key} differs between two collections at the same seed"
+    # and a different seed is a different walk (the test would be vacuous if the ant never moved)
+    assert not np.array_equal(a["ant"], _collect_other_seed(tmp_path, monkeypatch))
+
+
+def _collect_other_seed(tmp_path, monkeypatch):
+    out = tmp_path / "other_seed.npz"
+    collect.main(["--domain", "ant_tag", "--variant", "smart", "--num_trajectories", "2", "--timesteps", "15",
+                  "--num_particles", "20", "--seed", "8", "--pursuit_fraction", "0",
+                  "--fully_observed_fraction", "0", "--no_rebalance", "--output_file", str(out)])
+    with np.load(out, allow_pickle=True) as z:
+        return z["ant"]
+
+
 def test_npy_output_is_refused_before_anything_is_collected(tmp_path):
     with pytest.raises(ValueError, match="Output must be .npz"):
         collect.main(["--domain", "odd_even", "--variant", "oe50_short", "--num_episodes", "1",

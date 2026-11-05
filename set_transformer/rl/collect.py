@@ -222,6 +222,14 @@ def collect_arrays(domain: Domain, args, options: dict, *, progress: bool = True
     collection = collection_of(domain)
     state = collection.prepare(args, options)
     env = collection.make_env(args, options, state)
+    # Seed the env's action space from the run's seed (2026-11-05, PITFALLS.md 13.42). Gymnasium
+    # gives every space its own generator, created from entropy the first time it is sampled, and
+    # env.reset(seed=...) never touches it. A collection whose episodes act with
+    # action_space.sample() -- Ant-Tag's random walks, and its fallback when no locomotion policy is
+    # given -- was therefore not reproducible at a fixed --seed. The same call the eval door makes.
+    # Nothing else draws from this generator: a policy acts through its own network, and Odd-Even's
+    # drawn actions move neither the state nor the observations.
+    env.action_space.seed(int(args.seed))
     if getattr(args, "behaviour", "scripted") == "policy":
         # The agent may have been trained on stacked base observations (the framestack arm);
         # k and the padding are recorded in its zip, so the collection env stacks the same
