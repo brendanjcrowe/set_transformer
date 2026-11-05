@@ -146,7 +146,7 @@ def test_reconstruction_post_sab_count_is_configurable_and_recorded(dataset, tmp
     from set_transformer.rl import run_records
     from set_transformer.rl.encoders import _checkpoint_config_for_flags
     monkeypatch.setattr(run_records, "git_provenance", lambda: {})
-    monkeypatch.setenv("WANDB_MODE", "offline")
+    monkeypatch.setenv("WANDB_MODE", "disabled")
     monkeypatch.setenv("WANDB_DIR", str(tmp_path))
     for count in (0, 3):
         result = pretrain.main(["--domain", "ant_tag", "--encoder", "st", "--data_path", str(dataset), *SMALL,

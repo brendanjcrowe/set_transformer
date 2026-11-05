@@ -67,7 +67,7 @@ def run_side(label: str, checkout: Path, domain: str, script: str, flags: list[s
     # The root layout (change 5.2) writes the record under $RL_BMDP_RUNS; the legacy scripts
     # wrote it under cwd/runs. Pointing the root at cwd/runs puts both under one glob.
     env["RL_BMDP_RUNS"] = str(cwd / "runs")
-    env.setdefault("WANDB_MODE", "offline")
+    env.setdefault("WANDB_MODE", "disabled")
     env.setdefault("OMP_NUM_THREADS", "1")
     env.setdefault("MKL_NUM_THREADS", "1")
     (side / "command.txt").write_text(" ".join(cmd) + f"\ncwd={cwd}\n")

@@ -37,7 +37,7 @@ FORK_STEP="${FORK_STEP:-3000000}"
 SEEDS="${SEEDS:-0 1 2}"
 ARMS="${ARMS:-none_e2e plain_finetune}"          # main-wave run tags to fork from
 SCHEDULES="${SCHEDULES:-ctrl dist0 dist0ent0}"
-export WANDB_MODE=offline
+export WANDB_MODE=disabled
 stamp() { echo "=== [$(date '+%F %T')] $*"; }
 
 declare -A SCHED=(

@@ -60,7 +60,7 @@ WIDTH = 17       # 2 + 3 * n_clusters at the registered five clusters
 @pytest.fixture(autouse=True)
 def _offline_wandb(monkeypatch):
     """PITFALLS.md 13.36: the file sets the variable itself."""
-    monkeypatch.setenv("WANDB_MODE", "offline")
+    monkeypatch.setenv("WANDB_MODE", "disabled")
 
 
 def _build(variant, seed=0, rank=0, **options):

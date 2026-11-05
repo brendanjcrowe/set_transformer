@@ -20,7 +20,7 @@ RL_RUNS=$ROOT/ant_tag/${VARIANT}/rl/st
 LOGS=$ROOT/ant_tag/waves; mkdir -p "$LOGS"
 CK_PLAIN=/home/himanshu/Documents/Research/rl_for_beliefmdps/set_transformer/experiments/ant_tag/experiments/st_pretrain_smart_mid_slow_v15_plain/sinkhorn_2026-09-07_15-53-26/checkpoints/checkpoint_best.pt
 CK_ALIGN=/home/himanshu/Documents/Research/rl_for_beliefmdps/set_transformer/experiments/ant_tag/experiments/st_pretrain_smart_mid_slow_v15_align/sinkhorn_2026-09-07_16-40-10/checkpoints/checkpoint_best.pt
-export WANDB_MODE=offline
+export WANDB_MODE=disabled
 stamp() { echo "=== [$(date '+%F %T')] $*"; }
 
 RL_COMMON=(

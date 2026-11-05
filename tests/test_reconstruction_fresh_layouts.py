@@ -59,7 +59,7 @@ def _wandb_offline(monkeypatch):
     (``test_pooled_arm_autoencoder``, ``test_pretrain_command``, ...); autouse covers the whole
     module so a test added later cannot miss it.
     """
-    monkeypatch.setenv("WANDB_MODE", "offline")
+    monkeypatch.setenv("WANDB_MODE", "disabled")
 
 
 @pytest.fixture(scope="module")

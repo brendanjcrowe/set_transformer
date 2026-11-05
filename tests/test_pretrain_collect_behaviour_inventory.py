@@ -116,7 +116,7 @@ N, D, S = 100, 2, 48
 def _run(script: Path, args: list[str], tmp: Path, timeout: int = 900) -> subprocess.CompletedProcess:
     """Run a pipeline script as the user would, from its own directory, on CPU, wandb offline
     and writing its side files under `tmp`."""
-    env = {**os.environ, "WANDB_MODE": "offline", "WANDB_DIR": str(tmp), "CUDA_VISIBLE_DEVICES": "",
+    env = {**os.environ, "WANDB_MODE": "disabled", "WANDB_DIR": str(tmp), "CUDA_VISIBLE_DEVICES": "",
            "OMP_NUM_THREADS": "4", "MKL_NUM_THREADS": "4", "OPENBLAS_NUM_THREADS": "4",
            "PYTHONWARNINGS": "ignore"}
     return subprocess.run([sys.executable, str(script), *args], cwd=script.parent, env=env,

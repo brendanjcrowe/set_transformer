@@ -226,7 +226,7 @@ def test_package_command_aligns_exports_round_trips_and_the_trainer_takes_it_fro
         name, dataset, tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(run_records, "git_provenance", lambda: {})
     monkeypatch.setattr(run_records, "tee_stdout_stderr", lambda path: None)
-    monkeypatch.setenv("WANDB_MODE", "offline")
+    monkeypatch.setenv("WANDB_MODE", "disabled")
     data, matrix = dataset
     root = tmp_path / "root"
     result = pretrain.main(["--domain", "hunt", "--variant", "least_mass", "--encoder", name,
@@ -267,7 +267,7 @@ def test_no_weight_channel_trains_the_unweighted_encoder(dataset, tmp_path, monk
     rule): the encoder reads D channels and the export says so, so the RL side must say it too."""
     monkeypatch.setattr(run_records, "git_provenance", lambda: {})
     monkeypatch.setattr(run_records, "tee_stdout_stderr", lambda path: None)
-    monkeypatch.setenv("WANDB_MODE", "offline")
+    monkeypatch.setenv("WANDB_MODE", "disabled")
     data, _ = dataset
     root = tmp_path / "root"
     result = pretrain.main(["--domain", "hunt", "--variant", "least_mass", "--encoder", "deepset",

@@ -130,7 +130,7 @@ def test_rolled_on_request_and_a_required_dataset_is_refused_when_missing(root, 
 def test_reconstruction_runs_on_the_same_labelled_file(root, monkeypatch, capsys):
     monkeypatch.setattr(run_records, "git_provenance", lambda: {})
     monkeypatch.setattr(run_records, "tee_stdout_stderr", lambda path: None)
-    monkeypatch.setenv("WANDB_MODE", "offline")
+    monkeypatch.setenv("WANDB_MODE", "disabled")
     result = pretrain.main(["--domain", "odd_even", "--variant", VARIANT, "--encoder", "st", "--objective", "reconstruction",
                             "--loss_type", "sinkhorn", "--sinkhorn_blur", "0.02", "--num_epochs", "1", "--batch_size", "8",
                             "--num_workers", "0", "--device", "cpu", "--num_inds", "4", "--dim_hidden", "16",

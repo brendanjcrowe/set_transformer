@@ -73,7 +73,7 @@ if [[ -z "$DATA" ]]; then
   [[ -f "data/${VARIANT}${SUFFIX}_pf_dataset.npz" ]] && DATA=data/${VARIANT}${SUFFIX}_pf_dataset.npz
 fi
 EMD=${DATA%.npz}_emd.npy
-export WANDB_MODE=offline
+export WANDB_MODE=disabled
 
 stamp() { echo "=== [$(date '+%F %T')] $*"; }
 

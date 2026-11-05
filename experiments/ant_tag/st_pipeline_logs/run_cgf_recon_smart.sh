@@ -51,7 +51,7 @@ START_AT=${START_AT:-1}
 EXPORT=${EXPORT:-}
 if [ "$START_AT" -le 1 ] && [ -z "$EXPORT" ]; then
 echo "[$(date)] step 1: pretraining ($DATA, GPU $PRETRAIN_GPU, $PRETRAIN_EPOCHS epochs)"
-CUDA_VISIBLE_DEVICES=$PRETRAIN_GPU WANDB_MODE=offline python3 3_train_st.py \
+CUDA_VISIBLE_DEVICES=$PRETRAIN_GPU WANDB_MODE=disabled python3 3_train_st.py \
   --data_path "$DATA" --encoder cgf $GEOM \
   --loss_type sinkhorn --sinkhorn_blur 0.01 --sinkhorn_scaling 0.5 \
   --num_epochs "$PRETRAIN_EPOCHS" --batch_size 32 --learning_rate 1e-3 \

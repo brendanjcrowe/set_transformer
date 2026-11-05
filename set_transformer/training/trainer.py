@@ -20,6 +20,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
+import os
 import wandb
 
 from ..loss import (
@@ -266,7 +267,15 @@ class Trainer:
             raise ValueError(f"Unknown loss type: {self.config.loss_type}")
 
     def _setup_wandb(self) -> None:
-        """Setup Weights & Biases logging."""
+        """Setup Weights & Biases logging.
+
+        W&B is not used by this project (2026-11-05): when the caller sets no ``WANDB_MODE`` the
+        mode defaults to ``disabled``, so ``wandb.init`` is a no-op and no ``wandb/`` folder is
+        written. Before this, an unset variable died inside ``wandb.init`` for want of an API key
+        (PITFALLS.md 13.36), which is why every launcher carried ``WANDB_MODE=...``. An explicit
+        ``WANDB_MODE`` (``offline`` / ``online``) is still honoured.
+        """
+        os.environ.setdefault("WANDB_MODE", "disabled")
         wandb.init(
             project="set-transformer",
             name=self.exp_config.run_name,

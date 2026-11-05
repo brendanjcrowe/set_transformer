@@ -49,7 +49,7 @@ VARIANT = "oe50_short"
 @pytest.fixture(autouse=True)
 def _offline_wandb(monkeypatch):
     """PITFALLS.md 13.36: the file sets the variable itself."""
-    monkeypatch.setenv("WANDB_MODE", "offline")
+    monkeypatch.setenv("WANDB_MODE", "disabled")
 
 
 class _LegacyStepIndexObservationWrapper(gym.ObservationWrapper):

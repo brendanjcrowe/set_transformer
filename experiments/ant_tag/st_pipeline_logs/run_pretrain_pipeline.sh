@@ -42,7 +42,7 @@ CUDA_VISIBLE_DEVICES=1 python3 2_collect_pf_dataset.py \
 # blur 0.01 is in NORMALIZED units (coords / 7.0) = 0.07 env units, well under
 # the den radius the encoder must resolve.
 echo "=== [$(date)] STAGE 2: pretrain ==="
-WANDB_MODE=offline CUDA_VISIBLE_DEVICES=1 python3 3_train_st.py \
+WANDB_MODE=disabled CUDA_VISIBLE_DEVICES=1 python3 3_train_st.py \
   --data_path "$DATA" \
   --loss_type sinkhorn --sinkhorn_blur 0.01 --sinkhorn_scaling 0.5 \
   --num_encodings 8 --dim_encoder 8 \

@@ -64,7 +64,7 @@ W_HEAVY = 6.75 / (2.4 + 6.75)  # cden_f / (cden_h + cden_f), the registered geom
 @pytest.fixture(autouse=True)
 def _offline_wandb(monkeypatch):
     """PITFALLS.md 13.36: the file sets the variable itself."""
-    monkeypatch.setenv("WANDB_MODE", "offline")
+    monkeypatch.setenv("WANDB_MODE", "disabled")
 
 
 def _build(seed=0, variant=VARIANT, **options):

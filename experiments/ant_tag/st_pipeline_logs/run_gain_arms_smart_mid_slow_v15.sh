@@ -26,7 +26,7 @@ ENCODER_LR_SCALE="${ENCODER_LR_SCALE:-0.1}"
 CK_PLAIN=/home/himanshu/Documents/Research/rl_for_beliefmdps/set_transformer/experiments/ant_tag/experiments/st_pretrain_smart_mid_slow_v15_plain/sinkhorn_2026-09-07_15-53-26/checkpoints/checkpoint_best.pt
 CK_ALIGN=/home/himanshu/Documents/Research/rl_for_beliefmdps/set_transformer/experiments/ant_tag/experiments/st_pretrain_smart_mid_slow_v15_align/sinkhorn_2026-09-07_16-40-10/checkpoints/checkpoint_best.pt
 REWARD_SCHEDULE="0:1:2:0:${GAIN},0.2:1:2:0:${GAIN},0.5:0.15:2:50:${GAIN},1:0.15:2:50:${GAIN}"
-export WANDB_MODE=offline
+export WANDB_MODE=disabled
 stamp() { echo "=== [$(date '+%F %T')] $*"; }
 
 stamp "queued: waiting for 'PIPELINE DONE' in $WAIT_FOR"

@@ -59,10 +59,10 @@ from set_transformer.rl.wrappers.obs_history import (  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
-def _offline_wandb(monkeypatch):
-    """Every run in this file is offline (PITFALLS.md 13.36: an exported WANDB_MODE in the
+def _wandb_disabled(monkeypatch):
+    """Every run in this file has W&B disabled (PITFALLS.md 13.36: an exported WANDB_MODE in the
     shell hides a missing fixture, so the file sets it itself)."""
-    monkeypatch.setenv("WANDB_MODE", "offline")
+    monkeypatch.setenv("WANDB_MODE", "disabled")
 
 
 # --------------------------------------------------------------------------

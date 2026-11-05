@@ -37,7 +37,7 @@ _TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}|\d{8}_\d{6}")
 def _run(spec: str, threads: int) -> None:
     cwd, command = spec.split("::", 1)
     env = {**os.environ, "OMP_NUM_THREADS": str(threads), "MKL_NUM_THREADS": str(threads),
-           "OPENBLAS_NUM_THREADS": str(threads), "CUDA_VISIBLE_DEVICES": "", "WANDB_MODE": "offline",
+           "OPENBLAS_NUM_THREADS": str(threads), "CUDA_VISIBLE_DEVICES": "", "WANDB_MODE": "disabled",
            "PYTHONWARNINGS": "ignore"}
     proc = subprocess.run(shlex.split(command), cwd=cwd, env=env, capture_output=True, text=True)
     if proc.returncode != 0:

@@ -98,7 +98,7 @@ folders); `run_records.latest_pretrain_checkpoint(...)` finds the newest RL-load
 
 ```bash
 cd experiments/ant_tag
-WANDB_MODE=offline python3 3_train_st.py \
+WANDB_MODE=disabled python3 3_train_st.py \
     --data_path data/<domain>_pf_dataset.npz \
     --num_encodings 8 --dim_encoder 8 \
     --sinkhorn_blur 0.02 --seed 0
@@ -189,7 +189,7 @@ python3 1_train_locomotion.py --total_timesteps 1000000
 python3 2_collect_pf_dataset.py --variant smart --locomotion_policy_path models/ant_locomotion_policy.zip
 # 3. Pretrain the ST autoencoder (output under <root>/runs/ant_tag/smart/pretrain/; --data_path
 #    defaults to the dataset step 2 wrote when --variant is given)
-WANDB_MODE=offline python3 3_train_st.py --variant smart --num_encodings 8 --dim_encoder 8
+WANDB_MODE=disabled python3 3_train_st.py --variant smart --num_encodings 8 --dim_encoder 8
 # 4. RL: the ST arm, encoder trained under PPO / frozen pretrained / finetuned pretrained
 python3 4_train_rl_st.py --variant smart --seed 0
 python3 4_train_rl_st.py --variant smart --pretrained_st_model_path <ckpt> --st_frozen

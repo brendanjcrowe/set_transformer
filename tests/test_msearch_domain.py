@@ -323,7 +323,7 @@ def test_collected_dataset_carries_relative_particles_and_the_labels(dataset):
 
 @pytest.mark.parametrize("encoder", ["st", "cgf"])
 def test_reconstruction_pretraining_round_trips_into_the_rl_extractor(encoder, dataset, tmp_path, monkeypatch, capsys):
-    monkeypatch.setenv("WANDB_MODE", "offline")
+    monkeypatch.setenv("WANDB_MODE", "disabled")
     monkeypatch.setenv("WANDB_DIR", str(tmp_path))
     monkeypatch.setattr(run_records, "git_provenance", lambda: {})
     monkeypatch.setattr(run_records, "tee_stdout_stderr", lambda path: None)

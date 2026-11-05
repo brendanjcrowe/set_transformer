@@ -166,7 +166,7 @@ def test_end_to_end_script_on_a_tiny_weighted_dataset(tmp_path, weighted):
            "--warmup_epochs", "1", "--seed", "0", "--dim_hidden", "32", "--device", "cpu"]
     if not weighted:
         cmd.append("--ignore_weights")
-    env = {**os.environ, "WANDB_MODE": "offline", "CUDA_VISIBLE_DEVICES": ""}
+    env = {**os.environ, "WANDB_MODE": "disabled", "CUDA_VISIBLE_DEVICES": ""}
     proc = subprocess.run(cmd, cwd=script.parent, env=env, capture_output=True, text=True,
                           timeout=900)
     assert proc.returncode == 0, proc.stdout[-3000:] + "\n" + proc.stderr[-3000:]
@@ -212,7 +212,7 @@ def test_rl_script_accepts_the_export_and_reloads_it(tmp_path):
     np.savez(data, particles=particles, weights=weights,
              metadata=np.array(json.dumps({"particle_scale": SCALE, "particle_centre": 0.0})))
     ant_tag = Path(__file__).resolve().parents[1] / "experiments" / "ant_tag"
-    env = {**os.environ, "WANDB_MODE": "offline", "CUDA_VISIBLE_DEVICES": ""}
+    env = {**os.environ, "WANDB_MODE": "disabled", "CUDA_VISIBLE_DEVICES": ""}
 
     pre = subprocess.run(
         [sys.executable, str(ant_tag / "3_train_st.py"), "--data_path", str(data),

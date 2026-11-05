@@ -166,7 +166,7 @@ TINY = ["--variant", "smart", "--total_timesteps", "32", "--n_envs", "1", "--ppo
 
 
 def _run(script, extra, tmp_path, tag):
-    env = {**os.environ, "WANDB_MODE": "offline", "CUDA_VISIBLE_DEVICES": ""}
+    env = {**os.environ, "WANDB_MODE": "disabled", "CUDA_VISIBLE_DEVICES": ""}
     out_dir = tmp_path / tag
     cmd = [sys.executable, str(ANT_TAG / script), *TINY, *extra,
            "--log_dir", str(out_dir / "logs") + "/", "--model_save_path", str(out_dir / "models" / "agent.zip"),
